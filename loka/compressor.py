@@ -1,302 +1,182 @@
-import numpy as np
-import mujoco
+"""Telemetry compression and tracking-error evaluation for LOKA."""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 
-# Stability deadband — error stays 0 inside these bands; LOKA triggers above ERROR_TRIGGER_THRESHOLD.
-NOMINAL_HEIGHT_M = 1.15
-HEIGHT_TOLERANCE_M = 0.10
-PITCH_TOLERANCE_RAD = 0.35
-SPEED_TOLERANCE_MPS = 0.25
-ERROR_TRIGGER_THRESHOLD = 0.25
+import mujoco
+import numpy as np
 
-HEIGHT_GOAL_M = 1.2
-SPEED_GOAL_MPS = 1.0
+from loka.error_spec import ErrorSpec, ErrorTerm, get_tracking_error  # noqa: F401
 
-# Anomaly metrics window and minimum collection time before dispatching the LLM.
 TELEMETRY_WINDOW_S = 2.0
 ANOMALY_COLLECTION_S = 1.0
-
-# Actuator command deficit: planner command vs actual joint motion (see _mean_actuator_cmd_deficit).
-ACTUAL_DELTA_FLOOR = 1e-3
-CMD_DEFICIT_DELTA_MIN = 8.0
-
-LEG_CHAINS = (
-    ("right_hip", "right_knee", "right_ankle"),
-    ("left_hip", "left_knee", "left_ankle"),
-)
-
 
 @dataclass(frozen=True)
 class TelemetrySections:
     """Toggle each telemetry block included in the LLM prompt."""
 
-    section_0_torso: bool = True
+    section_0_state: bool = True
     section_1_cost: bool = True
-    section_2_command_deficit: bool = True
+    section_2_motor_load: bool = True
     section_3_directive: bool = True
 
 
 DEFAULT_TELEMETRY_SECTIONS = TelemetrySections()
 
 
-def get_tracking_error(data):
-    torso_height = 1.3 + data.qpos[0]
-    torso_pitch = data.qpos[2]
-    forward_vel = data.qvel[1]
-
-    height_error = 0.0
-    if torso_height < (NOMINAL_HEIGHT_M - HEIGHT_TOLERANCE_M):
-        height_error = (NOMINAL_HEIGHT_M - HEIGHT_TOLERANCE_M) - torso_height
-
-    pitch_error = 0.0
-    if abs(torso_pitch) > PITCH_TOLERANCE_RAD:
-        pitch_error = abs(torso_pitch) - PITCH_TOLERANCE_RAD
-
-    speed_error = 0.0
-    if forward_vel < (SPEED_GOAL_MPS - SPEED_TOLERANCE_MPS):
-        speed_error = (SPEED_GOAL_MPS - SPEED_TOLERANCE_MPS) - forward_vel
-
-    return (height_error * 2.0) + pitch_error + speed_error
-
-
-def extract_torso_state(buffer):
-    """Mean planar-walker root (torso) kinematics over a frame buffer."""
-    if not buffer:
+def _mean_term_value(frames, term: ErrorTerm) -> float | None:
+    if not frames:
         return None
-
-    qpos_arr = np.array([f["qpos"] for f in buffer])
-    qvel_arr = np.array([f["qvel"] for f in buffer])
-
-    return {
-        "height_m": float(np.mean(1.3 + qpos_arr[:, 0])),
-        "forward_x_m": float(np.mean(qpos_arr[:, 1])),
-        "pitch_rad": float(np.mean(qpos_arr[:, 2])),
-        "forward_vel_mps": float(np.mean(qvel_arr[:, 1])),
-        "vertical_vel_mps": float(np.mean(qvel_arr[:, 0])),
-        "pitch_rate_radps": float(np.mean(qvel_arr[:, 2])),
-    }
+    return float(np.mean([term.read_frame(frame) for frame in frames]))
 
 
-def extract_torso_snapshot(frame):
-    """Instantaneous torso state from a single simulation frame."""
-    return {
-        "height_m": float(1.3 + frame["qpos"][0]),
-        "forward_x_m": float(frame["qpos"][1]),
-        "pitch_rad": float(frame["qpos"][2]),
-        "forward_vel_mps": float(frame["qvel"][1]),
-        "vertical_vel_mps": float(frame["qvel"][0]),
-        "pitch_rate_radps": float(frame["qvel"][2]),
-    }
-
-
-def _torso_status_label(metric, current, nominal=None, tol_frac=0.15):
-    if metric == "height_m" and current < (NOMINAL_HEIGHT_M - HEIGHT_TOLERANCE_M):
-        return "[ERR: BELOW SAFE HEIGHT]"
-    if metric == "pitch_rad" and abs(current) > PITCH_TOLERANCE_RAD:
-        return "[ERR: EXCESSIVE LEAN]"
-    if metric == "vertical_vel_mps" and current < -0.5:
-        return "[ERR: FALLING]"
-    if metric == "pitch_rate_radps" and abs(current) > 2.0:
-        return "[ERR: UNSTABLE ROTATION]"
-    if metric == "forward_vel_mps" and current < (SPEED_GOAL_MPS - SPEED_TOLERANCE_MPS):
-        return "[ERR: SPEED LOSS]"
-
-    if nominal is not None:
-        delta = abs(current - nominal)
-        ref = max(abs(nominal), 1e-3)
-        if delta > ref * 2.0:
-            return "[ERR: CRITICAL DEVIATION]"
-        if delta > ref * tol_frac + 0.05:
-            return "[ERR: MODERATE DEVIATION]"
+def _term_status(term: ErrorTerm, value: float) -> str:
+    excess = term.excess(value)
+    if excess <= 0.0:
         return "[NOMINAL]"
+    if excess * term.weight > 0.5:
+        return f"[ERR: {term.name.upper()} CRITICAL]"
+    return f"[ERR: {term.name.upper()} OUT OF BAND]"
 
-    return "[NOMINAL]"
 
-
-def format_torso_state_section(anom_slice, nominal_buffer, has_baseline):
-    anom_state = extract_torso_state(anom_slice)
-    if anom_state is None:
+def format_tracked_state_section(anom_slice, nominal_buffer, has_baseline, error_spec: ErrorSpec):
+    if not anom_slice or not error_spec.terms:
         return ""
 
-    snapshot = extract_torso_snapshot(anom_slice[-1])
-    nom_state = extract_torso_state(nominal_buffer) if has_baseline else None
-
-    lines = ["0. TORSO KINEMATIC STATE (Planar Walker Root)"]
-    lines.append(
-        "Root DOFs: height (Z), forward position (X), pitch angle, and their velocities."
-    )
-    lines.append(
+    lines = [
+        "0. TRACKED STATE (Error_Tracking terms)",
+        "Values use each term's formula: offset + signal[index].",
         f"Window = mean over recent {TELEMETRY_WINDOW_S:.1f}s anomaly frames; "
-        "Snapshot = value at trigger instant.\n"
-    )
-
-    metrics = [
-        ("height_m", "Height", "m"),
-        ("forward_x_m", "Forward Position", "m"),
-        ("pitch_rad", "Pitch (Attitude)", "rad"),
-        ("forward_vel_mps", "Forward Velocity", "m/s"),
-        ("vertical_vel_mps", "Vertical Velocity", "m/s"),
-        ("pitch_rate_radps", "Pitch Rate", "rad/s"),
+        "Snapshot = value at trigger instant.\n",
     ]
 
-    for key, label, unit in metrics:
-        current = anom_state[key]
-        snap = snapshot[key]
-        if has_baseline and nom_state is not None:
-            nominal = nom_state[key]
-            status = _torso_status_label(key, current, nominal=nominal)
-            lines.append(
-                f"- {label}: Nominal {nominal:.2f} {unit} | "
-                f"Current {current:.2f} {unit} | Snapshot {snap:.2f} {unit}  {status}"
-            )
-        else:
-            status = _torso_status_label(key, current)
-            goal_note = ""
-            if key == "height_m":
-                goal_note = f" (goal ~{HEIGHT_GOAL_M:.1f} m)"
-            elif key == "forward_vel_mps":
-                goal_note = f" (goal ~{SPEED_GOAL_MPS:.1f} m/s)"
-            lines.append(
-                f"- {label}: Current {current:.2f} {unit} | "
-                f"Snapshot {snap:.2f} {unit}{goal_note}  {status}"
-            )
+    snapshot_frame = anom_slice[-1]
+    for term in error_spec.terms:
+        current = _mean_term_value(anom_slice, term)
+        snap = term.read_frame(snapshot_frame)
+        if current is None:
+            continue
+
+        status = _term_status(term, current)
+        band = (
+            f"mode={term.mode} target={term.target:.3g} "
+            f"tol={term.tolerance:.3g} weight={term.weight:.3g}"
+        )
+        if has_baseline:
+            nominal = _mean_term_value(nominal_buffer, term)
+            if nominal is not None:
+                lines.append(
+                    f"- {term.name}: Nominal {nominal:.3g} | "
+                    f"Current {current:.3g} | Snapshot {snap:.3g}  {status}"
+                )
+                lines.append(f"  ({band})")
+                continue
+
+        lines.append(
+            f"- {term.name}: Current {current:.3g} | Snapshot {snap:.3g}  {status}"
+        )
+        lines.append(f"  ({band})")
 
     return "\n".join(lines) + "\n\n"
 
 
-def extract_cost_proxies(buffer):
+def extract_cost_proxies(buffer, error_spec: ErrorSpec | None = None):
+    """Generic cost-ish proxies: Control effort + ErrorSpec term deviations from target."""
     if not buffer:
-        return {"Height": 0.0, "Rotation": 0.0, "Speed": 0.0, "Control": 0.0}
+        return {"Control": 0.0}
 
-    qpos_arr = np.array([f["qpos"] for f in buffer])
-    qvel_arr = np.array([f["qvel"] for f in buffer])
     ctrl_arr = np.array([f["ctrl"] for f in buffer])
+    proxies = {"Control": float(np.mean(np.abs(ctrl_arr)))}
 
-    heights = 1.3 + qpos_arr[:, 0]
-    height_dev = np.mean(np.abs(1.2 - heights))
-    pitch_dev = np.mean(np.abs(qpos_arr[:, 2]))
-    speeds = qvel_arr[:, 1]
-    speed_dev = np.mean(np.abs(1.0 - speeds))
-    effort_dev = np.mean(np.abs(ctrl_arr))
+    if error_spec is not None:
+        for term in error_spec.terms:
+            values = np.array([term.read_frame(frame) for frame in buffer])
+            proxies[term.name] = float(np.mean(np.abs(values - term.target)))
 
-    return {"Height": height_dev, "Rotation": pitch_dev, "Speed": speed_dev, "Control": effort_dev}
+    return proxies
 
 
-def _mean_actuator_cmd_deficit(frames, model):
-    """Map actuator name -> mean |planner_cmd| / |actual joint delta|."""
-    totals = {}
-    counts = {}
+def _actuator_capacity(model, actuator_id: int) -> float:
+    gear = abs(float(model.actuator_gear[actuator_id, 0]))
+    ctrl_limit = max(abs(float(x)) for x in model.actuator_ctrlrange[actuator_id])
+    capacity = gear * ctrl_limit
+    return capacity if capacity > 1e-9 else 1.0
 
+
+def _mean_motor_loads(frames, model):
+    """Per-actuator mean/peak |force| and utilization vs gear*ctrlrange capacity."""
+    if not frames:
+        return {}
+
+    force_stacks = []
     for frame in frames:
-        cmd = frame.get("planner_cmd")
-        joint_delta = frame.get("joint_delta")
-        if cmd is None or joint_delta is None:
+        force = frame.get("actuator_force")
+        if force is None:
             continue
+        force_stacks.append(np.abs(np.asarray(force, dtype=float)))
 
-        for actuator_id in range(model.nu):
-            if model.actuator_trntype[actuator_id] != mujoco.mjtTrn.mjTRN_JOINT:
-                continue
+    if not force_stacks:
+        return {}
 
-            joint_id = model.actuator_trnid[actuator_id, 0]
-            qpos_idx = model.jnt_qposadr[joint_id]
-            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
+    stacked = np.stack(force_stacks, axis=0)
+    mean_abs = np.mean(stacked, axis=0)
+    peak_abs = np.max(stacked, axis=0)
 
-            cmd_mag = abs(float(cmd[actuator_id]))
-            act_mag = max(abs(float(joint_delta[qpos_idx])), ACTUAL_DELTA_FLOOR)
-            ratio = cmd_mag / act_mag
-
-            totals[name] = totals.get(name, 0.0) + ratio
-            counts[name] = counts.get(name, 0) + 1
-
-    return {name: totals[name] / counts[name] for name in totals}
-
-
-def _chain_for_actuator(name):
-    for chain in LEG_CHAINS:
-        if name in chain:
-            return chain
-    return None
+    loads = {}
+    for actuator_id in range(model.nu):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
+        capacity = _actuator_capacity(model, actuator_id)
+        mean_load = float(mean_abs[actuator_id])
+        peak_load = float(peak_abs[actuator_id])
+        loads[name] = {
+            "mean": mean_load,
+            "peak": peak_load,
+            "util_mean": mean_load / capacity,
+            "util_peak": peak_load / capacity,
+        }
+    return loads
 
 
-def _select_cmd_deficit_fault(anom_deficits, nom_deficits):
-    """Pick upstream-most actuator with the largest command-deficit increase."""
-    candidates = []
-    for name, anom_ratio in anom_deficits.items():
-        deficit_delta = anom_ratio - nom_deficits.get(name, 0.0)
-        if deficit_delta > CMD_DEFICIT_DELTA_MIN:
-            candidates.append({
-                "name": name,
-                "nominal": nom_deficits.get(name, 0.0),
-                "current": anom_ratio,
-                "deficit_delta": deficit_delta,
-            })
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: item["deficit_delta"], reverse=True)
-    top = candidates[0]
-    chain = _chain_for_actuator(top["name"])
-    if chain is None:
-        return top
-
-    chain_candidates = [c for c in candidates if c["name"] in chain]
-    for joint_name in chain:
-        for candidate in chain_candidates:
-            if candidate["name"] == joint_name:
-                return candidate
-
-    return top
-
-
-def _format_joint_tracking_section(anom_slice, nominal_baseline, model, has_baseline):
+def _format_motor_load_section(anom_slice, nominal_baseline, model, has_baseline):
     lines = [
-        "2. ACTUATOR COMMAND DEFICIT (Planner Command vs Joint Motion)",
-        "Compares MPC planner command magnitude to actual joint motion per actuator.",
-        "Commands are captured before hidden fault overrides zero the actuator.",
-        "Hidden physical faults are excluded from planning but enforced in simulation.",
-        "Reports the upstream-most actuator on the limb with the largest deficit increase.",
+        "2. MOTOR LOAD (Per-Actuator Force)",
+        "Reports mean and peak |actuator_force| for each MJCF motor over the window.",
+        "Utilization is |force| / (|gear| * max|ctrlrange|).",
         "",
     ]
 
-    if not has_baseline:
-        lines.append(
-            "- No nominal baseline for command deficit. "
-            "Cannot localize hardware faults without healthy reference gait.\n"
-        )
+    anom_loads = _mean_motor_loads(anom_slice, model)
+    if not anom_loads:
+        lines.append("- No actuator_force samples available in this window.\n")
         return "\n".join(lines) + "\n"
 
-    anom_deficits = _mean_actuator_cmd_deficit(anom_slice, model)
-    nom_deficits = _mean_actuator_cmd_deficit(nominal_baseline, model)
-    fault = _select_cmd_deficit_fault(anom_deficits, nom_deficits)
+    nom_loads = _mean_motor_loads(nominal_baseline, model) if has_baseline else {}
 
-    if fault is None:
-        lines.append(
-            "- No localized actuator command deficits detected. "
-            "Instability may be global momentum or an unmodeled disturbance.\n"
-        )
-        return "\n".join(lines) + "\n"
+    for name, stats in anom_loads.items():
+        if has_baseline and name in nom_loads:
+            nom = nom_loads[name]
+            lines.append(
+                f"- {name}: Nominal mean {nom['mean']:.2f} "
+                f"(util {nom['util_mean']:.0%}) | "
+                f"Current mean {stats['mean']:.2f} (util {stats['util_mean']:.0%}) | "
+                f"Peak {stats['peak']:.2f} (util {stats['util_peak']:.0%})"
+            )
+        else:
+            lines.append(
+                f"- {name}: Current mean {stats['mean']:.2f} "
+                f"(util {stats['util_mean']:.0%}) | "
+                f"Peak {stats['peak']:.2f} (util {stats['util_peak']:.0%})"
+            )
 
-    chain = _chain_for_actuator(fault["name"])
-    if chain is not None:
-        lines.append(f"Suspect limb chain: {', '.join(chain)}.\n")
-
-    lines.append(f">> {fault['name']}")
-    lines.append(
-        f"- Command/Motion Ratio: Nominal {fault['nominal']:.1f} | "
-        f"Current {fault['current']:.1f} (delta +{fault['deficit_delta']:.1f})"
-    )
-    lines.append(
-        "- Trend Tag: [TRACKING_FAILURE] (Planner commands motion, joint does not respond)\n"
-    )
+    lines.append("")
     return "\n".join(lines) + "\n"
 
 
 def _format_cost_section(anom_costs, nom_costs, has_baseline):
-    lines = ["1. COST LANDSCAPE DIFFERENTIAL"]
-    for cost_name in anom_costs.keys():
-        a_val = anom_costs[cost_name]
-        if has_baseline:
+    lines = ["1. COST / DEVIATION LANDSCAPE"]
+    for cost_name, a_val in anom_costs.items():
+        if has_baseline and cost_name in nom_costs:
             n_val = nom_costs[cost_name]
             if a_val > (n_val * 2.0 + 0.05):
                 status = "[ERR: CRITICAL DEVIATION]"
@@ -305,23 +185,23 @@ def _format_cost_section(anom_costs, nom_costs, has_baseline):
             else:
                 status = "[NOMINAL]"
             lines.append(
-                f"- {cost_name}_Cost: Nominal {n_val:.2f} | Current {a_val:.2f}  {status}"
+                f"- {cost_name}: Nominal {n_val:.2f} | Current {a_val:.2f}  {status}"
             )
         else:
             lines.append(
-                f"- {cost_name}_Cost: Nominal [Unknown] | Current {a_val:.2f}  [NO BASELINE]"
+                f"- {cost_name}: Nominal [Unknown] | Current {a_val:.2f}  [NO BASELINE]"
             )
     return "\n".join(lines) + "\n\n"
 
 
 def _format_directive_section(sections: TelemetrySections):
     sources = []
-    if sections.section_0_torso:
-        sources.append("torso state")
+    if sections.section_0_state:
+        sources.append("tracked state")
     if sections.section_1_cost:
-        sources.append("cost landscape")
-    if sections.section_2_command_deficit:
-        sources.append("actuator command deficit tags")
+        sources.append("cost / deviation landscape")
+    if sections.section_2_motor_load:
+        sources.append("motor load")
 
     if not sources:
         source_text = "available telemetry"
@@ -332,8 +212,8 @@ def _format_directive_section(sections: TelemetrySections):
 
     lines = [
         "3. SYSTEM ORCHESTRATOR DIRECTIVE",
-        f"Diagnose the root physical failure using the {source_text}. "
-        "Update the YAML scratchpad to rewrite MPC parameters.\n",
+        f"Diagnose using the {source_text}. "
+        "Update the YAML scratchpad to rewrite MPC parameters and, if needed, Error_Tracking.\n",
     ]
     return "\n".join(lines) + "\n"
 
@@ -343,6 +223,7 @@ def synthesize_generalized_telemetry(
     anomaly_buffer,
     model,
     sections: TelemetrySections = DEFAULT_TELEMETRY_SECTIONS,
+    error_spec: ErrorSpec | None = None,
 ):
     if not anomaly_buffer:
         return "Error: No anomaly buffer available."
@@ -366,23 +247,25 @@ def synthesize_generalized_telemetry(
         prompt += (
             "The MPC is not behaving nominally. Compare the Nominal Baseline to the Current Anomaly.\n\n"
         )
-        nom_costs = extract_cost_proxies(nominal_baseline)
+        nom_costs = extract_cost_proxies(nominal_baseline, error_spec)
     else:
         prompt += (
             "CRITICAL: Cold Start Failure. No nominal baseline exists. "
-            "Evaluating against absolute safety limits.\n\n"
+            "Evaluating against absolute Error_Tracking limits.\n\n"
         )
         nom_costs = {}
 
-    if sections.section_0_torso:
-        prompt += format_torso_state_section(anom_slice, nominal_baseline, has_baseline)
+    if sections.section_0_state and error_spec is not None:
+        prompt += format_tracked_state_section(
+            anom_slice, nominal_baseline, has_baseline, error_spec
+        )
 
     if sections.section_1_cost:
-        anom_costs = extract_cost_proxies(anom_slice)
+        anom_costs = extract_cost_proxies(anom_slice, error_spec)
         prompt += _format_cost_section(anom_costs, nom_costs, has_baseline)
 
-    if sections.section_2_command_deficit:
-        prompt += _format_joint_tracking_section(
+    if sections.section_2_motor_load:
+        prompt += _format_motor_load_section(
             anom_slice, nominal_baseline, model, has_baseline
         )
 

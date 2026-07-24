@@ -1,15 +1,28 @@
+"""LLM orchestration: prompt assembly, YAML apply, planner recreation."""
+
 import os
-import yaml
+
 import mujoco
+import yaml
+from dotenv import load_dotenv
 from mujoco_mpc import agent as mpc_agent
 from openai import OpenAI
-from dotenv import load_dotenv
+
+from loka.error_spec import format_error_spec, parse_error_tracking
+from loka.mjcf_utils import (
+    SUPPORTED_PLANNER_NUMERICS,
+    set_model_numeric,
+)
+from loka.robot_context import (
+    format_capabilities_block,
+    format_current_error_tracking,
+    format_primary_objective_block,
+)
 
 load_dotenv()
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-SUPPORTED_PLANNER_NUMERICS = frozenset({"agent_horizon", "sampling_exploration"})
-SUPPORTED_TASK_PARAMETERS = frozenset({"Height Goal", "Speed Goal"})
+_PROMPT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "system_prompt.txt")
 
 
 def resolve_mjcf_name(model, obj_enum, name):
@@ -44,24 +57,6 @@ def resolve_mjcf_name(model, obj_enum, name):
     return None, -1
 
 
-def set_model_numeric(model, name, value):
-    """Set an MJCF custom numeric on the MuJoCo model."""
-    numeric_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_NUMERIC, name)
-    if numeric_id == -1:
-        raise ValueError(f"Custom numeric '{name}' not found in model")
-    addr = model.numeric_adr[numeric_id]
-    model.numeric_data[addr] = float(value)
-
-
-def get_model_numeric(model, name):
-    """Read an MJCF custom numeric from the MuJoCo model."""
-    numeric_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_NUMERIC, name)
-    if numeric_id == -1:
-        return None
-    addr = model.numeric_adr[numeric_id]
-    return float(model.numeric_data[addr])
-
-
 def recreate_agent_with_planner_settings(model, agent, settings, task_id):
     """Apply planner settings and recreate the MPC agent to pick them up."""
     applied = {}
@@ -78,12 +73,33 @@ def recreate_agent_with_planner_settings(model, agent, settings, task_id):
     return mpc_agent.Agent(task_id=task_id, model=model)
 
 
-def load_system_prompt(robot_context=None):
-    with open("system_prompt.txt", encoding="utf-8") as handle:
-        system_prompt = handle.read()
+def _live_task_parameter_names(agent) -> set[str]:
+    try:
+        return set(agent.get_task_parameters().keys())
+    except Exception:
+        return set()
+
+
+def load_system_prompt(
+    robot_context=None,
+    objective=None,
+    capabilities=None,
+    error_spec=None,
+):
+    """Assemble the system prompt from the generic template plus live model context."""
+    with open(_PROMPT_PATH, encoding="utf-8") as handle:
+        system_prompt = handle.read().rstrip()
+
+    blocks = [system_prompt]
+    if objective:
+        blocks.append(format_primary_objective_block(objective))
+    if capabilities:
+        blocks.append(format_capabilities_block(capabilities))
+    if error_spec is not None:
+        blocks.append(format_current_error_tracking(error_spec))
     if robot_context:
-        system_prompt = f"{system_prompt.rstrip()}\n\n{robot_context}"
-    return system_prompt
+        blocks.append(robot_context)
+    return "\n\n".join(blocks)
 
 
 def llm_worker(api_messages, result_queue):
@@ -103,7 +119,15 @@ def llm_worker(api_messages, result_queue):
         result_queue.put(None)
 
 
-def apply_scratchpad(agent, scratchpad, loka_state, model, episode=None, data=None, task_id="Walker"):
+def apply_scratchpad(
+    agent,
+    scratchpad,
+    loka_state,
+    model,
+    episode=None,
+    data=None,
+    task_id="Walker",
+):
     """Parses the LLM's YAML and safely applies it to the running MPC and loka_state."""
     if not scratchpad or "Semantic_State" not in scratchpad:
         print("\n[!] Failed to parse LOKA scratchpad.")
@@ -158,11 +182,12 @@ def apply_scratchpad(agent, scratchpad, loka_state, model, episode=None, data=No
         except Exception as e:
             print(f"  -> Failed to apply cost weights: {e}")
 
+    allowed_task_params = _live_task_parameter_names(agent)
     task_targets = scratchpad.get("Task_Targets", {})
     if task_targets:
         print("  -> Task Parameters Updated:")
         for param_name, new_value in task_targets.items():
-            if param_name not in SUPPORTED_TASK_PARAMETERS:
+            if allowed_task_params and param_name not in allowed_task_params:
                 print(f"     * [WARN] Unknown task parameter '{param_name}' (ignored)")
                 continue
             try:
@@ -170,6 +195,16 @@ def apply_scratchpad(agent, scratchpad, loka_state, model, episode=None, data=No
                 print(f"     * {param_name} = {new_value}")
             except Exception as e:
                 print(f"     * Failed to set {param_name}: {e}")
+
+    error_tracking = scratchpad.get("Error_Tracking")
+    if error_tracking is not None:
+        print("  -> Error Tracking Updated:")
+        try:
+            new_spec = parse_error_tracking(error_tracking, model.nq, model.nv)
+            loka_state["error_spec"] = new_spec
+            print(format_error_spec(new_spec))
+        except Exception as e:
+            print(f"     * [WARN] Invalid Error_Tracking (ignored): {e}")
 
     mutations = scratchpad.get("Model_Mutations", [])
     if mutations:

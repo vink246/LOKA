@@ -1,17 +1,39 @@
 """Failure-episode and operator-request conversation state for LOKA orchestration."""
 
+from __future__ import annotations
+
+from loka.error_spec import format_error_spec
 from loka.robot_context import format_current_model_belief
 
 
-def _format_context_sections(mpc_config: str, belief: str, telemetry_header: str, telemetry: str) -> str:
-    return (
+def _format_context_sections(
+    mpc_config: str,
+    belief: str,
+    telemetry_header: str,
+    telemetry: str,
+    error_tracking: str | None = None,
+) -> str:
+    parts = [
         "## CURRENT MPC CONFIGURATION\n"
-        f"{mpc_config}\n\n"
-        "## CURRENT MODEL BELIEF\n"
+        f"{mpc_config}\n"
+    ]
+    if error_tracking:
+        parts.append(f"\n## CURRENT ERROR TRACKING\n{error_tracking}\n")
+    parts.append(
+        f"\n## CURRENT MODEL BELIEF\n"
         f"{belief}\n\n"
         f"{telemetry_header}\n"
         f"{telemetry}"
     )
+    return "".join(parts)
+
+
+def _error_tracking_text(loka_state: dict) -> str:
+    error_spec = loka_state.get("error_spec")
+    if error_spec is None:
+        return "No Error_Tracking configured."
+    return format_error_spec(error_spec)
+
 
 def _format_intervention_history(interventions, empty_label):
     if not interventions:
@@ -31,6 +53,8 @@ def _format_intervention_history(interventions, empty_label):
             lines.append(f"  Planner_Targets: {fix['planner_targets']}")
         if fix.get("task_targets"):
             lines.append(f"  Task_Targets: {fix['task_targets']}")
+        if fix.get("error_tracking"):
+            lines.append(f"  Error_Tracking: {fix['error_tracking']}")
         if fix.get("model_mutations"):
             lines.append("  Model_Mutations:")
             for mutation in fix["model_mutations"]:
@@ -61,6 +85,7 @@ class ConversationMixin:
             "controller_targets": scratchpad.get("Controller_Targets", {}),
             "planner_targets": scratchpad.get("Planner_Targets", {}),
             "task_targets": scratchpad.get("Task_Targets", {}),
+            "error_tracking": scratchpad.get("Error_Tracking"),
             "model_mutations": scratchpad.get("Model_Mutations", []),
         })
 
@@ -97,29 +122,45 @@ class FailureEpisode(ConversationMixin):
         self, telemetry: str, loka_state: dict, sim_time: float, mpc_config: str
     ) -> str:
         belief = format_current_model_belief(loka_state)
+        objective = loka_state.get("primary_objective", "")
         return (
             f"--- FAILURE EPISODE (round {self.round_number}, t={sim_time:.2f}s) ---\n"
             f"Episode started at t={self.started_at:.2f}s. "
             "The robot is still unstable after prior intervention(s). "
-            "Re-evaluate task parameters if the current Height Goal or Speed Goal "
-            "is preventing recovery.\n\n"
+            "Re-evaluate task parameters and Error_Tracking if the current mission "
+            "targets or success criteria are preventing recovery.\n"
+            f"Primary objective: {objective}\n\n"
             "## ATTEMPTED FIXES\n"
             f"{self.format_attempted_fixes()}\n\n"
-            + _format_context_sections(mpc_config, belief, "## NEW TELEMETRY", telemetry)
+            + _format_context_sections(
+                mpc_config,
+                belief,
+                "## NEW TELEMETRY",
+                telemetry,
+                error_tracking=_error_tracking_text(loka_state),
+            )
         )
 
     def build_initial_user_turn(
         self, telemetry: str, loka_state: dict, sim_time: float, mpc_config: str
     ) -> str:
         belief = format_current_model_belief(loka_state)
+        objective = loka_state.get("primary_objective", "")
         return (
             f"--- FAILURE EPISODE (round 1, t={sim_time:.2f}s) ---\n"
             "Initial instability detected. Consider adjusting cost weights, planner "
-            "settings, and task parameters (Height Goal, Speed Goal) if the current "
-            "mission targets are unrealistic for recovery.\n\n"
+            "settings, task parameters, and Error_Tracking if the current mission "
+            "targets are unrealistic for recovery.\n"
+            f"Primary objective: {objective}\n\n"
             "## ATTEMPTED FIXES\n"
             "None. This is the first intervention for this failure episode.\n\n"
-            + _format_context_sections(mpc_config, belief, "## NEW TELEMETRY", telemetry)
+            + _format_context_sections(
+                mpc_config,
+                belief,
+                "## NEW TELEMETRY",
+                telemetry,
+                error_tracking=_error_tracking_text(loka_state),
+            )
         )
 
 
@@ -144,13 +185,19 @@ class OperatorSession(ConversationMixin):
         return (
             f"--- OPERATOR REQUEST (t={sim_time:.2f}s) ---\n"
             f"{request.strip()}\n\n"
-            "The operator is requesting a deliberate strategy or gait change. "
-            "Adjust MPC cost weights, planner metaparameters, task parameters "
-            "(Height Goal, Speed Goal), and internal model beliefs to explore this "
-            "request. Do not assume hardware failure unless telemetry supports it.\n\n"
+            "The operator is requesting a deliberate strategy or objective change. "
+            "Adjust MPC cost weights, planner metaparameters, task parameters, and "
+            "internal model beliefs to explore this request. "
+            "Because the overarching objective is changing, you MUST include an "
+            "updated Error_Tracking block so success/failure criteria match the new "
+            "mission. Do not assume hardware failure unless telemetry supports it.\n\n"
             "## PRIOR INTERVENTIONS THIS SESSION\n"
             f"{self.format_prior_interventions()}\n\n"
             + _format_context_sections(
-                mpc_config, belief, "## CURRENT TELEMETRY SNAPSHOT", telemetry
+                mpc_config,
+                belief,
+                "## CURRENT TELEMETRY SNAPSHOT",
+                telemetry,
+                error_tracking=_error_tracking_text(loka_state),
             )
         )

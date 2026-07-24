@@ -1,5 +1,4 @@
 import argparse
-import os
 import sys
 import time
 import threading
@@ -8,26 +7,33 @@ from collections import deque
 
 import mujoco
 import mujoco.viewer
-import mujoco_mpc
 import numpy as np
 from mujoco_mpc import agent as mpc_agent
 
 from loka.compressor import (
     ANOMALY_COLLECTION_S,
     DEFAULT_TELEMETRY_SECTIONS,
-    ERROR_TRIGGER_THRESHOLD,
     get_tracking_error,
     synthesize_generalized_telemetry,
     TelemetrySections,
     TELEMETRY_WINDOW_S,
 )
+from loka.error_spec import format_error_spec
 from loka.model_state import apply_loka_mutations, zero_dead_actuator_commands
 from loka.orchestrator import apply_scratchpad, llm_worker, load_system_prompt
-from loka.robot_context import build_robot_model_context, capture_nominal_params, format_current_mpc_configuration
+from loka.robot_context import (
+    build_robot_model_context,
+    capture_nominal_params,
+    discover_capabilities,
+    format_current_mpc_configuration,
+)
 from loka.session import FailureEpisode, OperatorSession
+from loka.task_catalog import initial_error_spec, known_task_ids, resolve_xml_path
 
-LOKA_ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_XML_PATH = os.path.join(LOKA_ROOT, "models", "walker", "task.xml")
+DEFAULT_TASK_ID = "Walker"
+DEFAULT_OBJECTIVE = (
+    "Sustained locomotion: maintain Height Goal (~1.2 m) and Speed Goal (1.0 m/s)."
+)
 OPERATOR_REQUEST_PREFIX = "loka:"
 
 
@@ -55,7 +61,7 @@ def start_operator_input_thread(request_queue: queue.Queue) -> None:
     threading.Thread(target=_reader, daemon=True).start()
 
 
-def build_snapshot_telemetry(nominal_buffer, anomaly_buffer, model, sections):
+def build_snapshot_telemetry(nominal_buffer, anomaly_buffer, model, sections, error_spec):
     """Build telemetry from the most recent frames for operator requests."""
     recent_frames = int(TELEMETRY_WINDOW_S / model.opt.timestep)
     source = list(nominal_buffer) if nominal_buffer else list(anomaly_buffer)
@@ -69,6 +75,7 @@ def build_snapshot_telemetry(nominal_buffer, anomaly_buffer, model, sections):
         deque(recent),
         model,
         sections=sections,
+        error_spec=error_spec,
     )
 
 
@@ -90,26 +97,56 @@ def dispatch_to_orchestrator(
     return user_turn, session
 
 
+def rebuild_system_prompt(loka_state, robot_context, agent, model):
+    capabilities = discover_capabilities(agent, model)
+    return load_system_prompt(
+        robot_context=robot_context,
+        objective=loka_state.get("primary_objective"),
+        capabilities=capabilities,
+        error_spec=loka_state.get("error_spec"),
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run the LOKA MuJoCo MPC simulation.")
-    parser.add_argument("--xml-path", default=DEFAULT_XML_PATH)
+    parser.add_argument(
+        "--xml-path",
+        default=None,
+        help=(
+            "Path to the MJPC task XML. If omitted, LOKA resolves stock XML from "
+            "--task-id (Walker uses models/walker/task.xml; others use mujoco_mpc)."
+        ),
+    )
+    parser.add_argument(
+        "--task-id",
+        default=DEFAULT_TASK_ID,
+        help=(
+            "MJPC task id passed to mujoco_mpc.Agent (default: Walker). "
+            f"Known: {', '.join(known_task_ids())}."
+        ),
+    )
+    parser.add_argument(
+        "--objective",
+        default=None,
+        help="Primary mission text injected into the orchestrator system prompt.",
+    )
     parser.add_argument(
         "--telemetry-section-0",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_TELEMETRY_SECTIONS.section_0_torso,
-        help="Include section 0 (torso kinematic state) in LLM telemetry.",
+        default=DEFAULT_TELEMETRY_SECTIONS.section_0_state,
+        help="Include section 0 (tracked state) in LLM telemetry.",
     )
     parser.add_argument(
         "--telemetry-section-1",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_TELEMETRY_SECTIONS.section_1_cost,
-        help="Include section 1 (cost landscape differential) in LLM telemetry.",
+        help="Include section 1 (cost / deviation landscape) in LLM telemetry.",
     )
     parser.add_argument(
         "--telemetry-section-2",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_TELEMETRY_SECTIONS.section_2_command_deficit,
-        help="Include section 2 (actuator command deficit) in LLM telemetry.",
+        default=DEFAULT_TELEMETRY_SECTIONS.section_2_motor_load,
+        help="Include section 2 (motor load) in LLM telemetry.",
     )
     parser.add_argument(
         "--telemetry-section-3",
@@ -122,39 +159,63 @@ def parse_args():
 
 def main():
     args = parse_args()
+    xml_path = resolve_xml_path(args.task_id, args.xml_path)
+    objective = args.objective
+    if objective is None:
+        objective = (
+            DEFAULT_OBJECTIVE
+            if args.task_id == "Walker"
+            else f"Complete the '{args.task_id}' task successfully."
+        )
+
     telemetry_sections = TelemetrySections(
-        section_0_torso=args.telemetry_section_0,
+        section_0_state=args.telemetry_section_0,
         section_1_cost=args.telemetry_section_1,
-        section_2_command_deficit=args.telemetry_section_2,
+        section_2_motor_load=args.telemetry_section_2,
         section_3_directive=args.telemetry_section_3,
     )
-    model = mujoco.MjModel.from_xml_path(args.xml_path)
+    model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
-    agent = mpc_agent.Agent(task_id="Walker", model=model)
-    robot_context = build_robot_model_context(model, args.xml_path)
-    system_prompt = load_system_prompt(robot_context)
+    agent = mpc_agent.Agent(task_id=args.task_id, model=model)
+    robot_context = build_robot_model_context(model, xml_path)
+
+    loka_state = {
+        "mutations": [],
+        "nominal_params": capture_nominal_params(model),
+        "primary_objective": objective,
+        "error_spec": initial_error_spec(args.task_id, model),
+    }
+    system_prompt = rebuild_system_prompt(loka_state, robot_context, agent, model)
+
     enabled = [
         name
         for name, on in (
-            ("0:torso", telemetry_sections.section_0_torso),
+            ("0:state", telemetry_sections.section_0_state),
             ("1:cost", telemetry_sections.section_1_cost),
-            ("2:cmd_deficit", telemetry_sections.section_2_command_deficit),
+            ("2:motor_load", telemetry_sections.section_2_motor_load),
             ("3:directive", telemetry_sections.section_3_directive),
         )
         if on
     ]
+    print(f"[LOKA] task_id={args.task_id}")
+    print(f"[LOKA] xml_path={xml_path}")
+    print(f"[LOKA] objective: {objective}")
+    print(f"[LOKA] model nq={model.nq} nv={model.nv} nu={model.nu}")
     print(f"[LOKA] Telemetry sections enabled: {', '.join(enabled) or 'none'}")
+    print("[LOKA] Default Error_Tracking:\n" + format_error_spec(loka_state["error_spec"]))
     print(
         "[LOKA] Operator requests: type a message in this terminal and press Enter.\n"
         "       Optional prefix: loka: <request>\n"
-        "       Example: try a slower hopping gait with more planner exploration"
+        "       Example: walk crouched at 1 m/s"
     )
 
     operator_session = OperatorSession()
     operator_request_queue = queue.Queue()
     start_operator_input_thread(operator_request_queue)
     try:
-        agent.set_task_parameter("Speed Goal", 1.0)
+        task_params = agent.get_task_parameters()
+        if "Speed Goal" in task_params:
+            agent.set_task_parameter("Speed Goal", 1.0)
     except Exception as e:
         print(f"Warning: Could not set Speed Goal ({e}).")
 
@@ -168,17 +229,20 @@ def main():
 
     def apply_physical_faults():
         """Ground-truth hardware faults for physics — override planner model at sim time."""
-        if fault_state["active"]:
+        if fault_state["active"] and right_hip_id != -1:
             model.actuator_gear[right_hip_id, 0] = 0.0
 
     def enforce_faulted_controls(actions):
-        if fault_state["active"]:
+        if fault_state["active"] and right_hip_id != -1:
             actions[right_hip_id] = 0.0
         return actions
 
     def key_callback(keycode):
         try:
             if chr(keycode).lower() == "f":
+                if right_hip_id == -1:
+                    print("\n\n[KEYBOARD] No right_hip actuator; fault inject skipped.")
+                    return
                 fault_state["active"] = not fault_state["active"]
                 status = "INJECTED" if fault_state["active"] else "CLEARED"
                 print(f"\n\n[KEYBOARD] Right hip fault {status}!")
@@ -203,16 +267,13 @@ def main():
     pending_session = None
     queued_operator_requests = 0
 
-    loka_state = {
-        "mutations": [],
-        "nominal_params": capture_nominal_params(model),
-    }
-
     with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
         mujoco.mj_resetData(model, data)
 
         while viewer.is_running():
             step_start = time.time()
+            error_spec = loka_state["error_spec"]
+            trigger_threshold = error_spec.trigger_threshold
 
             if not llm_queue.empty():
                 worker_result = llm_queue.get()
@@ -228,19 +289,33 @@ def main():
                         model,
                         episode=completed_session,
                         data=data,
+                        task_id=args.task_id,
+                    )
+                    # Refresh injected capabilities / Error_Tracking after LLM updates.
+                    system_prompt = rebuild_system_prompt(
+                        loka_state, robot_context, agent, model
                     )
                 pending_user_turn = None
                 pending_session = None
                 llm_is_busy = False
                 if isinstance(completed_session, FailureEpisode):
                     anomaly_buffer.clear()
-                if get_tracking_error(data) > ERROR_TRIGGER_THRESHOLD:
+                error_spec = loka_state["error_spec"]
+                if get_tracking_error(data, error_spec) > error_spec.trigger_threshold:
                     anomaly_collect_since = data.time
 
             if not llm_is_busy and not operator_request_queue.empty():
                 operator_request = operator_request_queue.get()
+                loka_state["primary_objective"] = operator_request
+                system_prompt = rebuild_system_prompt(
+                    loka_state, robot_context, agent, model
+                )
                 telemetry = build_snapshot_telemetry(
-                    nominal_buffer, anomaly_buffer, model, telemetry_sections
+                    nominal_buffer,
+                    anomaly_buffer,
+                    model,
+                    telemetry_sections,
+                    loka_state["error_spec"],
                 )
                 mpc_config = format_current_mpc_configuration(agent, model)
                 user_turn = operator_session.build_request_turn(
@@ -276,7 +351,7 @@ def main():
             mujoco.mj_step(model, data)
             joint_delta = np.abs(data.qpos - qpos_before)
 
-            current_error = get_tracking_error(data)
+            current_error = get_tracking_error(data, error_spec)
 
             frame_data = {
                 "time": data.time,
@@ -285,6 +360,7 @@ def main():
                 "ctrl": data.ctrl.copy(),
                 "planner_cmd": planner_cmd,
                 "joint_delta": joint_delta,
+                "actuator_force": data.actuator_force.copy(),
             }
 
             anomaly_buffer.append(frame_data)
@@ -303,7 +379,7 @@ def main():
                 failure_episode = None
                 anomaly_collect_since = None
 
-            in_failure = current_error > ERROR_TRIGGER_THRESHOLD
+            in_failure = current_error > trigger_threshold
             if in_failure:
                 if anomaly_collect_since is None:
                     anomaly_collect_since = data.time
@@ -326,6 +402,7 @@ def main():
                         anomaly_buffer,
                         model,
                         sections=telemetry_sections,
+                        error_spec=error_spec,
                     )
                     mpc_config = format_current_mpc_configuration(agent, model)
 

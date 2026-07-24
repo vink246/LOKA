@@ -1,9 +1,12 @@
+"""Robot MJCF reference text and live MPC capability formatting for LOKA."""
+
 import os
 import re
 
 import mujoco
 
-from loka.orchestrator import SUPPORTED_PLANNER_NUMERICS, get_model_numeric
+from loka.error_spec import ErrorSpec, format_error_spec
+from loka.mjcf_utils import SUPPORTED_PLANNER_NUMERICS, get_model_numeric
 
 _JOINT_TYPES = {
     int(mujoco.mjtJoint.mjJNT_FREE): "free",
@@ -77,6 +80,78 @@ def capture_nominal_params(model):
     return {"actuators": actuators, "geoms": geoms, "bodies": bodies}
 
 
+def discover_capabilities(agent, model) -> dict:
+    """Live cost weights, task parameters, and planner numerics from the loaded model."""
+    try:
+        cost_weights = {name: float(val) for name, val in agent.get_cost_weights().items()}
+    except Exception:
+        cost_weights = {}
+
+    try:
+        task_parameters = {
+            name: float(val) for name, val in agent.get_task_parameters().items()
+        }
+    except Exception:
+        task_parameters = {}
+
+    planner = {}
+    for name in sorted(SUPPORTED_PLANNER_NUMERICS):
+        value = get_model_numeric(model, name)
+        if value is not None:
+            planner[name] = value
+
+    return {
+        "cost_weights": cost_weights,
+        "task_parameters": task_parameters,
+        "planner": planner,
+    }
+
+
+def format_capabilities_block(capabilities: dict) -> str:
+    lines = ["AVAILABLE CONTROLLER / PLANNER / TASK PARAMETERS"]
+
+    weights = capabilities.get("cost_weights", {})
+    lines.append("Available Cost Weights (use exact names in Controller_Targets):")
+    if weights:
+        for name, value in sorted(weights.items()):
+            lines.append(f'  - "{name}" (current: {value:.4g})')
+    else:
+        lines.append("  - [none discovered]")
+
+    planner = capabilities.get("planner", {})
+    lines.append("Available Planner Metaparameters:")
+    if planner:
+        for name, value in sorted(planner.items()):
+            lines.append(f'  - "{name}" (current: {value:.4g})')
+    else:
+        lines.append("  - [none discovered]")
+
+    tasks = capabilities.get("task_parameters", {})
+    lines.append("Available Task Parameters (use exact names in Task_Targets):")
+    if tasks:
+        for name, value in sorted(tasks.items()):
+            lines.append(f'  - "{name}" (current: {value:.4g})')
+    else:
+        lines.append("  - [none discovered]")
+
+    return "\n".join(lines)
+
+
+def format_primary_objective_block(objective: str) -> str:
+    return (
+        "PRIMARY OBJECTIVE\n"
+        f"{objective.strip()}\n"
+        "All MPC targets and Error_Tracking criteria should serve this objective."
+    )
+
+
+def format_current_error_tracking(error_spec: ErrorSpec) -> str:
+    return (
+        "CURRENT ERROR TRACKING (live success / failure criteria):\n"
+        f"{format_error_spec(error_spec)}"
+    )
+
+
 def _lookup_nominal(nominal_params, mutation):
     obj_type = mutation["type"]
     name = mutation["name"]
@@ -103,7 +178,7 @@ def format_current_model_belief(loka_state):
     for mutation in latest.values():
         nominal_val = _lookup_nominal(nominal_params, mutation)
         applied_at = mutation.get("applied_at")
-        time_note = f", applied t={applied_at:.2f}s" if applied_at is not None else ""
+        time_note = f", applied at t={applied_at:.2f}s" if applied_at is not None else ""
         lines.append(
             f"  - {mutation['type']} '{mutation['name']}'.{mutation['attr']}: "
             f"{mutation['val']} (nominal: {nominal_val}{time_note})"
@@ -157,15 +232,24 @@ def build_robot_model_context(model, xml_path):
         body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
         parent_id = model.body_parentid[body_id]
         parent_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, parent_id) or "world"
-        lines.append(f"  - {body_name} (parent: {parent_name})")
+        body_pos = model.body_pos[body_id]
+        lines.append(
+            f"  - {body_name} (parent: {parent_name}, "
+            f"mjcf_pos=[{body_pos[0]:.3g}, {body_pos[1]:.3g}, {body_pos[2]:.3g}])"
+        )
 
-    lines.extend(["", "Joint / DOF layout (maps to qpos/qvel in telemetry):"])
+    lines.extend([
+        "",
+        "Joint / DOF layout (maps to qpos/qvel; use these indices in Error_Tracking):",
+    ])
     for joint_id in range(model.njnt):
         joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
         qpos_idx = model.jnt_qposadr[joint_id]
         qvel_idx = model.jnt_dofadr[joint_id]
         joint_type = _joint_type_name(model.jnt_type[joint_id])
-        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, model.jnt_bodyid[joint_id])
+        body_name = mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_BODY, model.jnt_bodyid[joint_id]
+        )
 
         range_str = ""
         if model.jnt_limited[joint_id]:
@@ -177,17 +261,14 @@ def build_robot_model_context(model, xml_path):
             f"qpos[{qpos_idx}], qvel[{qvel_idx}]{range_str}"
         )
 
-    lines.extend([
-        "",
-        "Torso root semantics (planar walker):",
-        "  - rootz (qpos[0]): vertical slide; world height = 1.3 + qpos[0]",
-        "  - rootx (qpos[1]): forward slide along +X (m)",
-        "  - rooty (qpos[2]): torso pitch hinge (rad); positive = lean forward",
-        "  - qvel[0]: vertical velocity, qvel[1]: forward velocity, qvel[2]: pitch rate",
-        "",
-        "Actuators (exact lowercase names for Model_Mutations):",
-    ])
+    lines.append("")
+    lines.append(
+        "Note: for slide joints parented under a body with non-zero mjcf_pos, "
+        "world-frame position is often mjcf_pos[axis] + qpos[index]. "
+        "Use Error_Tracking.offset when you need world-frame values."
+    )
 
+    lines.extend(["", "Actuators (exact lowercase names for Model_Mutations):"])
     for actuator_id in range(model.nu):
         actuator_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
         target_joint = _actuator_target_joint(model, actuator_id) or "unknown"
@@ -200,10 +281,10 @@ def build_robot_model_context(model, xml_path):
 
     lines.extend([
         "",
-        "Mutable object examples:",
+        "Mutable object attributes:",
         "  - actuators: gear",
-        "  - geoms: friction (e.g. floor)",
-        "  - bodies: mass (e.g. torso, right_thigh)",
+        "  - geoms: friction",
+        "  - bodies: mass",
     ])
 
     mjcf = load_kinematics_mjcf(xml_path)
