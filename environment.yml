@@ -1,0 +1,21 @@
+name: loka
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # Core sim / control (mujoco_mpc is installed separately from source)
+      - mujoco==3.2.3
+      - numpy>=1.24
+      # LOKA orchestrator
+      - openai>=1.40
+      - python-dotenv>=1.0
+      - pyyaml>=6.0
+      # Needed to build/install google-deepmind/mujoco_mpc Python bindings
+      - grpcio>=1.60
+      - grpcio-tools>=1.60
+      - protobuf>=4.25
+      - matplotlib>=3.8
+      - mediapy>=1.2
