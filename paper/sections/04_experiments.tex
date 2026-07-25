@@ -1,0 +1,56 @@
+\section{Experimental Design and Evaluation}
+\label{sec:experiments}
+
+We evaluate LOKA in the MuJoCo physics simulation environment on an underactuated bipedal walker driven by MuJoCo MPC (MJPC), with planned extensions to additional humanoid embodiments.
+
+\subsection{Evaluation Scenarios}
+\label{sec:scenarios}
+
+To validate robust reformulation across physical and semantic shifts, the system is subjected to four validation tasks:
+\begin{itemize}
+\item \textbf{Mass Shift:} An unmodeled mass of \(x\)\,kg (TODO) is attached asymmetrically mid-stride, forcing the system to detect effort imbalance and re-stabilize its center-of-mass target.
+\item \textbf{Friction Shift:} The global surface friction coefficient is stepped down from a nominal value of $1.0$ to a reduced value (TODO) to evaluate real-time environmental adaptation.
+\item \textbf{Hardware Failure:} A hard fault is injected into a critical actuator (e.g., right hip), setting physical torque capacity to zero to validate the virtual-amputation pipeline.
+\item \textbf{Semantic / Operator Objectives:} The robot receives overarching language instructions (e.g., crouch and walk, crawl, hold upright) and/or must navigate a specialized corridor featuring a low overhanging ceiling followed by elevated rubble.
+\end{itemize}
+
+\subsection{Quantitative Performance Metrics}
+\label{sec:metrics}
+
+The framework is evaluated using the following metrics:
+\begin{itemize}
+\item \textbf{Task Success Rate (TSR):} Fraction of trials where the robot reaches the terminal criterion without falling.
+\item \textbf{Time to Stabilization ($T_s$):} Duration between anomaly onset and restoration of a steady-state gait (or satisfaction of updated mission criteria).
+\item \textbf{Effort Deviation Integral ($E_{dev}$):} Accumulated energy metric in Equation~\ref{eq:effort}, quantifying adaptation efficiency (alternative integrals over tracking residuals are also under consideration).
+\item \textbf{Outer-loop turns:} Number of orchestrator interventions until success or timeout.
+\item \textbf{Semantic Accuracy Percentage (SAP):} An automated judge (independent frontier model) comparing parsed scratchpad mutations against hidden fault metadata.
+\item \textbf{Interface reliability:} Rates of invalid YAML and unresolved MJCF names.
+\end{itemize}
+
+\subsection{Comparative Baselines}
+\label{sec:baselines}
+
+\textbf{TODO:} Flesh out precise baseline implementations adapted to the dynamic bipedal domain (e.g., vanilla fixed MJPC, Domain Randomization without online mutation, ablations without model mutations or multi-turn history, and a code-generation / Language-to-Rewards variant where latency permits).
+
+\begin{table}[t]
+  \centering
+  \caption{Placeholder results (fault recovery \%, operator success \%, median outer-loop turns).}
+  \label{tab:results}
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Method & Fault (\%) & Op.\ (\%) & Turns \\
+    \midrule
+    Fixed MJPC & -- & -- & -- \\
+    Ablation (no mut.) & -- & -- & -- \\
+    LOKA (full) & -- & -- & -- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=\linewidth]{recovery_curves.pdf}
+%   \caption{Tracking error vs.\ time after fault injection for LOKA and baselines.}
+%   \label{fig:recovery}
+% \end{figure}

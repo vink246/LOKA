@@ -1,0 +1,67 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\graphicspath{{figures/}}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{LLM-Orchestrated Kinematic Adaptation (LOKA): An Immune System for Dynamic Humanoid Locomotion}
+
+\author{\IEEEauthorblockN{Vineet Kulkarni}
+\IEEEauthorblockA{\textit{School of Interactive Computing} \\
+\textit{Georgia Institute of Technology}\\
+Atlanta, Georgia, USA \\
+vkulkarni46@gatech.edu}
+\and
+\IEEEauthorblockN{Nitish Sontakke}
+\IEEEauthorblockA{\textit{School of Interactive Computing} \\
+\textit{Georgia Institute of Technology}\\
+Atlanta, Georgia, USA \\
+nitishsontakke@gatech.edu}
+\and
+\IEEEauthorblockN{Dr.\ Sehoon Ha (Advisor)}
+\IEEEauthorblockA{\textit{School of Interactive Computing} \\
+\textit{Georgia Institute of Technology}\\
+Atlanta, Georgia, USA \\
+sehoonha@gatech.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Translating the semantic reasoning capabilities of foundation models into the high-frequency control signals required for robotic systems remains a critical challenge.
+Existing paradigms face significant architectural barriers: monolithic Vision-Language-Action (VLA) models struggle to adapt to novel task combinations in long-horizon domains; offline Domain Randomization (DR) leaves a persistent deployment gap under unexpected physical alterations; and autoregressive Large Language Model (LLM) code-generation frameworks introduce latencies that are fatal to dynamic bipedal balancing.
+This paper introduces LLM-Orchestrated Kinematic Adaptation (LOKA), a hybrid neuro-symbolic control architecture for real-time humanoid stabilization and gait discovery.
+LOKA decouples low-frequency semantic reasoning from high-frequency physical optimization through an asynchronous dual-rate execution engine.
+An intermediate Telemetry Compressor monitors motor effort and mission criteria, filtering raw high-frequency data into dense semantic trend tags.
+Upon detecting internal or environmental anomalies or an operator language request, a language model acts as an online system-identification engine via a structured YAML scratchpad.
+Rather than generating high-latency policy code, the orchestrator mutates the objective landscape, task targets, success criteria, and kinematic assumptions referenced by an active Model Predictive Controller (MPC).
+By bridging qualitative inference with quantitative optimal control, LOKA targets zero-shot physical adaptation under structural degradation and extreme environmental transitions.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Vision-Language Models, Embodied AI, Kinematic Adaptation, Model Predictive Control, Humanoid Robotics
+\end{IEEEkeywords}
+
+\input{sections/01_introduction}
+\input{sections/02_related_work}
+\input{sections/03_method}
+\input{sections/04_experiments}
+\input{sections/05_discussion}
+\input{sections/06_conclusion}
+
+\input{sections/A_appendix}
+
+\input{sections/references}
+
+\end{document}

@@ -1,0 +1,62 @@
+\section{Related Work and Literature Review}
+\label{sec:related}
+
+To position LOKA within the current robotics landscape, we analyze related architectures across four primary research domains.
+
+\subsection{Slow-Fast Orchestration and Online Fault Recovery}
+\label{sec:related-slowfast}
+
+Decoupling symbolic cognitive reasoning from reactive physical stabilization has been explored across multiple domains.
+The AESOP framework utilizes a high-frequency anomaly classifier to trigger a slow generative LLM reasoner, relying on an MPC to preserve physical feasibility during the reasoning latency gap on embedded hardware~\cite{AESOP}.
+The REFLECT framework processes multisensory log data into a hierarchical natural language summary to enable an LLM to explain manipulation failures and guide corrective behavior~\cite{REFLECT}.
+While structurally related, REFLECT operates as a post-mortem diagnostic tool for general tasks, whereas LOKA's Telemetry Compressor monitors high-frequency proprioceptive stream inputs to execute online adjustments.
+
+Online parameter modification has been explored in wheeled robotics and autonomous driving.
+For instance, the Hey Robot! framework uses an LLM to modulate objective cost weights based on human preferences for mobile navigation, though it lacks structural awareness of the physical model~\cite{HeyRobot}.
+Similarly, RobotxR1 exposes MPC cost structures and safety margins as online-tunable parameters that a closed-loop reinforcement learning agent alters via language prompts~\cite{RobotxR1}.
+However, RobotxR1 treats the underlying kinematic model as an unchangeable prior.
+LOKA expands this authority by allowing structural modifications to the solver's body model.
+The integration of neuro-symbolic planners, such as Recover, combines explicit rule-based logic with language agents to isolate physical faults~\cite{Recover}.
+LOKA avoids the execution gaps of pure symbolic rule bases by mapping outputs directly into a continuous optimal control loop.
+
+Decoupling processing frequencies has also been applied to vehicle routing and monolithic transformers.
+AsyncDriver implements an asynchronous multi-threaded system to separate high-latency driving reasoning from real-time path planning~\cite{AsyncDriver}.
+In end-to-end foundation policies, Fast-in-Slow (FiS-VLA) builds a unified dual-system policy that embeds high-frequency execution token heads directly inside a larger, low-frequency VLM backbone~\cite{FiS-VLA}.
+LOKA shares these multi-rate design patterns but rejects black-box end-to-end actions, ensuring low-level physical safety by anchoring the fast loop to a mathematically transparent MPC solver.
+
+\subsection{Language-to-Rewards and Code Generation}
+\label{sec:related-code}
+
+The dominant paradigm for bridging foundation models with optimal control relies on generating executable Python code.
+The Eureka and Text2Reward architectures utilize LLMs as automated programmers to search over and debug dense reward functions for reinforcement learning agents~\cite{Eureka, Text2Reward}.
+While highly effective, these frameworks operate strictly as heavy offline synthesis engines requiring thousands of environment rollouts.
+
+For online application, the ASPIRE framework distills successful debugging sessions into a reusable text-based skill library using synchronous programmatic synthesis for manipulation tasks~\cite{ASPIRE}.
+Similarly, the Language to Rewards (L2R) framework translates natural language text descriptors into functional reward scripts optimized in a loop by a MuJoCo MPC~\cite{Lang2Reward}.
+Video2Reward derives reward metrics from target video behaviors for legged robots~\cite{Video2Reward}.
+While expressive, these systems are fundamentally bounded by the autoregressive code generation bottleneck, exposing the system to syntax failures and unrecoverable latency during runtime anomalies.
+LOKA diverges sharply from this line of work by replacing code generation entirely with a strictly typed parameter and model mutation engine.
+
+\subsection{LLM-Guided Feedback Control Loops}
+\label{sec:related-feedback}
+
+A parallel vector of research integrates language models into active feedback control architectures.
+The LLMs-guided Adaptive Compensator utilizes an LLM to dynamically output an error-tracking compensator, verifying the loop via stability criteria on soft and humanoid links~\cite{LLMadaptive}.
+At the joint gain level, the LLM-Controller framework dynamically modulates nonlinear feedback properties while relying on the underlying baseline tracking architecture to preserve local stability~\cite{LLMcontroller}.
+Automated frameworks like ControlAgent and AgenticControl leverage multi-agent language systems to design classical proportional-integral-derivative (PID) layouts by reasoning through phase margins and settling times~\cite{ControlAgent, AgenticControl}.
+
+To bridge optimization with neural safety, architectures such as Never Too Rigid to Reach enforce Lyapunov-constrained reinforcement learning priors to guide virtual model control on flexible arms~\cite{NeverRigid}.
+Furthermore, the Meta-Control architecture synthesizes entirely new control topologies depending on changing operational skills~\cite{MetaControl}.
+LOKA shares the philosophy of leveraging language priors to modulate control characteristics, but shifts the intervention point.
+Rather than operating at the joint-level error feedback or gain layer, LOKA mutates the predictive horizon, task-space priorities, and kinematic assumptions of an online preview optimization engine.
+
+\subsection{Alternative Robot-Language Interface Modalities}
+\label{sec:related-interfaces}
+
+Exposing intermediate control spaces to language models remains a highly active area of study.
+The SayTap framework utilizes binary foot-contact matrices as a structured intermediate interface to map language commands to quadrupedal locomotion policies~\cite{SayTap}.
+OmniVIC couples VLMs with retrieval-augmented generation to continually reconfigure the stiffness and damping properties of a Variable Impedance Controller (VIC), applying explicit force bounds for safety~\cite{OmniVIC}.
+For manipulation, the IROSA framework maps user prompts to the operational parameters of Kernelized Movement Primitives (KMPs) through tool calls, completely isolating the language agent from direct trajectory generation~\cite{IROSA}.
+
+To handle complex contact profiles, the CompliantVLA-adaptor and GenCHiP frameworks inject language-derived force compliance, variable impedance values, and compliance boundaries directly into manipulation matrices to ensure safety during physical interaction~\cite{CompliantVLA, GenCHiP}.
+LOKA generalizes this mapping philosophy to the full-body locomotion of underactuated bipeds, utilizing a structured YAML configuration block to map semantic objectives directly into high-degree-of-freedom tracking priorities.

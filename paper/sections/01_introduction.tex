@@ -1,0 +1,28 @@
+\section{Introduction}
+\label{sec:introduction}
+
+The pursuit of artificial general intelligence within the physical realm has catalyzed a transition from narrow control loops to broad, multi-modal generalist policies.
+At the forefront of this evolution is the integration of foundation models into robotic control architectures.
+However, recent evaluations reveal that current VLMs' physical reasoning skills remain prone to causal hallucination and tracking drift~\cite{PhysionGap}.
+Safely translating high-level cognitive reasoning into the continuous, high-frequency control signals required for dynamically balancing underactuated humanoids remains a formidable engineering challenge.
+
+Current paradigms attempting to bridge this gap exhibit severe shortcomings.
+Monolithic Vision-Language-Action (VLA) models map perception directly to actions, yet they struggle to generalize behavior compositionally and fail when confronted with novel combinations of familiar skills, making them highly prone to compounding errors during long-horizon execution~\cite{OpenVLA, ACT_VLA}.
+Conversely, traditional trajectory optimization and Model Predictive Control (MPC) yield precise execution and constraint satisfaction over short horizons, but they are inherently rigid and lack global semantic awareness~\cite{MPC_Rigidity}.
+When an out-of-distribution physical shift occurs during live deployment, standard controllers fail to re-plan appropriately because their internal models are mathematically blind to the structural modification.
+
+To handle these variations, state-of-the-art systems rely heavily on Domain Randomization (DR)~\cite{TobinDR}.
+DR is an offline robustification technique.
+While it accommodates bounded Gaussian noise in simulation, it cannot dynamically isolate and adapt to discrete, unmodeled physical variations during runtime.
+Recent online integration efforts utilize foundation models to synthesize reward functions via code generation~\cite{Lang2Reward}.
+Yet, even if code generation is moved outside the synchronous control loop to mitigate latency, the code-as-policy paradigm remains inherently brittle; ensuring syntactic and mathematical correctness without catastrophic failure remains a critical vulnerability~\cite{CodeAsPolicyBrittleness}.
+
+To resolve the latency-stability paradox, this paper introduces LLM-Orchestrated Kinematic Adaptation (LOKA).
+LOKA moves the field away from high-latency code synthesis and toward real-time parameter and structural model mutation.
+The key contributions of this research are:
+\begin{itemize}
+\item \textbf{Effort-Driven Telemetry Compression:} An intermediate middleware node that continuously monitors actuator torque deficits, energy gradients, and mission error criteria.
+It delta-masks nominal behavior and synthesizes complex physical anomalies into compressed semantic strings, triggering the cognitive model before tracking errors lead to collapse.
+\item \textbf{Asynchronous Dual-Rate Execution:} A hardware-capable architecture that completely isolates the high-frequency physical execution loop from the low-frequency inference time of the language model using thread-safe background processing queues.
+\item \textbf{Dynamic Kinematic Malleability:} A structured YAML scratchpad interface that enables the language model to act as a real-time system identification engine, granting it direct authority to mutate cost weights, planner numerics, task goals, success criteria, and the active controller's physical self-awareness on the fly.
+\end{itemize}

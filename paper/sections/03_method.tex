@@ -1,0 +1,109 @@
+\section{Methodology: The LOKA Architecture}
+\label{sec:method}
+
+LOKA operates as a continuous cognitive system-identification loop.
+The pipeline consists of four tightly coupled phases executed across a specialized multi-threaded computational architecture (Fig.~\ref{fig:architecture}).
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.92\linewidth}{\centering\vspace{1.0em}
+  \textbf{Fast loop:} MuJoCo plant $\leftrightarrow$ MJPC\\[0.4em]
+  Telemetry buffer $\rightarrow$ Compressor / Error\_Tracking\\[0.4em]
+  Anomaly or operator request $\rightarrow$ LLM orchestrator (slow)\\[0.4em]
+  YAML scratchpad $\rightarrow$ costs / planner / tasks / belief\\[0.4em]
+  Affordance clamp $\rightarrow$ apply to live MPC
+  \vspace{1.0em}}}
+  \caption{LOKA dual-rate architecture (placeholder figure).
+  A high-frequency MJPC loop continues while a background LLM mutates costs, planner numerics, task goals, mission criteria, and internal-model belief from compressed telemetry.}
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Phase 1: Effort-Driven Telemetry Compression}
+\label{sec:telemetry}
+
+Rather than triggering adaptation only after tracking error has corrupted the bipedal state vector, LOKA monitors energy expenditure within the low-level planner and mission criteria exposed by \texttt{Error\_Tracking}.
+The MPC continuously generates an optimal control input vector representing commanded actuator torques.
+The Telemetry Compressor calculates the Effort Deviation Integral ($E_{dev}$) over a sliding temporal window of length $W$:
+\begin{equation}
+E_{dev} = \int_{t-W}^{t} \| u_{\text{actual}}(\tau) - u_{\text{nominal}}(\tau) \|^2 d\tau
+\label{eq:effort}
+\end{equation}
+When $E_{dev}$ violates a safety boundary---or when composite mission excess exceeds a trigger threshold---the Compressor freezes the high-frequency telemetry buffer, delta-masks nominal state variables, and synthesizes the anomaly into semantic tags.
+For example, a joint exhibiting maximum torque saturation but near-zero joint velocity is tagged as \texttt{[SATURATED\_SEIZED]}, while high torque coupled with erratic velocity is tagged as \texttt{[SATURATED\_FLAILING]}.
+
+In the current implementation, compressed reports are organized into optional sections:
+(0)~tracked state relative to live \texttt{Error\_Tracking} terms;
+(1)~cost / residual summaries;
+(2)~motor-load asymmetry and saturation cues;
+(3)~directive / mission context.
+We are additionally evaluating visual embeddings for spatial context.
+Sections can be toggled for ablations that isolate which observations the orchestrator requires.
+
+\subsection{Phase 2: Asynchronous Dual-Rate Execution}
+\label{sec:async}
+
+To prevent LLM inference latency from freezing the controller, LOKA implements a clean asynchronous partitioning scheme:
+\begin{enumerate}
+\item \textbf{Fast control loop (main thread):} Samples the true state vector from the physics engine (with future expansions accommodating state estimators), invokes the MPC planner step, maps actions to actuators, and updates rolling history queues.
+\item \textbf{Slow cognitive loop (background thread):} When an anomaly is flagged, during a periodic heartbeat, or when an operator issues a natural-language request, a background worker constructs the semantic prompt---including prior interventions in the current failure episode---and dispatches it to the orchestrator.
+\end{enumerate}
+While the LLM executes its forward pass, the main thread continues physics steps unhindered, relying on the last known valid configuration to keep the robot stable.
+
+\subsection{Phase 3: The YAML Scratchpad}
+\label{sec:scratchpad}
+
+The interface between the slow and fast threads is a strictly typed shared repository: the YAML scratchpad.
+The underlying MPC continuously minimizes a quadratic task-space cost over a preview horizon $N$:
+\begin{equation}
+J = \sum_{k=0}^{N-1} \left( \| x_k - x_{\text{ref}} \|_Q^2 + \| u_k \|_R^2 \right) + \| x_N - x_{\text{ref}} \|_P^2
+\label{eq:mpc_obj}
+\end{equation}
+where $Q$ and $R$ represent diagonal tracking and effort penalization matrices.
+The LLM mutates this optimization landscape by returning a formatted block with optional sections (omit keys that are unchanged):
+\begin{itemize}
+\item \texttt{Semantic\_State}: chain-of-thought hypothesis and analysis before parameter edits;
+\item \texttt{Controller\_Targets}: diagonal cost weights adjusting the importance of individual residuals;
+\item \texttt{Planner\_Targets}: e.g., \texttt{agent\_horizon} and \texttt{sampling\_exploration} (applied by recreating the MJPC agent);
+\item \texttt{Task\_Targets}: mission setpoints exposed by the active MJPC task (e.g., height and speed goals);
+\item \texttt{Error\_Tracking}: composite trigger threshold plus weighted terms over \texttt{qpos}/\texttt{qvel} indices with modes such as \texttt{below\_target}, \texttt{above\_target}, \texttt{abs\_above}, and \texttt{abs\_deviation};
+\item \texttt{Model\_Mutations}: continuous structural edits to the planner's internal prior---actuator \texttt{gear}, geom \texttt{friction}, and body \texttt{mass}---resolved against MJCF names, independent of the hidden physical plant.
+\end{itemize}
+Multi-turn failure episodes surface prior diagnoses so the model must revise its hypothesis rather than repeat unchanged mutations.
+Operator requests may arrive outside failure and can rewrite task goals; when the mission changes, \texttt{Error\_Tracking} must be updated to match.
+
+\subsection{Phase 4: Affordance Clamping and Execution}
+\label{sec:apply}
+
+Upon completion of inference, the resulting string is captured via a thread-safe queue, parsed, and handed to the main loop.
+Before targets are applied, they pass through a deterministic affordance filter.
+If the language model proposes a parameter that violates hard kinematic constraints (e.g., a torso height beyond maximum leg extension), the filter clamps the value to the nearest physical boundary.
+Once validated, the main loop updates model properties and controller settings.
+If a joint is mutated to a gear ratio of $0.0$ (virtual amputation), middleware zeros subsequent control signals for that actuator index, forcing the solver to discover alternative strategies with the remaining functional links.
+Mutations update what the MPC \emph{believes}; they do not repair the physical plant.
+Policy guidance requires aligning belief with observations---e.g., reducing gear on a dead motor---rather than increasing gear to ``force'' a seized joint.
+
+\subsection{Algorithm Overview}
+\label{sec:algorithm}
+
+The following pseudocode outlines the asynchronous orchestration loop.
+
+\begin{algorithmic}[1]
+\STATE \textbf{Initialize:} $MPC_{state}$, $LOKA_{memory}$, $Q_{thread}$
+\STATE \textbf{Start Main Physics Loop} (high frequency)
+\WHILE{Robot is Active}
+    \STATE $E_{dev} \leftarrow$ Calculate\_Effort\_Deviation()
+    \STATE $e_{track} \leftarrow$ Evaluate\_Error\_Tracking()
+    \IF{($E_{dev} >$ Threshold \OR $e_{track} >$ Trigger \OR OperatorRequest) \AND LLM not busy}
+        \STATE $Telemetry \leftarrow$ Compress\_State($MPC_{state}$)
+        \STATE Spawn\_Thread(Query\_LLM($Telemetry$, EpisodeHistory), $Q_{thread}$)
+    \ENDIF
+    \IF{$Q_{thread}$ has message}
+        \STATE $YAML_{updates} \leftarrow$ Parse\_Queue($Q_{thread}$)
+        \STATE Validate\_Constraints($YAML_{updates}$)
+        \STATE Mutate\_MPC\_Model($YAML_{updates}$)
+        \STATE Record\_Intervention($YAML_{updates}$)
+    \ENDIF
+    \STATE $u_{optimal} \leftarrow$ $MPC$.Step\_Planner()
+    \STATE Execute\_Torques(Mask\_Dead\_Actuators($u_{optimal}$))
+\ENDWHILE
+\end{algorithmic}
