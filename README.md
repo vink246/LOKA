@@ -83,6 +83,8 @@ Useful flags:
 | `--task-id Walker` | MJPC task id (default: Walker; uses `models/walker/`) |
 | `--xml-path PATH` | Override task XML |
 | `--objective "..."` | Mission text for the orchestrator |
+| `--record [PATH]` | Record from a tracking camera to video (default: `loka_recording.mp4`) |
+| `--record-camera NAME` | Camera for `--record` (default: `side_follow`, moves beside the robot) |
 
 Operator requests: type in the same terminal while the sim runs (optional `loka:` prefix), e.g. `walk crouched at 1 m/s`.
 

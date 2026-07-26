@@ -21,6 +21,14 @@ from loka.compressor import (
 from loka.error_spec import format_error_spec
 from loka.model_state import apply_loka_mutations, zero_dead_actuator_commands
 from loka.orchestrator import apply_scratchpad, llm_worker, load_system_prompt
+from loka.recording import (
+    DEFAULT_RECORD_CAMERA,
+    DEFAULT_RECORD_FPS,
+    DEFAULT_RECORD_HEIGHT,
+    DEFAULT_RECORD_PATH,
+    DEFAULT_RECORD_WIDTH,
+    VideoRecorder,
+)
 from loka.robot_context import (
     build_robot_model_context,
     capture_nominal_params,
@@ -154,6 +162,43 @@ def parse_args():
         default=DEFAULT_TELEMETRY_SECTIONS.section_3_directive,
         help="Include section 3 (orchestrator directive) in LLM telemetry.",
     )
+    parser.add_argument(
+        "--record",
+        nargs="?",
+        const=DEFAULT_RECORD_PATH,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Record the sim from a tracking camera to a video file. "
+            f"Optional PATH (default: {DEFAULT_RECORD_PATH})."
+        ),
+    )
+    parser.add_argument(
+        "--record-camera",
+        default=DEFAULT_RECORD_CAMERA,
+        help=(
+            "MuJoCo camera used when --record is set "
+            f"(default: {DEFAULT_RECORD_CAMERA}, side view that moves with the robot)."
+        ),
+    )
+    parser.add_argument(
+        "--record-fps",
+        type=float,
+        default=DEFAULT_RECORD_FPS,
+        help=f"Recording frame rate (default: {DEFAULT_RECORD_FPS:g}).",
+    )
+    parser.add_argument(
+        "--record-width",
+        type=int,
+        default=DEFAULT_RECORD_WIDTH,
+        help=f"Recording width in pixels (default: {DEFAULT_RECORD_WIDTH}).",
+    )
+    parser.add_argument(
+        "--record-height",
+        type=int,
+        default=DEFAULT_RECORD_HEIGHT,
+        help=f"Recording height in pixels (default: {DEFAULT_RECORD_HEIGHT}).",
+    )
     return parser.parse_args()
 
 
@@ -208,6 +253,22 @@ def main():
         "       Optional prefix: loka: <request>\n"
         "       Example: walk crouched at 1 m/s"
     )
+
+    recorder = None
+    if args.record is not None:
+        recorder = VideoRecorder(
+            model,
+            path=args.record,
+            camera=args.record_camera,
+            fps=args.record_fps,
+            width=args.record_width,
+            height=args.record_height,
+        )
+        print(
+            f"[LOKA] Recording camera={args.record_camera} "
+            f"({args.record_width}x{args.record_height} @ {args.record_fps:g} fps) "
+            f"-> {args.record}"
+        )
 
     operator_session = OperatorSession()
     operator_request_queue = queue.Queue()
@@ -267,207 +328,214 @@ def main():
     pending_session = None
     queued_operator_requests = 0
 
-    with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
-        mujoco.mj_resetData(model, data)
+    try:
+        with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
+            mujoco.mj_resetData(model, data)
 
-        while viewer.is_running():
-            step_start = time.time()
-            error_spec = loka_state["error_spec"]
-            trigger_threshold = error_spec.trigger_threshold
+            while viewer.is_running():
+                step_start = time.time()
+                error_spec = loka_state["error_spec"]
+                trigger_threshold = error_spec.trigger_threshold
 
-            if not llm_queue.empty():
-                worker_result = llm_queue.get()
-                completed_session = pending_session
-                if worker_result and pending_user_turn is not None and completed_session is not None:
-                    completed_session.append_exchange(
-                        pending_user_turn, worker_result["raw_yaml"]
-                    )
-                    agent = apply_scratchpad(
-                        agent,
-                        worker_result["scratchpad"],
-                        loka_state,
-                        model,
-                        episode=completed_session,
-                        data=data,
-                        task_id=args.task_id,
-                    )
-                    # Refresh injected capabilities / Error_Tracking after LLM updates.
+                if not llm_queue.empty():
+                    worker_result = llm_queue.get()
+                    completed_session = pending_session
+                    if worker_result and pending_user_turn is not None and completed_session is not None:
+                        completed_session.append_exchange(
+                            pending_user_turn, worker_result["raw_yaml"]
+                        )
+                        agent = apply_scratchpad(
+                            agent,
+                            worker_result["scratchpad"],
+                            loka_state,
+                            model,
+                            episode=completed_session,
+                            data=data,
+                            task_id=args.task_id,
+                        )
+                        # Refresh injected capabilities / Error_Tracking after LLM updates.
+                        system_prompt = rebuild_system_prompt(
+                            loka_state, robot_context, agent, model
+                        )
+                    pending_user_turn = None
+                    pending_session = None
+                    llm_is_busy = False
+                    if isinstance(completed_session, FailureEpisode):
+                        anomaly_buffer.clear()
+                    error_spec = loka_state["error_spec"]
+                    if get_tracking_error(data, error_spec) > error_spec.trigger_threshold:
+                        anomaly_collect_since = data.time
+
+                if not llm_is_busy and not operator_request_queue.empty():
+                    operator_request = operator_request_queue.get()
+                    loka_state["primary_objective"] = operator_request
                     system_prompt = rebuild_system_prompt(
                         loka_state, robot_context, agent, model
                     )
-                pending_user_turn = None
-                pending_session = None
-                llm_is_busy = False
-                if isinstance(completed_session, FailureEpisode):
-                    anomaly_buffer.clear()
-                error_spec = loka_state["error_spec"]
-                if get_tracking_error(data, error_spec) > error_spec.trigger_threshold:
-                    anomaly_collect_since = data.time
-
-            if not llm_is_busy and not operator_request_queue.empty():
-                operator_request = operator_request_queue.get()
-                loka_state["primary_objective"] = operator_request
-                system_prompt = rebuild_system_prompt(
-                    loka_state, robot_context, agent, model
-                )
-                telemetry = build_snapshot_telemetry(
-                    nominal_buffer,
-                    anomaly_buffer,
-                    model,
-                    telemetry_sections,
-                    loka_state["error_spec"],
-                )
-                mpc_config = format_current_mpc_configuration(agent, model)
-                user_turn = operator_session.build_request_turn(
-                    operator_request, telemetry, loka_state, data.time, mpc_config
-                )
-                pending_user_turn, pending_session = dispatch_to_orchestrator(
-                    user_turn,
-                    operator_session,
-                    system_prompt,
-                    llm_queue,
-                    f"operator request, {operator_session.prior_turn_count} prior turn(s)",
-                )
-                llm_is_busy = True
-                last_dispatch_time = data.time
-
-            queued_operator_requests = operator_request_queue.qsize()
-
-            apply_planning_model()
-
-            qpos_before = data.qpos.copy()
-            if data.time >= last_planner_time:
-                agent.set_state(time=data.time, qpos=data.qpos, qvel=data.qvel, act=data.act)
-                agent.planner_step()
-                last_planner_time += planner_timestep
-
-            planner_cmd = agent.get_action().copy()
-            raw_actions = planner_cmd.copy()
-            raw_actions = zero_dead_actuator_commands(raw_actions, loka_state)
-            raw_actions = enforce_faulted_controls(raw_actions)
-
-            apply_physical_faults()
-            data.ctrl[:] = raw_actions
-            mujoco.mj_step(model, data)
-            joint_delta = np.abs(data.qpos - qpos_before)
-
-            current_error = get_tracking_error(data, error_spec)
-
-            frame_data = {
-                "time": data.time,
-                "qpos": data.qpos.copy(),
-                "qvel": data.qvel.copy(),
-                "ctrl": data.ctrl.copy(),
-                "planner_cmd": planner_cmd,
-                "joint_delta": joint_delta,
-                "actuator_force": data.actuator_force.copy(),
-            }
-
-            anomaly_buffer.append(frame_data)
-            if current_error == 0.0 and not llm_is_busy:
-                nominal_buffer.append(frame_data)
-
-            if (
-                failure_episode is not None
-                and current_error == 0.0
-                and not llm_is_busy
-            ):
-                print(
-                    f"\n[INFO] Failure episode recovered at t={data.time:.2f}s. "
-                    "Closing LLM conversation thread."
-                )
-                failure_episode = None
-                anomaly_collect_since = None
-
-            in_failure = current_error > trigger_threshold
-            if in_failure:
-                if anomaly_collect_since is None:
-                    anomaly_collect_since = data.time
-
-                collection_ready = (
-                    data.time - anomaly_collect_since
-                ) >= ANOMALY_COLLECTION_S
-                cooldown_ready = (
-                    data.time - last_dispatch_time
-                ) >= COOLDOWN_PERIOD
-
-                if collection_ready and cooldown_ready and not llm_is_busy:
-                    if failure_episode is None:
-                        failure_episode = FailureEpisode(
-                            data.time, nominal_baseline=list(nominal_buffer)
-                        )
-
-                    telemetry = synthesize_generalized_telemetry(
-                        failure_episode.nominal_baseline,
+                    telemetry = build_snapshot_telemetry(
+                        nominal_buffer,
                         anomaly_buffer,
                         model,
-                        sections=telemetry_sections,
-                        error_spec=error_spec,
+                        telemetry_sections,
+                        loka_state["error_spec"],
                     )
                     mpc_config = format_current_mpc_configuration(agent, model)
-
-                    if failure_episode.round_number == 1:
-                        user_turn = failure_episode.build_initial_user_turn(
-                            telemetry, loka_state, data.time, mpc_config
-                        )
-                    else:
-                        user_turn = failure_episode.build_user_turn(
-                            telemetry, loka_state, data.time, mpc_config
-                        )
-
+                    user_turn = operator_session.build_request_turn(
+                        operator_request, telemetry, loka_state, data.time, mpc_config
+                    )
                     pending_user_turn, pending_session = dispatch_to_orchestrator(
                         user_turn,
-                        failure_episode,
+                        operator_session,
                         system_prompt,
                         llm_queue,
-                        (
-                            f"failure episode round {failure_episode.round_number}, "
-                            f"{failure_episode.prior_turn_count} prior turn(s)"
-                        ),
+                        f"operator request, {operator_session.prior_turn_count} prior turn(s)",
                     )
                     llm_is_busy = True
                     last_dispatch_time = data.time
+
+                queued_operator_requests = operator_request_queue.qsize()
+
+                apply_planning_model()
+
+                qpos_before = data.qpos.copy()
+                if data.time >= last_planner_time:
+                    agent.set_state(time=data.time, qpos=data.qpos, qvel=data.qvel, act=data.act)
+                    agent.planner_step()
+                    last_planner_time += planner_timestep
+
+                planner_cmd = agent.get_action().copy()
+                raw_actions = planner_cmd.copy()
+                raw_actions = zero_dead_actuator_commands(raw_actions, loka_state)
+                raw_actions = enforce_faulted_controls(raw_actions)
+
+                apply_physical_faults()
+                data.ctrl[:] = raw_actions
+                mujoco.mj_step(model, data)
+                joint_delta = np.abs(data.qpos - qpos_before)
+
+                current_error = get_tracking_error(data, error_spec)
+
+                frame_data = {
+                    "time": data.time,
+                    "qpos": data.qpos.copy(),
+                    "qvel": data.qvel.copy(),
+                    "ctrl": data.ctrl.copy(),
+                    "planner_cmd": planner_cmd,
+                    "joint_delta": joint_delta,
+                    "actuator_force": data.actuator_force.copy(),
+                }
+
+                anomaly_buffer.append(frame_data)
+                if current_error == 0.0 and not llm_is_busy:
+                    nominal_buffer.append(frame_data)
+
+                if (
+                    failure_episode is not None
+                    and current_error == 0.0
+                    and not llm_is_busy
+                ):
+                    print(
+                        f"\n[INFO] Failure episode recovered at t={data.time:.2f}s. "
+                        "Closing LLM conversation thread."
+                    )
+                    failure_episode = None
                     anomaly_collect_since = None
-            else:
-                anomaly_collect_since = None
 
-            viewer.sync()
+                in_failure = current_error > trigger_threshold
+                if in_failure:
+                    if anomaly_collect_since is None:
+                        anomaly_collect_since = data.time
 
-            if llm_is_busy:
-                status_char = "[THINKING]"
-            elif queued_operator_requests:
-                status_char = f"[REQ Q={queued_operator_requests}]"
-            elif in_failure:
-                if anomaly_collect_since is not None:
-                    collected = data.time - anomaly_collect_since
-                    if collected < ANOMALY_COLLECTION_S:
-                        status_char = (
-                            f"[COLLECT {collected:.1f}/{ANOMALY_COLLECTION_S:.0f}s]"
+                    collection_ready = (
+                        data.time - anomaly_collect_since
+                    ) >= ANOMALY_COLLECTION_S
+                    cooldown_ready = (
+                        data.time - last_dispatch_time
+                    ) >= COOLDOWN_PERIOD
+
+                    if collection_ready and cooldown_ready and not llm_is_busy:
+                        if failure_episode is None:
+                            failure_episode = FailureEpisode(
+                                data.time, nominal_baseline=list(nominal_buffer)
+                            )
+
+                        telemetry = synthesize_generalized_telemetry(
+                            failure_episode.nominal_baseline,
+                            anomaly_buffer,
+                            model,
+                            sections=telemetry_sections,
+                            error_spec=error_spec,
                         )
-                    else:
-                        cooldown_left = COOLDOWN_PERIOD - (
-                            data.time - last_dispatch_time
-                        )
-                        if cooldown_left > 0:
-                            status_char = f"[COOLDOWN {cooldown_left:.1f}s]"
+                        mpc_config = format_current_mpc_configuration(agent, model)
+
+                        if failure_episode.round_number == 1:
+                            user_turn = failure_episode.build_initial_user_turn(
+                                telemetry, loka_state, data.time, mpc_config
+                            )
                         else:
-                            status_char = "[FAIL]"
-                else:
-                    status_char = "[FAIL]"
-            else:
-                status_char = "[NOMINAL]"
-            episode_tag = (
-                f" epR{failure_episode.round_number}" if failure_episode else ""
-            )
-            sys.stdout.write(
-                f"\rSim Time: {data.time:.2f}s | Err: {current_error:.3f} | "
-                f"{status_char}{episode_tag} "
-            )
-            sys.stdout.flush()
+                            user_turn = failure_episode.build_user_turn(
+                                telemetry, loka_state, data.time, mpc_config
+                            )
 
-            time_until_next = model.opt.timestep - (time.time() - step_start)
-            if time_until_next > 0:
-                time.sleep(time_until_next)
+                        pending_user_turn, pending_session = dispatch_to_orchestrator(
+                            user_turn,
+                            failure_episode,
+                            system_prompt,
+                            llm_queue,
+                            (
+                                f"failure episode round {failure_episode.round_number}, "
+                                f"{failure_episode.prior_turn_count} prior turn(s)"
+                            ),
+                        )
+                        llm_is_busy = True
+                        last_dispatch_time = data.time
+                        anomaly_collect_since = None
+                else:
+                    anomaly_collect_since = None
+
+                if recorder is not None:
+                    recorder.maybe_capture(data)
+
+                viewer.sync()
+
+                if llm_is_busy:
+                    status_char = "[THINKING]"
+                elif queued_operator_requests:
+                    status_char = f"[REQ Q={queued_operator_requests}]"
+                elif in_failure:
+                    if anomaly_collect_since is not None:
+                        collected = data.time - anomaly_collect_since
+                        if collected < ANOMALY_COLLECTION_S:
+                            status_char = (
+                                f"[COLLECT {collected:.1f}/{ANOMALY_COLLECTION_S:.0f}s]"
+                            )
+                        else:
+                            cooldown_left = COOLDOWN_PERIOD - (
+                                data.time - last_dispatch_time
+                            )
+                            if cooldown_left > 0:
+                                status_char = f"[COOLDOWN {cooldown_left:.1f}s]"
+                            else:
+                                status_char = "[FAIL]"
+                    else:
+                        status_char = "[FAIL]"
+                else:
+                    status_char = "[NOMINAL]"
+                episode_tag = (
+                    f" epR{failure_episode.round_number}" if failure_episode else ""
+                )
+                sys.stdout.write(
+                    f"\rSim Time: {data.time:.2f}s | Err: {current_error:.3f} | "
+                    f"{status_char}{episode_tag} "
+                )
+                sys.stdout.flush()
+
+                time_until_next = model.opt.timestep - (time.time() - step_start)
+                if time_until_next > 0:
+                    time.sleep(time_until_next)
+    finally:
+        if recorder is not None:
+            recorder.close()
 
 
 if __name__ == "__main__":
