@@ -1,0 +1,57 @@
+# Baseline CPG, MPC, torso path, and UI defaults.
+# Default is STAND STILL (v_ref=0, A_S=0, H=0) with hybrid PD on the legs.
+
+cpg:
+  stride_period: 0.8       # T [s]
+  sweep_amplitude: 0.0     # A_S [m] — keep 0 to stand; raise to walk
+  clearance: 0.0           # H [m] — keep 0 to stand; raise to walk
+  duty_factor: 0.6         # d (stance proportion)
+  phase_left: 0.0          # psi_left
+  phase_right: 0.5         # psi_right (alternating gait)
+  # Nominal foot placement in pelvis frame (from MuJoCo FK of default stand)
+  stance_x: 0.0
+  stance_y_left: 0.1185
+  stance_y_right: -0.1185
+  stance_z: -0.743
+
+torso:
+  path_type: "straight"    # straight | circle | sine
+  v_ref: 0.0               # forward speed [m/s] — 0 = stand in place
+  y_offset: 0.0            # lateral offset [m]
+  z_target: 0.793          # base height [m]
+  theta_ref: 0.0           # heading [rad]
+  path_radius: 1.0         # R for circular arc [m]
+  omega: 0.5               # frequency for sine path [rad/s]
+  sine_amplitude: 0.2      # lateral amplitude for sine path [m]
+
+mpc:
+  planner: "convex_qp"     # convex_qp | predictive_sampling | ilqg
+  horizon: 50              # 50 * 0.02 = 1.0 s model horizon
+  dt: 0.02
+  mass: 35.0
+  gravity: 9.81
+  dyn_stiffness: 16.0
+  dyn_damping: 8.0
+  weights:
+    w_z: 50.0
+    w_p: 20.0      # horizontal torso hold (w_xy)
+    w_u: 1.0
+    w_theta: 40.0  # pitch/roll upright
+    w_q: 0.5       # control effort penalty (R)
+    w_tau: 0.01
+  predictive_sampling:
+    num_samples: 64
+    noise_std: 0.08        # rad joint-delta sample std
+  ilqg:
+    max_iters: 5
+    reg: 1.0e-4
+
+actuator:
+  freeze_arms: true
+  freeze_waist: false      # hips/waist unlocked — MPC may use waist pitch/roll
+  enable_leg_torque: false
+
+ui:
+  window_title: "LOKA G1 Torso Position MPC"
+  width: 1040
+  height: 1560

@@ -10,3 +10,5 @@ dependencies:
       - mujoco>=3.2
       - numpy>=1.24
       - pygame>=2.5
+      - pyyaml>=6.0
+      - dearpygui>=1.11
