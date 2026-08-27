@@ -1,11 +1,11 @@
 """LOKA — LLM-Orchestrated Kinematic Adaptation.
 
-Includes the G1 CPG + MPC baseline control stack under ``loka.nodes``,
-``loka.ui``, and ``loka.utils``, plus the LLM orchestrator modules.
+Two halves:
+
+* ``loka.control`` / ``loka.sim`` -- the G1 standing controller (centroidal MPC
+  feeding a whole-body QP) and its MuJoCo harness.
+* ``loka.orchestrator`` and friends -- the LLM layer that compresses telemetry
+  into semantic tags and mutates the controller's parameters at runtime.
 """
 
-__all__ = [
-    "nodes",
-    "ui",
-    "utils",
-]
+__all__ = ["control", "evaluate", "sim"]

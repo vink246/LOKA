@@ -40,7 +40,14 @@ def _term_status(term: ErrorTerm, value: float) -> str:
     return f"[ERR: {term.name.upper()} OUT OF BAND]"
 
 
-def format_tracked_state_section(anom_slice, nominal_buffer, has_baseline, error_spec: ErrorSpec):
+def format_tracked_state_section(
+    anom_slice,
+    nominal_buffer,
+    has_baseline,
+    error_spec: ErrorSpec,
+    *,
+    nominal_label: str = "Nominal",
+):
     if not anom_slice or not error_spec.terms:
         return ""
 
@@ -48,8 +55,18 @@ def format_tracked_state_section(anom_slice, nominal_buffer, has_baseline, error
         "0. TRACKED STATE (Error_Tracking terms)",
         "Values use each term's formula: offset + signal[index].",
         f"Window = mean over recent {TELEMETRY_WINDOW_S:.1f}s anomaly frames; "
-        "Snapshot = value at trigger instant.\n",
+        "Snapshot = value at trigger instant.",
     ]
+    if has_baseline:
+        lines.append(
+            f"{nominal_label} = healthy telemetry under the *current* mission "
+            "(re-baselined after Task_Targets / Error_Tracking changes)."
+        )
+    else:
+        lines.append(
+            f"{nominal_label} unavailable (waiting to re-baseline under the current mission)."
+        )
+    lines.append("")
 
     snapshot_frame = anom_slice[-1]
     for term in error_spec.terms:
@@ -67,7 +84,7 @@ def format_tracked_state_section(anom_slice, nominal_buffer, has_baseline, error
             nominal = _mean_term_value(nominal_buffer, term)
             if nominal is not None:
                 lines.append(
-                    f"- {term.name}: Nominal {nominal:.3g} | "
+                    f"- {term.name}: {nominal_label} {nominal:.3g} | "
                     f"Current {current:.3g} | Snapshot {snap:.3g}  {status}"
                 )
                 lines.append(f"  ({band})")

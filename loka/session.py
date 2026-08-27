@@ -107,6 +107,10 @@ class FailureEpisode(ConversationMixin):
         super().__init__()
         self.started_at = started_at
         self.nominal_baseline = list(nominal_baseline or [])
+        # Round-to-round plant-health snapshots for the plateau gate.
+        self.metric_history: list = []
+        self.stall_count: int = 0
+        self.accepted_residual = None  # EpisodeMetrics | None after plateau/cap
 
     @property
     def round_number(self) -> int:

@@ -6,9 +6,17 @@ dependencies:
   - python=3.10
   - pip
   - pip:
-      # Core sim (unitree_sdk2_python is installed separately from source)
       - mujoco>=3.2
       - numpy>=1.24
-      - pygame>=2.5
+      - scipy>=1.10
       - pyyaml>=6.0
+      # QP solver behind both control layers. osqp>=1.0 is required: the
+      # controller reads result.info.status_val to reject infeasible solves.
+      - osqp>=1.1
+      - pytest>=7.4
+      # Live tuning dashboard (python -m loka.dashboard).
       - dearpygui>=1.11
+      # Stack A (LLM orchestration) only. mujoco_mpc ships no wheel; build it
+      # from google-deepmind/mujoco_mpc per its README, into this env.
+      - openai>=1.30
+      - python-dotenv>=1.0

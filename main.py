@@ -27,6 +27,7 @@ from loka.recording import (
     DEFAULT_RECORD_HEIGHT,
     DEFAULT_RECORD_PATH,
     DEFAULT_RECORD_WIDTH,
+    RecordingToggle,
     VideoRecorder,
 )
 from loka.robot_context import (
@@ -253,16 +254,25 @@ def main():
         "       Optional prefix: loka: <request>\n"
         "       Example: walk crouched at 1 m/s"
     )
+    print("[LOKA] Press R in the viewer to start/stop recording to recordings/.")
 
-    recorder = None
+    recording = RecordingToggle(
+        model,
+        model_path=xml_path,
+        camera=args.record_camera,
+        fps=args.record_fps,
+        width=args.record_width,
+        height=args.record_height,
+    )
     if args.record is not None:
-        recorder = VideoRecorder(
+        recording.recorder = VideoRecorder(
             model,
             path=args.record,
             camera=args.record_camera,
             fps=args.record_fps,
             width=args.record_width,
             height=args.record_height,
+            model_path=xml_path,
         )
         print(
             f"[LOKA] Recording camera={args.record_camera} "
@@ -300,15 +310,19 @@ def main():
 
     def key_callback(keycode):
         try:
-            if chr(keycode).lower() == "f":
-                if right_hip_id == -1:
-                    print("\n\n[KEYBOARD] No right_hip actuator; fault inject skipped.")
-                    return
-                fault_state["active"] = not fault_state["active"]
-                status = "INJECTED" if fault_state["active"] else "CLEARED"
-                print(f"\n\n[KEYBOARD] Right hip fault {status}!")
+            key = chr(keycode).lower()
         except ValueError:
-            pass
+            return
+
+        if key == "f":
+            if right_hip_id == -1:
+                print("\n\n[KEYBOARD] No right_hip actuator; fault inject skipped.")
+                return
+            fault_state["active"] = not fault_state["active"]
+            status = "INJECTED" if fault_state["active"] else "CLEARED"
+            print(f"\n\n[KEYBOARD] Right hip fault {status}!")
+        elif key == "r":
+            recording.request_toggle()
 
     buffer_maxlen = int(TELEMETRY_WINDOW_S / model.opt.timestep)
     nominal_buffer = deque(maxlen=buffer_maxlen)
@@ -493,8 +507,7 @@ def main():
                 else:
                     anomaly_collect_since = None
 
-                if recorder is not None:
-                    recorder.maybe_capture(data)
+                recording.maybe_capture(data)
 
                 viewer.sync()
 
@@ -534,8 +547,7 @@ def main():
                 if time_until_next > 0:
                     time.sleep(time_until_next)
     finally:
-        if recorder is not None:
-            recorder.close()
+        recording.close()
 
 
 if __name__ == "__main__":

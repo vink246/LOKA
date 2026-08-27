@@ -219,3 +219,11 @@ __marimo__/
 
 #MuJoCo
 MUJOCO_LOG.TXT
+
+# Local sim video captures (R-key toggle in main.py)
+recordings/
+logs/
+
+# Local working plans (not for the paper / not committed)
+LOKA_INTEGRATION_PLAN.md
+*_INTEGRATION_PLAN.md
