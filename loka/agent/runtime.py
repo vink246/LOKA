@@ -11,29 +11,28 @@ from pathlib import Path
 
 import numpy as np
 
-from loka.compressor import ANOMALY_COLLECTION_S
-from loka.control.stand import StandController
-from loka.error_spec import get_tracking_error
-from loka.model_state import apply_loka_mutations, zero_dead_actuator_commands
-from loka.session import FailureEpisode, OperatorSession
+from loka.control.locomotion import LocomotionController
+from loka.agent.error_spec import get_tracking_error
+from loka.agent.model_state import apply_loka_mutations, zero_dead_actuator_commands
+from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Push, Simulation
-from loka.stand_loka.apply import apply_stand_scratchpad
-from loka.stand_loka.compress import synthesize_stand_telemetry
-from loka.stand_loka.context import (
+from loka.agent.apply import apply_stand_scratchpad
+from loka.agent.compress import ANOMALY_COLLECTION_S, synthesize_stand_telemetry
+from loka.agent.context import (
     build_stand_capabilities,
     build_stand_robot_context,
     default_stand_objective,
     format_stand_configuration,
 )
-from loka.stand_loka.anomaly import assess_stand_anomaly
-from loka.stand_loka.error_defaults import (
+from loka.agent.anomaly import assess_stand_anomaly
+from loka.agent.error_defaults import (
     default_stand_error_spec,
     default_walk_error_spec,
 )
-from loka.stand_loka.faults import FaultSpec, apply_plant_fault, capture_nominal_params, clear_plant_faults
-from loka.stand_loka.interactive import FaultVizState
-from loka.stand_loka.llm import load_stand_system_prompt, stand_llm_worker
-from loka.stand_loka.plateau import (
+from loka.agent.faults import FaultSpec, apply_plant_fault, capture_nominal_params, clear_plant_faults
+from loka.agent.interactive import FaultVizState
+from loka.agent.llm import load_stand_system_prompt, stand_llm_worker
+from loka.agent.plateau import (
     EpisodeMetrics,
     build_accept_residual_scratchpad,
     exceeds_residual_floor,
@@ -41,7 +40,7 @@ from loka.stand_loka.plateau import (
     should_stop_episode,
     snapshot_metrics,
 )
-from loka.stand_loka.session_log import StandSessionLog, default_log_path
+from loka.agent.session_log import StandSessionLog, default_log_path
 
 COOLDOWN_S = 4.0
 HEARTBEAT_S = 30.0
@@ -53,7 +52,7 @@ TASK_SETTLE_SUPPRESS_S = 5.0
 
 
 @dataclass
-class StandLokaConfig:
+class LokaConfig:
     enable_llm: bool = True
     cooldown_s: float = COOLDOWN_S
     anomaly_collection_s: float = ANOMALY_COLLECTION_S
@@ -70,18 +69,18 @@ class StandLokaConfig:
     plateau_abs_score_eps: float = 0.03
 
 
-class StandLokaRuntime:
+class LokaRuntime:
     """Owns a ``Simulation`` plus LOKA session state."""
 
     def __init__(
         self,
         sim: Simulation,
-        config: StandLokaConfig | None = None,
+        config: LokaConfig | None = None,
         faults: list[FaultSpec] | None = None,
     ) -> None:
         self.sim = sim
-        self.config = config or StandLokaConfig()
-        self.controller: StandController = sim.controller
+        self.config = config or LokaConfig()
+        self.controller: LocomotionController = sim.controller
         self.faults = list(faults or [])
         self._fault_backups = []
         self._fired_faults: set[int] = set()

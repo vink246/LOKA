@@ -13,7 +13,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from loka.control.stand import StandConfig, StandController
+from loka.control.locomotion import LocomotionConfig, LocomotionController
 
 #: Pelvis height below which the run is called a fall.
 FALL_HEIGHT = 0.45
@@ -70,14 +70,14 @@ class Simulation:
 
     def __init__(
         self,
-        config: StandConfig | None = None,
+        config: LocomotionConfig | None = None,
         model_path: str | Path | None = None,
         pushes: list[Push] | None = None,
     ) -> None:
-        self.config = config or StandConfig()
+        self.config = config or LocomotionConfig()
         if model_path is not None:
             self.config.model_path = str(model_path)
-        self.controller = StandController(self.config)
+        self.controller = LocomotionController(self.config)
 
         self.model = mujoco.MjModel.from_xml_path(self.config.model_path)
         self.data = mujoco.MjData(self.model)

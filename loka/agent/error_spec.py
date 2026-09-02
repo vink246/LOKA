@@ -57,43 +57,6 @@ class ErrorSpec:
         }
 
 
-def default_walker_error_spec() -> ErrorSpec:
-    """Parity with the historical Walker height/pitch/speed deadbands."""
-    return ErrorSpec(
-        trigger_threshold=0.25,
-        terms=[
-            ErrorTerm(
-                name="height",
-                signal="qpos",
-                index=0,
-                mode="below_target",
-                target=1.15,
-                tolerance=0.10,
-                weight=2.0,
-                offset=1.3,
-            ),
-            ErrorTerm(
-                name="pitch",
-                signal="qpos",
-                index=2,
-                mode="abs_above",
-                target=0.0,
-                tolerance=0.35,
-                weight=1.0,
-            ),
-            ErrorTerm(
-                name="speed",
-                signal="qvel",
-                index=1,
-                mode="below_target",
-                target=1.0,
-                tolerance=0.25,
-                weight=1.0,
-            ),
-        ],
-    )
-
-
 def parse_error_tracking(raw: dict, nq: int, nv: int) -> ErrorSpec:
     """Validate LLM Error_Tracking YAML into an ErrorSpec."""
     if not isinstance(raw, dict):

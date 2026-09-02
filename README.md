@@ -6,18 +6,25 @@ Foundation models reason about the world in language; bipeds are dynamically uns
 
 When motors seize, friction collapses, mass shifts, or an operator says *"crouch and walk at 1 m/s"*, LOKA compresses proprioceptive anomalies into semantic tags, diagnoses in the background, and applies surgical edits—cost weights, planner numerics, task goals, mission criteria, even virtual amputations (zero gear on a dead actuator)—so the robot can rediscover a gait before collapse.
 
-## Two stacks
+## What's here
 
 | | Entry point | What it is |
 |---|---|---|
-| **Orchestration** | `python main.py` | The LOKA research loop: telemetry compression → LLM diagnosis → typed parameter mutation, driving MuJoCo-MPC. |
-| **G1 balance** | `python -m loka.main` | A standalone MPC + whole-body-QP standing controller for the G1, and the plant LOKA will drive next. |
+| **Plant** | `python -m loka.main` | The G1 locomotion controller: centroidal MPC feeding a whole-body QP, with a gait layer on top. Never waits on anything. |
+| **Manual tuning** | `python -m loka.dashboard` | The same plant with every knob on a slider and the footstep plan drawn in the viewer. No LLM in the loop. |
+| **Orchestration** | `python -m loka.run_loka` | The research loop: telemetry compression → LLM diagnosis → typed parameter mutation, driving that plant. |
 
-The two are independent today. The controller exposes `update_weights()` — the same
-kind of typed surface the orchestrator already mutates on the MJPC side — which is
-the intended seam between them.
+All three drive the *same* controller object through the *same* two typed
+surfaces — `update_weights()` for costs and gains, `set_task_targets()` for
+setpoints and gait policy. A knob you can reach by hand in the dashboard is a
+knob the model can reach later, by the same name, with the same clamp.
 
-## The G1 standing controller
+Standing is solid and measured below. **Walking is not finished**: the robot
+steps at the commanded speed and then topples sideways after eight to sixteen
+steps. `docs/walking.md` has the diagnosis and what to try next; the failure is
+pinned by an `xfail` in `tests/test_gait.py` rather than hidden.
+
+## The G1 locomotion controller
 
 Two layers, both quadratic programs, running in one process with MuJoCo:
 
@@ -63,16 +70,21 @@ controller, not better tuning.
 
 ```text
 loka/control/
-├── robot.py   # G1 model wrapper: indices, contact sites, dynamics, stance margins
-├── qp.py      # OSQP front-end with pinned sparsity patterns for warm starts
-├── mpc.py     # convex single-rigid-body MPC over contact forces
-├── wbc.py     # whole-body QP: accelerations + forces -> torques
-├── stand.py   # ties them together; the LOKA-facing command surface
-└── tuning.py  # the typed, clamped parameter registry (GUI + LLM)
+├── robot.py       # G1 model wrapper: indices, contact sites, dynamics, stance margins
+├── qp.py          # OSQP front-end with pinned sparsity patterns for warm starts
+├── mpc.py         # convex single-rigid-body MPC over contact forces
+├── wbc.py         # whole-body QP: accelerations + forces -> torques
+├── gait.py        # gait clock, footstep plan, DCM reference, swing arcs
+├── locomotion.py  # ties them together; the LOKA-facing command surface
+└── tuning.py      # the typed, clamped parameter registry (GUI + LLM)
+loka/agent/       # the slow layer: compress -> diagnose -> typed apply
 loka/sim.py       # MuJoCo loop, scripted pushes, run statistics
-loka/dashboard.py # live tuning GUI
+loka/dashboard.py # manual tuning GUI
+loka/viz.py       # viewer overlays: footstep plan, swing arc, pushes, mass
 loka/evaluate.py  # robustness suite (hold / push / crouch)
+loka/config/g1.yaml  # static tuning, mirroring the dataclasses field for field
 models/g1/        # vendored 29-DoF MJCF + stance scene
+docs/             # walking.md (the gait layer), orchestrator.md (the slow layer)
 ```
 
 ## Setup
@@ -85,8 +97,7 @@ conda activate loka
 `osqp>=1.1` is required — the controller reads `result.info.status_val` to reject
 infeasible solves, and older versions report status differently.
 
-The orchestration stack additionally needs [`mujoco_mpc`](https://github.com/google-deepmind/mujoco_mpc)
-(built from source, no wheel exists) and an API key:
+Only the orchestrator needs an API key; the plant and the dashboard run without one:
 
 ```bash
 cp .env.example .env   # then set OPENAI_API_KEY
@@ -99,28 +110,42 @@ python -m loka.main                  # interactive viewer
 python -m loka.main --push 4         # shove the pelvis every 3 s
 python -m loka.main --height 0.60    # crouch
 python -m loka.main --headless -T 10 # scripted run, prints a summary
-python -m loka.dashboard             # live tuning GUI + viewer
+
+python -m loka.dashboard             # manual tuning GUI + viewer
+python -m loka.dashboard --walk 0.25 # ... starting in a walk
 python -m loka.dashboard --no-robot  # GUI only (faster on software GL)
-python -m loka.evaluate              # full robustness suite
-python main.py                       # the LOKA orchestration loop (Walker task)
+
+python -m loka.evaluate              # plant robustness suite
+python -m loka.verify_gait           # gait diagnostics across a parameter matrix
+
+python -m loka.run_loka                          # the orchestration loop
+python -m loka.run_loka --operator "crouch a bit" # ... driven by language
+python -m loka.run_loka --no-llm --fault mass     # ... ablated, plant only
 ```
 
-Static tuning lives in `loka/config/stand.yaml`, which mirrors the dataclasses in
+Static tuning lives in `loka/config/g1.yaml`, which mirrors the dataclasses in
 `loka/control/` field for field; the dataclass defaults are what runs when no
 `--config` is passed.
 
 ## The tuning surface
 
-`loka/control/tuning.py` declares every parameter that may change at runtime —
-30 of them — each with a range and a one-line rationale. The dashboard renders
-that registry, and the orchestrator will mutate the same entries by the same
-names:
+There are two, and everything that can change at runtime goes through one of
+them. `loka/control/tuning.py` declares the costs and gains — 30 of them, each
+with a range and a one-line rationale — and `loka/control/gait.py` declares the
+`gait.*` policy the same way in `GAIT_KNOBS`. The dashboard renders those
+registries; the orchestrator mutates the same entries by the same names:
 
 ```python
 controller.update_weights(**{"wbc.kp_base_position": 30.0, "mpc.friction_mu": 0.35})
+controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25, "height": 0.65})
 ```
 
-Two properties make it the right seam for an LLM:
+Footstep coordinates and per-tick contact flags are *not* on either surface.
+Walking geometry stays classical and outside the model's vocabulary; the model
+picks a speed, a cadence and a stance width, and `gait.py` decides where the
+feet go.
+
+Two properties make this the right seam for an LLM:
 
 - **Paths are unambiguous.** `weight_force` and `friction_mu` exist on *both*
   layers with values three orders of magnitude apart, so a bare field name is
@@ -146,6 +171,10 @@ sum to body weight, torques match the equation of motion, `J̇q̇` agrees with f
 differences) and short closed-loop runs for drops, tilts, crouches and pushes. The
 capture-point test asserts recovery *and* asserts that a kick 50% past the limit
 still falls, so the suite cannot be satisfied by loosening what counts as a fall.
+
+The one known failure is marked, not hidden: `test_closed_loop_walk_stays_up` is
+an `xfail`, so it reports if the lateral divergence is ever fixed by accident,
+and the gait planner's own invariants are tested in isolation either way.
 
 ## Notes on the design
 
@@ -174,6 +203,13 @@ A few choices are load-bearing and easy to undo by accident:
   callback takes the full `(sender, app_data, user_data)` triple so this cannot
   recur quietly; `tests/test_dashboard.py` fires each widget through the real
   dispatch path rather than calling the handlers directly.
+- **The walk plan leads the robot; measurement only nudges it.** Footholds chain
+  off the current support foot, one commanded stride apart, and the CoM
+  reference is the DCM trajectory that chain implies. Measured state enters in
+  exactly two clamped places. The version before this derived the CoM reference
+  from the measured feet while placing the feet relative to the measured CoM —
+  a loop with no term commanding forward progress, which is why it could only
+  shuffle.
 - **The viewer redraws at 60 Hz, not once per control tick.** `viewer.sync()`
   costs ~3 ms; calling it every 2 ms tick spends more time drawing than
   simulating and drops the window to 0.41x realtime. Batching a frame's worth of

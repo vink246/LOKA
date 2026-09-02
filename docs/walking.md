@@ -38,7 +38,7 @@ Five distinct defects, each individually sufficient to prevent walking:
 
 ## Current architecture
 
-`loka/control/gait.py` plans; `loka/control/stand.py` executes.
+`loka/control/gait.py` plans; `loka/control/locomotion.py` executes.
 
 Footsteps form a **chain anchored at the current support foot**. Each link
 advances by `speed × T_step` along the heading and crosses `stance_width` to the
@@ -144,3 +144,22 @@ Ruled out by experiment, so as not to be re-litigated:
    delivering the requested ZMP — but the foot is only 0.06 m wide, and it is
    worth confirming the lateral CoP is not saturating at the edge during the
    compounding phase.
+
+## Tools for the next attempt
+
+`python -m loka.dashboard --walk 0.25` drives this plant by hand: every
+`gait.*` knob on a slider, the footstep plan and swing arc drawn in the viewer,
+and the lateral CoM error plotted in the heading frame beside the forward speed
+it is supposed to be trading against. Sliders apply live, so an entire sweep
+happens inside one run rather than one process per parameter.
+
+`python -m loka.verify_gait` is the non-interactive counterpart. It first runs
+the planner in isolation against a perfectly-tracking robot — which is how the
+plan was confirmed sound, and the check to run first after touching `gait.py` —
+then sweeps the closed loop and prints time-to-fall, travel, step count, swing
+clearance and swing error per configuration.
+
+`tests/test_gait.py` holds the planner invariants (stride advance, no lateral
+ratchet, bounded limit cycle, arc derivatives against finite differences) plus
+`test_closed_loop_walk_stays_up` as an `xfail`. If a change fixes the
+divergence, that test starts reporting `XPASS`.

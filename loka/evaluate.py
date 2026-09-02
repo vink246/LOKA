@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 
-from loka.control.stand import StandConfig
+from loka.control.locomotion import LocomotionConfig
 from loka.sim import Push, Simulation
 
 DIRECTIONS = {
@@ -34,7 +34,7 @@ DIRECTIONS = {
 
 
 def survives_push(
-    config: StandConfig, direction: np.ndarray, impulse: float, settle: float = 3.0
+    config: LocomotionConfig, direction: np.ndarray, impulse: float, settle: float = 3.0
 ) -> bool:
     """True if the robot is still standing ``settle`` seconds after the push."""
     push = Push(impulse=impulse, direction=direction, time=1.0)
@@ -47,7 +47,7 @@ def survives_push(
 
 
 def max_recoverable_impulse(
-    config: StandConfig,
+    config: LocomotionConfig,
     direction: np.ndarray,
     low: float = 0.0,
     high: float = 40.0,
@@ -65,7 +65,7 @@ def max_recoverable_impulse(
     return low
 
 
-def evaluate_hold(config: StandConfig, duration: float = 10.0) -> None:
+def evaluate_hold(config: LocomotionConfig, duration: float = 10.0) -> None:
     sim = Simulation(config)
     started = time.perf_counter()
     stats = sim.run(duration)
@@ -75,7 +75,7 @@ def evaluate_hold(config: StandConfig, duration: float = 10.0) -> None:
     print(f"  realtime factor : {stats.realtime_factor:.2f}x")
 
 
-def evaluate_pushes(config: StandConfig) -> None:
+def evaluate_pushes(config: LocomotionConfig) -> None:
     print("\npush recovery (max survivable impulse)")
     mass = Simulation(config).controller.robot.total_mass
     for name, direction in DIRECTIONS.items():
@@ -86,7 +86,7 @@ def evaluate_pushes(config: StandConfig) -> None:
         )
 
 
-def evaluate_crouch(config: StandConfig) -> None:
+def evaluate_crouch(config: LocomotionConfig) -> None:
     print("\nheight tracking")
     nominal = Simulation(config).controller.nominal_height
     for height in (nominal, nominal - 0.05, nominal - 0.10, nominal - 0.15):
@@ -109,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-pushes", action="store_true")
     args = parser.parse_args(argv)
 
-    config = StandConfig()
+    config = LocomotionConfig()
     evaluate_hold(config)
     if not args.skip_pushes:
         evaluate_pushes(config)

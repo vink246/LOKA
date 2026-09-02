@@ -1,9 +1,15 @@
-# LOKA Project Details (implemented)
+# The LOKA orchestrator (implemented)
 
-**Last revised:** 2026-07-29  
-**Scope covered:** Phase A — standing G1 plant + LOKA orchestration loop  
-**Not covered yet:** walking plant, classical reflex catalog, cross-session memory,
-paper-scale ablation matrix (Phases B–D in the integration plan)
+**Last revised:** 2026-09-02  
+**Scope covered:** the `loka/agent/` package — telemetry compression, LLM
+diagnosis, typed apply — over the G1 plant  
+**Not covered yet:** classical reflex catalog, cross-session memory,
+paper-scale ablation matrix (Phases C–D in the integration plan)
+
+The plant this drives is documented separately: `docs/walking.md` for the gait
+layer and its open defect, and the README for the control law. The orchestrator
+was built when the plant could only stand, and §19 lists what has to change now
+that it can walk.
 
 ---
 
@@ -23,18 +29,12 @@ The control thread never blocks on an API call; the LLM runs in a background
 worker and results are drained on the next control ticks.
 
 **Paper framing (v1 intent):** humanoid stand → walk with adaptive recovery under
-discrete faults + operator language — *not* VLA / code-as-policy. Walking and
-reflexes are planned but **not implemented** in the current code path.
+discrete faults + operator language — *not* VLA / code-as-policy. The reflex
+catalog is planned but **not implemented** in the current code path.
 
-### Two stacks in the repo
-
-| Stack | Entry | Role |
-|---|---|---|
-| **Stack A (MJPC Walker)** | root `main.py` / legacy Walker MJPC path | Original LOKA research loop on MuJoCo-MPC Walker. Untouched by Phase A stand work. |
-| **Stack B (G1 stand + LOKA)** | `python -m loka.run_stand_loka` | Centroidal MPC + WBC standing controller **plus** the Phase A orchestrator package `loka/stand_loka/`. |
-
-This document describes **Stack B** in depth. Stack A remains a separate entry
-point; do not conflate their prompts, plants, or apply paths.
+There is one entry point: `python -m loka.run_loka`. (The original MuJoCo-MPC
+Walker stack this grew out of has been deleted; if you find a reference to
+`mujoco_mpc`, `models/walker/` or a root `main.py`, it is stale.)
 
 ---
 
@@ -42,12 +42,12 @@ point; do not conflate their prompts, plants, or apply paths.
 
 ```text
                     ┌─────────────────────────────────────────┐
-  stdin / keys /    │           StandLokaRuntime.step()       │
+  stdin / keys /    │           LokaRuntime.step()       │
   --fault / --op    │                                         │
         │           │  1. inject timed / interactive faults   │
         │           │  2. drain LLM queue (apply scratchpad)  │
         │           │  3. re-apply belief mutations           │
-        │           │  4. StandController.compute_torque → τ  │
+        │           │  4. LocomotionController.compute_torque → τ  │
         │           │  5. MuJoCo step (sim plant)             │
         │           │  6. build telemetry frame               │
         │           │  7. mission Error_Tracking + anomaly    │
@@ -67,7 +67,7 @@ point; do not conflate their prompts, plants, or apply paths.
 - **Plant** (`Simulation.model` / `sim.model`): physics the robot *actually*
   experiences. Interactive / scripted faults mutate this model (extra mass,
   ice friction, dead actuator gear, external push).
-- **Belief** (`StandController.robot.model`): private MuJoCo model the
+- **Belief** (`LocomotionController.robot.model`): private MuJoCo model the
   controller uses for dynamics / planning. `Model_Mutations` from LOKA write
   here only. Re-applied every control tick via `apply_loka_mutations`.
 
@@ -78,58 +78,60 @@ and tags only.
 
 ## 3. Package map
 
-### 3.1 Standing LOKA package (`loka/stand_loka/`)
+### 3.1 The orchestrator package (`loka/agent/`)
 
 | Module | Responsibility |
 |---|---|
-| `runtime.py` | Dual-rate loop owner: `StandLokaRuntime`, `StandLokaConfig`, dispatch/drain, mission baseline, plateau accept |
+| `runtime.py` | Dual-rate loop owner: `LokaRuntime`, `LokaConfig`, dispatch/drain, mission baseline, plateau accept |
 | `anomaly.py` | Early plant-health scoring + semantic clues; gated so healthy crouch residuals do not open episodes |
-| `compress.py` | G1 stand telemetry compression (sections 0–3) for the LLM user turn |
+| `compress.py` | Telemetry compression (sections 0–3) for the LLM user turn |
 | `apply.py` | Parse/apply YAML scratchpad → allowlisted weights, tasks, Error_Tracking, belief mutations |
 | `policy.py` | Hard LLM allowlist (9 adaptive knobs); rejects locked QP costs |
 | `plateau.py` | Round-to-round severity, intervention cap, accept-residual scratchpad + mass inference |
 | `faults.py` | `FaultSpec` + plant-side mass / friction / actuator_dead apply & clear |
-| `interactive.py` | Stdin fault parsing, viewer overlays (push arrow, mass sphere, ice floor tint) |
-| `llm.py` | System prompt assembly + background OpenAI worker (`system_prompt_stand.txt`) |
-| `context.py` | Capabilities block, robot context, current stand configuration formatting |
+| `interactive.py` | Stdin fault command parsing (rendering lives in `loka/viz.py`) |
+| `llm.py` | System prompt assembly + background OpenAI worker (`system_prompt.txt`) |
+| `context.py` | Capabilities block, robot context, current configuration formatting |
 | `error_defaults.py` | Default standing `Error_Tracking` (pelvis height, drift, tip/roll rates) |
-| `session_log.py` | Per-run `logs/stand_loka/session.log` + `.jsonl` (rewritten each run) |
+| `session_log.py` | Per-run `logs/loka/session.log` + `.jsonl` (rewritten each run) |
+| `session.py` | `FailureEpisode` / `OperatorSession` multi-turn conversation state |
+| `error_spec.py` | `ErrorSpec` / `ErrorTerm`, tracking error, YAML parse |
+| `model_state.py` | MJCF name resolution; apply belief mutations; zero dead-actuator commands |
+| `robot_context.py` | Static kinematic reference text for the prompt |
 
-### 3.2 Shared / plant modules used by stand LOKA
+### 3.2 Plant modules the orchestrator drives
 
 | Module | Role |
 |---|---|
-| `loka/control/stand.py` | `StandController`, `StandCommand` (height / lean / yaw), telemetry |
+| `loka/control/locomotion.py` | `LocomotionController`, `LocomotionCommand` (height / lean / yaw), telemetry |
+| `loka/control/gait.py` | Gait clock, footstep plan, DCM reference, swing arcs; `gait.*` policy knobs |
 | `loka/control/mpc.py` | Centroidal convex MPC |
 | `loka/control/wbc.py` | Whole-body QP |
 | `loka/control/robot.py` | `G1Model` kinematics / contacts / support margin |
 | `loka/control/tuning.py` | Full tunable catalogue (GUI + allowlist subset) |
 | `loka/sim.py` | MuJoCo simulation wrapper, pushes, fall detection |
-| `loka/session.py` | `FailureEpisode` / `OperatorSession` multi-turn conversation state |
-| `loka/error_spec.py` | `ErrorSpec` / `ErrorTerm`, tracking error, YAML parse |
-| `loka/model_state.py` | Apply belief mutations; zero dead-actuator commands |
-| `loka/compressor.py` | Shared window constants + tracked-state formatting helpers |
+| `loka/viz.py` | Viewer overlays: footstep plan, swing arc, pushes, added mass |
 
 ### 3.3 Entry points
 
 | Command | Purpose |
 |---|---|
-| `python -m loka.run_stand_loka` | Interactive / headless stand + LOKA |
-| `python -m loka.evaluate_stand_loka` | Headless scenario skeleton (mostly no-LLM ablations) |
-| `python -m loka.main` | Stand plant alone (pre-LOKA balance stack) |
+| `python -m loka.run_loka` | Interactive / headless plant + LOKA |
+| `python -m loka.evaluate_loka` | Headless scenario skeleton (mostly no-LLM ablations) |
+| `python -m loka.dashboard` | The same plant driven by hand, no LLM in the loop |
+| `python -m loka.main` | Plant alone, viewer or headless |
 | `python -m loka.evaluate` | Plant-only disturbance / push eval |
-| `python -m pytest tests/test_stand_loka.py` | Phase A unit / integration tests |
+| `python -m pytest tests/test_agent.py` | Orchestrator unit / integration tests |
 
 ### 3.4 Prompts
 
-| File | Used by |
-|---|---|
-| `system_prompt_stand.txt` | Stand LOKA (`loka/stand_loka/llm.py`) |
-| `system_prompt.txt` | Stack A / Walker MJPC path (not the stand plant) |
+`system_prompt.txt` at the repo root, loaded by `loka/agent/llm.py`. Live model
+context (objective, capabilities, robot reference) is appended at assembly
+time, so the file itself stays plant-agnostic.
 
 ---
 
-## 4. The standing plant (Stack B controller)
+## 4. The plant
 
 ### 4.1 Control law
 
@@ -152,7 +154,7 @@ reflex / step module (Phase C / stretch), not more LLM latency.
 
 ### 4.2 Task / command surface (`Task_Targets`)
 
-Exposed to LOKA and ablations via `StandController.set_task_targets`:
+Exposed to LOKA and ablations via `LocomotionController.set_task_targets`:
 
 | Name | Meaning | Limits (approx.) |
 |---|---|---|
@@ -162,7 +164,7 @@ Exposed to LOKA and ablations via `StandController.set_task_targets`:
 | `lean_y` | CoM offset left (+) [m] | same |
 
 Aliases `com_offset_x` / `com_offset_y` are accepted. Lean is implemented as
-`StandCommand.com_offset_xy`.
+`LocomotionCommand.com_offset_xy`.
 
 **Height convention (easy to confuse):**
 
@@ -175,7 +177,7 @@ Aliases `com_offset_x` / `com_offset_y` are accepted. Lean is implemented as
 
 The full catalogue lives in `loka/control/tuning.py` (also for dashboards).
 The orchestrator may only set the **adaptive allowlist** in
-`loka/stand_loka/policy.py`:
+`loka/agent/policy.py`:
 
 | Path | Intent |
 |---|---|
@@ -200,7 +202,7 @@ Bare names like `weight_force` are ambiguous across layers and are rejected.
 
 ## 5. Dual-rate runtime loop
 
-### 5.1 `StandLokaConfig`
+### 5.1 `LokaConfig`
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -219,7 +221,7 @@ Bare names like `weight_force` are ambiguous across layers and are rejected.
 
 CLI: `--max-interventions` maps to `max_interventions_per_episode`.
 
-### 5.2 Per-tick sequence (`StandLokaRuntime.step`)
+### 5.2 Per-tick sequence (`LokaRuntime.step`)
 
 1. Fire any timed `FaultSpec`s whose `time` has elapsed; handle interactive injects.
 2. `_drain_llm()` — if a worker result is ready, `apply_stand_scratchpad`, optionally
@@ -263,7 +265,7 @@ numbers.
 
 ### 5.4 Sessions
 
-- **`FailureEpisode`** (`loka/session.py`): one multi-turn conversation from first
+- **`FailureEpisode`** (`loka/agent/session.py`): one multi-turn conversation from first
   fault/anomaly until recovery, plateau accept, operator objective change, or
   close. Tracks `interventions`, `metric_history`, `stall_count`,
   `accepted_residual`.
@@ -369,7 +371,8 @@ Model_Mutations:
     value: 0.0              # mass is absolute kg on the body
 ```
 
-`Planner_Targets` are ignored on the stand plant (no MJPC agent) with a log note.
+`Planner_Targets` are ignored with a log note: they addressed a sampling
+planner's metaparameters, and this plant has none.
 
 ### 8.2 Apply behaviour (`apply_stand_scratchpad`)
 
@@ -396,7 +399,7 @@ On accept-residual mass updates, the runtime also refreshes
 - Strips markdown fences; `yaml.safe_load` → scratchpad dict on the result queue.
 - Failures put `None`; runtime logs and continues plant control.
 
-Prompt assembly: `system_prompt_stand.txt` + objective + capabilities catalogue +
+Prompt assembly: `system_prompt.txt` + objective + capabilities catalogue +
 current Error_Tracking + robot context (G1 stand notes, lean limits, qpos layout).
 
 ---
@@ -471,10 +474,10 @@ Overlays: cyan push arrow; amber mass marker; strong cyan floor tint for ice.
 ### 10.3 Scripted / CLI
 
 ```bash
-python -m loka.run_stand_loka --fault mass --fault-at 4 --fault-mass 5
-python -m loka.run_stand_loka --fault friction --fault-mu 0.25
-python -m loka.run_stand_loka --fault actuator_dead --fault-actuator right_knee
-python -m loka.run_stand_loka --fault push
+python -m loka.run_loka --fault mass --fault-at 4 --fault-mass 5
+python -m loka.run_loka --fault friction --fault-mu 0.25
+python -m loka.run_loka --fault actuator_dead --fault-actuator right_knee
+python -m loka.run_loka --fault push
 ```
 
 ---
@@ -495,11 +498,11 @@ episode and invalidates MissionNominal when an operator request is accepted.
 
 ## 12. Logging
 
-When session logging is enabled (default in `run_stand_loka` unless `--no-log`):
+When session logging is enabled (default in `run_loka` unless `--no-log`):
 
-- `logs/stand_loka/session.log` — human-readable compressor turns, LLM YAML,
+- `logs/loka/session.log` — human-readable compressor turns, LLM YAML,
   apply summaries, notes (rewritten each run).
-- `logs/stand_loka/session.jsonl` — structured events for tooling.
+- `logs/loka/session.jsonl` — structured events for tooling.
 
 Directory is gitignored; paths print at startup.
 
@@ -507,7 +510,7 @@ Directory is gitignored; paths print at startup.
 
 ## 13. Evaluation harness (skeleton)
 
-`python -m loka.evaluate_stand_loka [--scenario NAME] [--json-out path]`
+`python -m loka.evaluate_loka [--scenario NAME] [--json-out path]`
 
 | Scenario | LLM | What it does |
 |---|---|---|
@@ -524,7 +527,7 @@ SAP, reflex latency, etc. — Phase D).
 
 ## 14. Tests
 
-`tests/test_stand_loka.py` (run under the `mjpc` conda env):
+`tests/test_agent.py` (run under the `mjpc` conda env):
 
 | Test | Covers |
 |---|---|
@@ -556,22 +559,22 @@ conda activate mjpc
 cd /path/to/LOKA
 
 # Interactive stand + LOKA (viewer + stdin faults / operator)
-python -m loka.run_stand_loka
+python -m loka.run_loka
 
 # Operator language (needs OPENAI_API_KEY)
-python -m loka.run_stand_loka --operator "lean left and crouch slightly"
+python -m loka.run_loka --operator "lean left and crouch slightly"
 
 # Ablation without LLM
-python -m loka.run_stand_loka --no-llm --task height=0.60,lean_x=0.03
+python -m loka.run_loka --no-llm --task height=0.60,lean_x=0.03
 
 # Headless timed fault
-python -m loka.run_stand_loka --fault mass --headless -T 12 --max-interventions 5
+python -m loka.run_loka --fault mass --headless -T 12 --max-interventions 5
 
 # Eval skeleton
-python -m loka.evaluate_stand_loka
+python -m loka.evaluate_loka
 
 # Tests
-python -m pytest tests/test_stand_loka.py -v
+python -m pytest tests/test_agent.py -v
 ```
 
 Environment:
@@ -600,15 +603,12 @@ Environment:
 
 | Area | Status |
 |---|---|
-| Walking / gait clock / footstep policy | Phase B — not started |
-| `gait.*` Task_Targets | Schema draft only in integration plan |
 | Classical reflex catalog (`slip_mu`, `capture_step`, …) | Phase C |
 | Session / cross-session memory store | Phase C |
 | Auto-step past capture | Stretch |
 | Body CoM offset / inertia belief attrs | Not in `apply_loka_mutations` |
 | Full paper metrics harness (TSR, \(T_s\), SAP, …) | Phase D |
 | Hardware / estimator bridge | Deferred |
-| Stack A ↔ Stack B merge | Still separate entry points |
 
 ---
 
@@ -616,10 +616,60 @@ Environment:
 
 | File | Tracked? | Purpose |
 |---|---|---|
-| **`LOKA_PROJECT_DETAILS.md`** (this file) | **Yes** | What is implemented and how it works |
+| **`docs/orchestrator.md`** (this file) | **Yes** | What the slow layer does and how |
+| `docs/walking.md` | Yes | The gait layer, and the open lateral-stability defect |
 | `LOKA_INTEGRATION_PLAN.md` | No (gitignored) | Working roadmap, decisions, phase checkboxes |
 | `README.md` | Yes | High-level project intro + plant metrics |
-| `system_prompt_stand.txt` | Yes | Live orchestrator instructions for stand |
+| `system_prompt.txt` | Yes | Live orchestrator instructions |
 
-When you change behaviour in `loka/stand_loka/`, update **this** file in the same
+When you change behaviour in `loka/agent/`, update **this** file in the same
 PR/commit when practical so GitHub stays the source of truth for implementers.
+
+---
+
+## 19. What still has to change now that the plant walks
+
+This package was deliberately left alone during the Phase B walking work, so
+the plant and the slow layer could be debugged separately. It is *not*
+stand-only: `error_defaults.py` already swaps in `default_walk_error_spec` when
+the mode changes, `anomaly.py` carries a second set of `WALK_*` thresholds, and
+`context.py` warns the model that slip and force mismatch are normal during
+swing. What follows is what is genuinely still owed.
+
+**The compressor is blind to the gait.** This is the load-bearing gap.
+`compress.py` formats CoM error, tilt, support margin, contacts and motor load
+— and mentions the gait nowhere. `LocomotionTelemetry` already carries
+`gait_phase`, `swing_clearance` and `swing_error`, and `GaitScheduler` exposes
+`cmd_speed` and `step_index`, but `LokaRuntime._frame` copies only the
+`walking` flag, so none of it reaches the model. A diagnosis of the lateral
+divergence in `docs/walking.md` needs at least: phase within the cycle,
+commanded versus achieved forward speed, lateral CoM error resolved in the
+*heading* frame rather than world y, and swing tracking error per step. The
+dashboard plots exactly these (`loka/dashboard.py`, `PLOTS`), which is a
+reasonable specification to copy.
+
+**Naming.** Every public symbol here still says `stand`:
+`apply_stand_scratchpad`, `synthesize_stand_telemetry`, `default_stand_error_spec`,
+`build_stand_capabilities`, `build_stand_robot_context`, `format_stand_configuration`,
+`load_stand_system_prompt`, `stand_llm_worker`, `StandTelemetrySections`,
+`assess_stand_anomaly`, `LLM_STAND_CONTROLLER_ALLOWLIST`, `stand_llm_catalogue`,
+and the `LOKA_STAND_MODEL` environment variable. The plant classes were renamed
+to `Locomotion*` and the package to `loka/agent/`; the functions inside were
+not, because renaming them without rethinking what they report would only move
+the problem.
+
+**The gait capability list is hand-maintained.** `context.py` writes the
+`gait.*` knobs out as prose, and has already drifted — `gait.foothold_retarget_s`
+is missing, and no knob carries its range. `loka/control/gait.py` now exports
+`GAIT_KNOBS`, each with a summary and a band, in the same shape
+`tuning.catalogue()` uses; rendering from that removes a class of drift.
+
+**Plateau accept assumes the residual is a mass offset.** `_infer_mass_belief`
+resolves a stable lateral CoM bias into a believed shoulder or torso mass.
+Standing, that is a good inference. Walking, a persistent lateral bias is at
+least as likely to be foothold placement, and writing it into the belief model
+would bury the very defect that is open.
+
+**Walk faults are untested.** `tests/test_agent.py` exercises faults from a
+stand. Nothing injects a fault mid-stride, which is where the interesting
+recoveries are — and where the plant currently falls over anyway.

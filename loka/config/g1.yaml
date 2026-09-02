@@ -1,11 +1,11 @@
-# Standing controller parameters. Everything here mirrors a field on
-# StandConfig / MPCConfig / WBCConfig in loka/control/, and the defaults in
-# those dataclasses are what runs when no config file is passed:
+# G1 locomotion controller parameters. Everything here mirrors a field on
+# LocomotionConfig / MPCConfig / WBCConfig / GaitConfig in loka/control/, and
+# the defaults in those dataclasses are what runs when no config is passed:
 #
-#     python -m loka.main --config loka/config/stand.yaml
+#     python -m loka.main --config loka/config/g1.yaml
 #
 # This file is also the surface LOKA mutates at runtime, via
-# StandController.update_weights().
+# LocomotionController.update_weights() and set_task_targets().
 
 model_path: models/g1/scene.xml
 control_dt: 0.002        # whole-body QP period  -> 500 Hz

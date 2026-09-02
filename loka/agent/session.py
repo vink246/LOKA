@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from loka.error_spec import format_error_spec
-from loka.robot_context import format_current_model_belief
+from loka.agent.error_spec import format_error_spec
+from loka.agent.robot_context import format_current_model_belief
 
 
 def _format_context_sections(

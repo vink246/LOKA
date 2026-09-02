@@ -9,14 +9,14 @@ import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from loka.error_spec import format_error_spec
-from loka.robot_context import format_primary_objective_block
-from loka.stand_loka.context import format_stand_capabilities_block
+from loka.agent.error_spec import format_error_spec
+from loka.agent.robot_context import format_primary_objective_block
+from loka.agent.context import format_stand_capabilities_block
 
 load_dotenv()
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-_PROMPT_PATH = Path(__file__).resolve().parents[2] / "system_prompt_stand.txt"
+_PROMPT_PATH = Path(__file__).resolve().parents[2] / "system_prompt.txt"
 
 
 def load_stand_system_prompt(

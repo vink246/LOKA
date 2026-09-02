@@ -1,4 +1,4 @@
-"""G1 standing telemetry compression for the LOKA orchestrator."""
+"""Telemetry compression: recent plant frames into an LLM-facing report."""
 
 from __future__ import annotations
 
@@ -7,12 +7,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from loka.compressor import (
-    TELEMETRY_WINDOW_S,
-    format_tracked_state_section,
-)
-from loka.error_spec import ErrorSpec
-from loka.stand_loka.anomaly import assess_stand_anomaly
+from loka.agent.anomaly import assess_stand_anomaly
+from loka.agent.error_spec import ErrorSpec, ErrorTerm
+
+#: Seconds of frames summarised in a report.
+TELEMETRY_WINDOW_S = 2.0
+#: Seconds the runtime keeps collecting after an anomaly trips, before it
+#: compresses and hands the window to the model.
+ANOMALY_COLLECTION_S = 1.0
 
 CAPTURE_MARGIN_WARN = 0.02  # m of support left before critical
 SLIP_SPEED = 0.15  # m/s at a loaded contact
@@ -40,10 +42,79 @@ def _window_frames(buffer: Sequence[dict], control_dt: float) -> list[dict]:
     return frames[-n:]
 
 
-def _mean_abs(values: Sequence[float]) -> float:
-    if not values:
-        return 0.0
-    return float(np.mean(np.abs(values)))
+def _mean_term_value(frames: Sequence[dict], term: ErrorTerm) -> float | None:
+    if not frames:
+        return None
+    return float(np.mean([term.read_frame(frame) for frame in frames]))
+
+
+def _term_status(term: ErrorTerm, value: float) -> str:
+    excess = term.excess(value)
+    if excess <= 0.0:
+        return "[NOMINAL]"
+    if excess * term.weight > 0.5:
+        return f"[ERR: {term.name.upper()} CRITICAL]"
+    return f"[ERR: {term.name.upper()} OUT OF BAND]"
+
+
+def format_tracked_state_section(
+    anom_slice: Sequence[dict],
+    nominal_buffer: Sequence[dict],
+    has_baseline: bool,
+    error_spec: ErrorSpec,
+    *,
+    nominal_label: str = "Nominal",
+) -> str:
+    """The Error_Tracking terms, each against its own band and baseline."""
+    if not anom_slice or not error_spec.terms:
+        return ""
+
+    lines = [
+        "0. TRACKED STATE (Error_Tracking terms)",
+        "Values use each term's formula: offset + signal[index].",
+        f"Window = mean over recent {TELEMETRY_WINDOW_S:.1f}s anomaly frames; "
+        "Snapshot = value at trigger instant.",
+    ]
+    if has_baseline:
+        lines.append(
+            f"{nominal_label} = healthy telemetry under the *current* mission "
+            "(re-baselined after Task_Targets / Error_Tracking changes)."
+        )
+    else:
+        lines.append(
+            f"{nominal_label} unavailable (waiting to re-baseline under the "
+            "current mission)."
+        )
+    lines.append("")
+
+    snapshot_frame = anom_slice[-1]
+    for term in error_spec.terms:
+        current = _mean_term_value(anom_slice, term)
+        snap = term.read_frame(snapshot_frame)
+        if current is None:
+            continue
+
+        status = _term_status(term, current)
+        band = (
+            f"mode={term.mode} target={term.target:.3g} "
+            f"tol={term.tolerance:.3g} weight={term.weight:.3g}"
+        )
+        if has_baseline:
+            nominal = _mean_term_value(nominal_buffer, term)
+            if nominal is not None:
+                lines.append(
+                    f"- {term.name}: {nominal_label} {nominal:.3g} | "
+                    f"Current {current:.3g} | Snapshot {snap:.3g}  {status}"
+                )
+                lines.append(f"  ({band})")
+                continue
+
+        lines.append(
+            f"- {term.name}: Current {current:.3g} | Snapshot {snap:.3g}  {status}"
+        )
+        lines.append(f"  ({band})")
+
+    return "\n".join(lines) + "\n\n"
 
 
 def _semantic_tags(frame: dict) -> list[str]:
@@ -179,7 +250,6 @@ def synthesize_stand_telemetry(
 
     blocks: list[str] = []
     if sections.section_0_state and error_spec is not None:
-        # Reuse Walker formatter: it only needs qpos/qvel in frames.
         blocks.append(
             format_tracked_state_section(
                 anom,

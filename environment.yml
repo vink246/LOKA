@@ -14,9 +14,9 @@ dependencies:
       # controller reads result.info.status_val to reject infeasible solves.
       - osqp>=1.1
       - pytest>=7.4
-      # Live tuning dashboard (python -m loka.dashboard).
+      # Manual tuning dashboard (python -m loka.dashboard).
       - dearpygui>=1.11
-      # Stack A (LLM orchestration) only. mujoco_mpc ships no wheel; build it
-      # from google-deepmind/mujoco_mpc per its README, into this env.
+      # The orchestrator (python -m loka.run_loka) only. Everything else in
+      # the repo runs without an API key.
       - openai>=1.30
       - python-dotenv>=1.0

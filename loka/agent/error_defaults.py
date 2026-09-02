@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from loka.error_spec import ErrorSpec, ErrorTerm
+from loka.agent.error_spec import ErrorSpec, ErrorTerm
 
 # Floating-base layout in models/g1/scene.xml:
 #   qpos: [x, y, z, qw, qx, qy, qz, joints...]

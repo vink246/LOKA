@@ -1,12 +1,15 @@
-"""Standing balance controller: centroidal MPC on top of a whole-body QP.
+"""Locomotion controller: centroidal MPC on top of a whole-body QP.
 
-    state ──► ConvexMPC (50 Hz)  ──► desired contact forces
+    state ──► GaitScheduler   (500 Hz) ──► contacts, CoM reference, swing arc
+           ──► ConvexMPC       (50 Hz) ──► desired contact forces
            └► WholeBodyController (500 Hz) ──► joint torques
 
-The MPC decides *how hard each foot should push* to keep the centroidal state
-on target. The WBC runs an order of magnitude faster and answers the different
-question of *what torques realise those forces* while keeping the feet planted,
-the torso upright, and the posture near nominal.
+The gait layer decides *who is on the ground and where the body should be*;
+standing is simply the case where it hands back both feet and a stationary
+reference. The MPC decides *how hard each foot should push* to track that
+centroidal reference. The WBC runs an order of magnitude faster and answers
+the different question of *what torques realise those forces* while keeping
+the planted feet still, the torso upright, and the swing foot on its arc.
 
 Nothing here knows about MuJoCo simulation or DDS: feed it ``(qpos, qvel)`` and
 it returns 29 torques, so the same object drives the simulator today and a
@@ -80,7 +83,7 @@ MIN_BASE_WEIGHT_SCALE = 0.4
 
 
 @dataclass
-class StandConfig:
+class LocomotionConfig:
     model_path: str = str(DEFAULT_MODEL)
     #: Whole-body QP period. 500 Hz is comfortable for a 59-variable QP.
     control_dt: float = 0.002
@@ -101,7 +104,7 @@ class StandConfig:
     gait: GaitConfig = field(default_factory=GaitConfig)
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "StandConfig":
+    def from_yaml(cls, path: str | Path) -> "LocomotionConfig":
         with open(path, "r", encoding="utf-8") as handle:
             raw: Mapping[str, Any] = yaml.safe_load(handle) or {}
         mpc = MPCConfig(**raw.pop("mpc", {}))
@@ -118,7 +121,7 @@ class StandConfig:
 
 
 @dataclass
-class StandCommand:
+class LocomotionCommand:
     """Operator / LOKA-facing setpoint.
 
     Lean offsets shift the CoM target within the support polygon:
@@ -169,7 +172,7 @@ TASK_PARAMETER_NAMES = frozenset({
 
 
 @dataclass
-class StandTelemetry:
+class LocomotionTelemetry:
     com: np.ndarray
     com_reference: np.ndarray
     com_error: np.ndarray
@@ -190,11 +193,11 @@ class StandTelemetry:
     swing_error: float = 0.0
 
 
-class StandController:
-    def __init__(self, config: StandConfig | None = None) -> None:
-        self.config = config or StandConfig()
+class LocomotionController:
+    def __init__(self, config: LocomotionConfig | None = None) -> None:
+        self.config = config or LocomotionConfig()
         self.robot = G1Model(self.config.model_path)
-        self.command = StandCommand()
+        self.command = LocomotionCommand()
 
         self.mpc = ConvexMPC(
             self.config.mpc, self.robot.num_contacts, self.robot.total_mass
@@ -270,7 +273,7 @@ class StandController:
         self._tick = 0
         self._desired_forces = self.mpc.last_forces.copy()
         self._ground_height = float(self.config.ground_height)
-        self.telemetry: StandTelemetry | None = None
+        self.telemetry: LocomotionTelemetry | None = None
         self.gait = GaitScheduler(self.config.gait)
         self._last_gait = None
 
@@ -527,7 +530,7 @@ class StandController:
         )
 
         swing = gait_out.swing
-        self.telemetry = StandTelemetry(
+        self.telemetry = LocomotionTelemetry(
             com=dynamics.com,
             com_reference=com_ref,
             com_error=dynamics.com - com_ref,
@@ -638,7 +641,7 @@ class StandController:
             applied[name] = value
 
         if gait_updates:
-            # Keep StandConfig.gait and scheduler in sync.
+            # Keep LocomotionConfig.gait and scheduler in sync.
             gait_applied = self.gait.apply_updates(gait_updates)
             applied.update(gait_applied)
             self.config.gait = self.gait.config

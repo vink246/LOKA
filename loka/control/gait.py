@@ -123,19 +123,52 @@ class GaitConfig:
     foothold_retarget_s: float = 0.70
 
 
-# Clamps applied when the LLM / operator sets gait.* Task_Targets.
+@dataclass(frozen=True)
+class GaitKnob:
+    """One gait policy scalar, with the band it is clamped into.
+
+    The same declaration serves the operator's slider and the orchestrator's
+    prompt, so the two cannot drift apart on either the range or the meaning.
+    """
+
+    name: str  # "gait.speed"
+    summary: str
+    low: float
+    high: float
+
+    @property
+    def field(self) -> str:
+        return self.name.split(".", 1)[1]
+
+
+GAIT_KNOBS: tuple[GaitKnob, ...] = (
+    GaitKnob("gait.mode", "0=stand 1=walk 2=tread (march in place) 3=limp", 0.0, 3.0),
+    GaitKnob("gait.speed", "Travel speed along the heading [m/s]", 0.0, 0.80),
+    GaitKnob("gait.heading", "World-frame travel direction [rad]", -np.pi, np.pi),
+    GaitKnob("gait.step_period",
+             "Full two-step cycle [s]; one step is half of this", 0.40, 1.20),
+    GaitKnob("gait.duty_factor",
+             "Stance fraction per leg. Must stay above 0.5 or both feet leave "
+             "the ground at once", 0.55, 0.85),
+    GaitKnob("gait.step_length_max",
+             "Cap on the stride between consecutive footholds [m]", 0.05, 0.45),
+    GaitKnob("gait.swing_height", "Peak swing clearance above the foot line [m]",
+             0.02, 0.15),
+    GaitKnob("gait.stance_width", "Lateral foot separation [m]; nominal G1 is 0.237",
+             0.18, 0.34),
+    GaitKnob("gait.capture_gain",
+             "DCM foothold feedback. 1.0 is deadbeat capture-point placement; "
+             "below 1 trades disturbance rejection for a smoother stride",
+             0.0, 1.5),
+    GaitKnob("gait.walk_accel", "Ramp on the commanded speed [m/s^2]", 0.05, 2.0),
+    GaitKnob("gait.foothold_retarget_s",
+             "Fraction of swing during which the foothold may still move",
+             0.05, 0.95),
+)
+
+#: Clamps applied when the LLM / operator sets gait.* Task_Targets.
 GAIT_LIMITS: dict[str, tuple[float, float]] = {
-    "gait.mode": (0.0, 3.0),
-    "gait.speed": (0.0, 0.80),
-    "gait.heading": (-np.pi, np.pi),
-    "gait.step_period": (0.40, 1.20),
-    "gait.duty_factor": (0.55, 0.85),
-    "gait.step_length_max": (0.05, 0.45),
-    "gait.swing_height": (0.02, 0.15),
-    "gait.stance_width": (0.18, 0.34),
-    "gait.capture_gain": (0.0, 1.5),
-    "gait.walk_accel": (0.05, 2.0),
-    "gait.foothold_retarget_s": (0.05, 0.95),
+    knob.name: (knob.low, knob.high) for knob in GAIT_KNOBS
 }
 
 GAIT_PARAMETER_NAMES = frozenset(GAIT_LIMITS.keys())
@@ -279,6 +312,11 @@ class GaitScheduler:
     def walking(self) -> bool:
         """True while the gait clock owns the contact schedule."""
         return self._active
+
+    @property
+    def step_index(self) -> int:
+        """Support steps completed since the walk began."""
+        return int(self._step)
 
     def wants_walk(self) -> bool:
         cfg = self.config

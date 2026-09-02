@@ -5,17 +5,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from loka.control.stand import StandController
+from loka.control.locomotion import LocomotionController
 from loka.sim import Simulation
-from loka.stand_loka.apply import apply_stand_scratchpad
-from loka.stand_loka.compress import synthesize_stand_telemetry
-from loka.stand_loka.error_defaults import default_stand_error_spec
-from loka.stand_loka.faults import FaultSpec, apply_plant_fault, clear_plant_faults
-from loka.stand_loka.runtime import StandLokaConfig, StandLokaRuntime
+from loka.agent.apply import apply_stand_scratchpad
+from loka.agent.compress import synthesize_stand_telemetry
+from loka.agent.error_defaults import default_stand_error_spec
+from loka.agent.faults import FaultSpec, apply_plant_fault, clear_plant_faults
+from loka.agent.runtime import LokaConfig, LokaRuntime
 
 
 def test_lean_and_height_are_clamped():
-    controller = StandController()
+    controller = LocomotionController()
     applied = controller.set_task_targets(
         {"lean_x": 1.0, "lean_y": -1.0, "height": 0.1, "yaw": 5.0}
     )
@@ -26,7 +26,7 @@ def test_lean_and_height_are_clamped():
 
 
 def test_apply_scratchpad_task_and_weights():
-    controller = StandController()
+    controller = LocomotionController()
     loka_state = {
         "mutations": [],
         "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
@@ -59,7 +59,7 @@ def test_apply_scratchpad_task_and_weights():
 
 
 def test_apply_rejects_ambiguous_bare_weight_name():
-    controller = StandController()
+    controller = LocomotionController()
     loka_state = {"mutations": [], "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy()}
     scratchpad = {
         "Semantic_State": {"Hypothesis": "x", "Analysis": "y"},
@@ -74,7 +74,7 @@ def test_apply_rejects_ambiguous_bare_weight_name():
 
 
 def test_apply_locks_robot_tuned_mpc_weights():
-    controller = StandController()
+    controller = LocomotionController()
     before_z = controller.config.mpc.weight_position[2]
     before_contact = controller.config.wbc.weight_contact
     loka_state = {"mutations": [], "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy()}
@@ -99,7 +99,7 @@ def test_apply_locks_robot_tuned_mpc_weights():
 
 def test_compressor_emits_balance_section():
     sim = Simulation()
-    runtime = StandLokaRuntime(sim, StandLokaConfig(enable_llm=False))
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     for _ in range(50):
         runtime.step()
     text = synthesize_stand_telemetry(
@@ -115,7 +115,7 @@ def test_compressor_emits_balance_section():
 
 def test_mass_fault_injection_changes_plant_not_belief():
     sim = Simulation()
-    runtime = StandLokaRuntime(sim, StandLokaConfig(enable_llm=False))
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     belief_mass = float(runtime.controller.robot.model.body_mass.sum())
     backup = apply_plant_fault(
         sim.model, FaultSpec("mass", 0.0, {"delta_kg": 5.0, "body": "torso_link"})
@@ -131,7 +131,7 @@ def test_mass_fault_injection_changes_plant_not_belief():
 
 def test_runtime_survives_scripted_lean_without_llm():
     sim = Simulation()
-    runtime = StandLokaRuntime(sim, StandLokaConfig(enable_llm=False))
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     for _ in range(200):
         runtime.step()
     runtime.controller.set_task_targets({"lean_x": 0.02, "height": 0.65})
@@ -144,7 +144,7 @@ def test_runtime_survives_scripted_lean_without_llm():
 
 
 def test_evaluate_lean_scenario():
-    from loka.evaluate_stand_loka import scenario_lean_operator_ablation
+    from loka.evaluate_loka import scenario_lean_operator_ablation
 
     result = scenario_lean_operator_ablation()
     assert not result.fell
@@ -153,7 +153,7 @@ def test_evaluate_lean_scenario():
 
 
 def test_evaluate_scripted_multi_turn_recovery():
-    from loka.evaluate_stand_loka import scenario_mass_fault_scripted_recovery
+    from loka.evaluate_loka import scenario_mass_fault_scripted_recovery
 
     result = scenario_mass_fault_scripted_recovery()
     assert not result.fell
@@ -162,7 +162,7 @@ def test_evaluate_scripted_multi_turn_recovery():
 
 
 def test_interactive_fault_commands_parse():
-    from loka.stand_loka.interactive import parse_fault_command
+    from loka.agent.interactive import parse_fault_command
 
     assert parse_fault_command("help") == "help"
     assert parse_fault_command("clear") == "clear"
@@ -184,7 +184,7 @@ def test_interactive_fault_commands_parse():
 
 def test_inject_and_clear_faults_update_viz():
     sim = Simulation()
-    runtime = StandLokaRuntime(sim, StandLokaConfig(enable_llm=False))
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     runtime.inject_fault_now(
         FaultSpec("mass", 0.0, {"delta_kg": 5.0, "body": "torso_link"})
     )
@@ -205,7 +205,7 @@ def test_inject_and_clear_faults_update_viz():
 
 def test_mission_baseline_rebases_after_task_change():
     sim = Simulation()
-    runtime = StandLokaRuntime(sim, StandLokaConfig(enable_llm=False))
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     while not runtime._baseline_full:
         runtime.step()
     standing_z = float(np.mean([f["qpos"][2] for f in runtime.nominal_baseline]))
@@ -233,7 +233,7 @@ def test_mission_baseline_rebases_after_task_change():
 
 
 def test_early_anomaly_fires_on_shoulder_mass_not_quiet_stand():
-    from loka.stand_loka.anomaly import assess_stand_anomaly
+    from loka.agent.anomaly import assess_stand_anomaly
 
     quiet = {
         "com_error": np.zeros(3),
@@ -297,7 +297,7 @@ def test_early_anomaly_fires_on_shoulder_mass_not_quiet_stand():
 
 
 def test_plateau_improvement_and_stop_reasons():
-    from loka.stand_loka.plateau import (
+    from loka.agent.plateau import (
         EpisodeMetrics,
         is_improved,
         should_stop_episode,
@@ -359,11 +359,11 @@ def test_plateau_improvement_and_stop_reasons():
 
 
 def test_accept_residual_updates_mass_belief_and_lean():
-    from loka.session import FailureEpisode
-    from loka.stand_loka.plateau import EpisodeMetrics
+    from loka.agent.session import FailureEpisode
+    from loka.agent.plateau import EpisodeMetrics
 
     sim = Simulation()
-    runtime = StandLokaRuntime(sim, StandLokaConfig(enable_llm=False))
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     while not runtime._baseline_full:
         runtime.step()
 
@@ -409,13 +409,13 @@ def test_accept_residual_updates_mass_belief_and_lean():
 
 
 def test_gate_failure_dispatch_detects_plateau():
-    from loka.session import FailureEpisode
-    from loka.stand_loka.plateau import EpisodeMetrics
+    from loka.agent.session import FailureEpisode
+    from loka.agent.plateau import EpisodeMetrics
 
     sim = Simulation()
-    runtime = StandLokaRuntime(
+    runtime = LokaRuntime(
         sim,
-        StandLokaConfig(
+        LokaConfig(
             enable_llm=False,
             max_interventions_per_episode=5,
             plateau_min_interventions=2,
@@ -459,9 +459,9 @@ def test_gate_failure_dispatch_detects_plateau():
 
 
 def test_session_log_rewrites_each_session(tmp_path):
-    from loka.stand_loka.session_log import StandSessionLog
+    from loka.agent.session_log import StandSessionLog
 
-    path = tmp_path / "stand_loka" / "session.log"
+    path = tmp_path / "loka" / "session.log"
     log1 = StandSessionLog(path)
     log1.dispatch(sim_time=1.0, reason="operator", user_content="FIRST")
     assert "FIRST" in path.read_text(encoding="utf-8")

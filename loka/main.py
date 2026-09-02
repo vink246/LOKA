@@ -7,8 +7,8 @@
     python -m loka.main --height 0.60         # crouch
 
 The controller is a centroidal MPC feeding a whole-body QP; see
-``loka/control/stand.py``. Use ``python -m loka.evaluate`` for the full
-robustness suite.
+``loka/control/locomotion.py``. Use ``python -m loka.evaluate`` for the full
+robustness suite, or ``python -m loka.dashboard`` to tune it by hand.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from loka.control.stand import DEFAULT_MODEL, StandConfig
+from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig
 from loka.recording import RecordingToggle
 from loka.sim import Simulation, push_sequence
 
@@ -51,7 +51,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_simulation(args: argparse.Namespace) -> Simulation:
-    config = StandConfig.from_yaml(args.config) if args.config else StandConfig()
+    config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
     duration = args.duration or (30.0 if not args.headless else 10.0)
     pushes = (
         push_sequence(

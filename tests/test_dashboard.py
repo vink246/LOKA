@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 
 from loka.control import tuning
-from loka.dashboard import Dashboard
+from loka.dashboard import PLOTS, Dashboard
 from loka.sim import Simulation
 
 dpg = pytest.importorskip("dearpygui.dearpygui")
@@ -190,6 +190,90 @@ def test_pause_button_toggles_and_relabels(dashboard):
     fire("pause")
     assert dashboard.running is was_running
     assert dpg.get_item_label("pause") == ("pause" if dashboard.running else "resume")
+
+
+@needs_display
+def test_every_declared_trace_gets_a_sample_per_frame(dashboard):
+    """A plot wired to a key nothing writes stays empty forever, silently."""
+    dashboard._reset()
+    before = {key: len(buffer) for key, buffer in dashboard.trace.items()}
+    dashboard._advance()
+
+    for plot in PLOTS:
+        for trace in plot.traces:
+            assert len(dashboard.trace[trace.key]) == before[trace.key] + 1, (
+                f"{plot.tag} plots {trace.key}, which _advance never appends to"
+            )
+
+
+# -- gait panel ------------------------------------------------------------
+#
+# These drive the controller through set_task_targets, the same entry point
+# the orchestrator uses, so a clamp or a side effect that would surprise the
+# LLM surprises the operator here first.
+
+
+@pytest.fixture
+def standing_again(dashboard):
+    """Leave the gait clock where the other tests expect it."""
+    yield
+    dpg.set_value("gait.mode", "stand")
+    fire("gait.mode")
+    dashboard._reset()
+
+
+@needs_display
+def test_mode_combo_starts_a_walk_and_reports_the_speed_it_chose(
+    dashboard, standing_again
+):
+    """Asking for walk with no speed set picks a crawl; the panel must show it."""
+    controller = dashboard.sim.controller
+    assert not controller.gait.wants_walk()
+
+    dpg.set_value("gait.mode", "walk")
+    fire("gait.mode")
+
+    assert controller.gait.wants_walk()
+    chosen = controller.gait.config.speed
+    assert chosen > 0.0
+    assert dpg.get_value("gait.speed") == pytest.approx(chosen)
+    assert dpg.get_value("readout::gait.speed") == f"{chosen:.4g}"
+
+
+@needs_display
+def test_leaving_walk_stops_the_gait_clock(dashboard, standing_again):
+    controller = dashboard.sim.controller
+    dpg.set_value("gait.mode", "walk")
+    fire("gait.mode")
+    assert controller.gait.wants_walk()
+
+    dpg.set_value("gait.mode", "stand")
+    fire("gait.mode")
+
+    assert not controller.gait.wants_walk()
+
+
+@needs_display
+@pytest.mark.parametrize(
+    "path,field,value",
+    [
+        ("gait.speed", "speed", 0.30),
+        ("gait.swing_height", "swing_height", 0.09),
+        ("gait.step_period", "step_period", 0.80),
+        ("gait.stance_width", "stance_width", 0.26),
+        ("gait.capture_gain", "capture_gain", 1.0),
+    ],
+)
+def test_gait_slider_reaches_the_scheduler(dashboard, standing_again, path, field, value):
+    dpg.set_value(path, value)
+    fire(path)
+
+    scheduler = dashboard.sim.controller.gait
+    assert getattr(scheduler.config, field) == pytest.approx(value)
+    # StandConfig.gait and the live scheduler are the same object; if they ever
+    # diverge, a --config run and a slider run stop agreeing.
+    assert dashboard.sim.controller.config.gait is scheduler.config
+    assert dpg.get_value(f"readout::{path}") == f"{value:.4g}"
 
 
 @needs_display

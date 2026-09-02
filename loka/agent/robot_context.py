@@ -1,12 +1,9 @@
-"""Robot MJCF reference text and live MPC capability formatting for LOKA."""
+"""Robot MJCF reference text for the orchestrator's prompt."""
 
 import os
 import re
 
 import mujoco
-
-from loka.error_spec import ErrorSpec, format_error_spec
-from loka.mjcf_utils import SUPPORTED_PLANNER_NUMERICS, get_model_numeric
 
 _JOINT_TYPES = {
     int(mujoco.mjtJoint.mjJNT_FREE): "free",
@@ -27,7 +24,7 @@ def _actuator_target_joint(model, actuator_id):
     return mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
 
 
-def load_kinematics_mjcf(xml_path):
+def _load_kinematics_mjcf(xml_path):
     """Load kinematics-relevant MJCF includes referenced by the task XML."""
     task_dir = os.path.dirname(os.path.abspath(xml_path))
 
@@ -58,97 +55,11 @@ def load_kinematics_mjcf(xml_path):
     return None
 
 
-def capture_nominal_params(model):
-    """Snapshot nominal MJCF parameters before any runtime or LOKA changes."""
-    actuators = {}
-    for actuator_id in range(model.nu):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
-        actuators[name] = {"gear": float(model.actuator_gear[actuator_id, 0])}
-
-    geoms = {}
-    for geom_id in range(model.ngeom):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
-        if not name:
-            continue
-        geoms[name] = {"friction": model.geom_friction[geom_id].tolist()}
-
-    bodies = {}
-    for body_id in range(1, model.nbody):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-        bodies[name] = {"mass": float(model.body_mass[body_id])}
-
-    return {"actuators": actuators, "geoms": geoms, "bodies": bodies}
-
-
-def discover_capabilities(agent, model) -> dict:
-    """Live cost weights, task parameters, and planner numerics from the loaded model."""
-    try:
-        cost_weights = {name: float(val) for name, val in agent.get_cost_weights().items()}
-    except Exception:
-        cost_weights = {}
-
-    try:
-        task_parameters = {
-            name: float(val) for name, val in agent.get_task_parameters().items()
-        }
-    except Exception:
-        task_parameters = {}
-
-    planner = {}
-    for name in sorted(SUPPORTED_PLANNER_NUMERICS):
-        value = get_model_numeric(model, name)
-        if value is not None:
-            planner[name] = value
-
-    return {
-        "cost_weights": cost_weights,
-        "task_parameters": task_parameters,
-        "planner": planner,
-    }
-
-
-def format_capabilities_block(capabilities: dict) -> str:
-    lines = ["AVAILABLE CONTROLLER / PLANNER / TASK PARAMETERS"]
-
-    weights = capabilities.get("cost_weights", {})
-    lines.append("Available Cost Weights (use exact names in Controller_Targets):")
-    if weights:
-        for name, value in sorted(weights.items()):
-            lines.append(f'  - "{name}" (current: {value:.4g})')
-    else:
-        lines.append("  - [none discovered]")
-
-    planner = capabilities.get("planner", {})
-    lines.append("Available Planner Metaparameters:")
-    if planner:
-        for name, value in sorted(planner.items()):
-            lines.append(f'  - "{name}" (current: {value:.4g})')
-    else:
-        lines.append("  - [none discovered]")
-
-    tasks = capabilities.get("task_parameters", {})
-    lines.append("Available Task Parameters (use exact names in Task_Targets):")
-    if tasks:
-        for name, value in sorted(tasks.items()):
-            lines.append(f'  - "{name}" (current: {value:.4g})')
-    else:
-        lines.append("  - [none discovered]")
-
-    return "\n".join(lines)
-
-
 def format_primary_objective_block(objective: str) -> str:
     return (
         "PRIMARY OBJECTIVE\n"
         f"{objective.strip()}\n"
         "All MPC targets and Error_Tracking criteria should serve this objective."
-    )
-
-
-def format_current_error_tracking(error_spec: ErrorSpec) -> str:
-    return (
-        "CURRENT ERROR TRACKING (live success / failure criteria):\n"
-        f"{format_error_spec(error_spec)}"
     )
 
 
@@ -183,37 +94,6 @@ def format_current_model_belief(loka_state):
             f"  - {mutation['type']} '{mutation['name']}'.{mutation['attr']}: "
             f"{mutation['val']} (nominal: {nominal_val}{time_note})"
         )
-
-    return "\n".join(lines)
-
-
-def format_current_mpc_configuration(agent, model):
-    """Snapshot live MPC cost weights, planner settings, and task goals."""
-    lines = ["Live values currently loaded in the MPC agent:"]
-
-    try:
-        weights = agent.get_cost_weights()
-        lines.append("Controller cost weights:")
-        for name in sorted(weights.keys()):
-            lines.append(f"  - {name}: {float(weights[name]):.4g}")
-    except Exception as exc:
-        lines.append(f"Controller cost weights: [unavailable: {exc}]")
-
-    lines.append("Planner metaparameters:")
-    for name in sorted(SUPPORTED_PLANNER_NUMERICS):
-        value = get_model_numeric(model, name)
-        if value is None:
-            lines.append(f"  - {name}: [not found in model]")
-        else:
-            lines.append(f"  - {name}: {value:.4g}")
-
-    try:
-        task_params = agent.get_task_parameters()
-        lines.append("Task parameters:")
-        for name in sorted(task_params.keys()):
-            lines.append(f"  - {name}: {float(task_params[name]):.4g}")
-    except Exception as exc:
-        lines.append(f"Task parameters: [unavailable: {exc}]")
 
     return "\n".join(lines)
 
@@ -287,7 +167,7 @@ def build_robot_model_context(model, xml_path):
         "  - bodies: mass",
     ])
 
-    mjcf = load_kinematics_mjcf(xml_path)
+    mjcf = _load_kinematics_mjcf(xml_path)
     if mjcf:
         lines.extend([
             "",

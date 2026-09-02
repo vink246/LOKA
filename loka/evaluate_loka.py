@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Phase A evaluation harness skeleton for standing LOKA.
 
-    python -m loka.evaluate_stand_loka
-    python -m loka.evaluate_stand_loka --scenario lean_operator --no-llm
+    python -m loka.evaluate_loka
+    python -m loka.evaluate_loka --scenario lean_operator --no-llm
 
 Scenarios run headless. LLM scenarios need OPENAI_API_KEY unless --no-llm.
 """
@@ -17,10 +17,10 @@ from pathlib import Path
 
 import numpy as np
 
-from loka.control.stand import StandConfig
+from loka.control.locomotion import LocomotionConfig
 from loka.sim import Simulation
-from loka.stand_loka.faults import FaultSpec
-from loka.stand_loka.runtime import StandLokaConfig, StandLokaRuntime
+from loka.agent.faults import FaultSpec
+from loka.agent.runtime import LokaConfig, LokaRuntime
 
 
 @dataclass
@@ -47,10 +47,10 @@ def _run(
     enable_llm: bool = False,
     local_operator_fn=None,
 ) -> ScenarioResult:
-    sim = Simulation(StandConfig())
-    runtime = StandLokaRuntime(
+    sim = Simulation(LocomotionConfig())
+    runtime = LokaRuntime(
         sim,
-        StandLokaConfig(enable_llm=enable_llm),
+        LokaConfig(enable_llm=enable_llm),
         faults=faults or [],
     )
     queued = False
@@ -90,7 +90,7 @@ def scenario_hold_baseline() -> ScenarioResult:
 def scenario_lean_operator_ablation() -> ScenarioResult:
     """No-LLM ablation: apply structured Task_Targets directly (not language)."""
 
-    def apply_local(runtime: StandLokaRuntime) -> None:
+    def apply_local(runtime: LokaRuntime) -> None:
         runtime.controller.set_task_targets(
             {"lean_x": 0.025, "lean_y": -0.02, "height": 0.65}
         )
@@ -128,12 +128,12 @@ def scenario_mass_fault_scripted_recovery() -> ScenarioResult:
     Turn 1 softens CoM gains / friction belief; turn 2 crouches slightly.
     Exercises the apply path without an API key.
     """
-    from loka.stand_loka.apply import apply_stand_scratchpad
+    from loka.agent.apply import apply_stand_scratchpad
 
-    sim = Simulation(StandConfig())
-    runtime = StandLokaRuntime(
+    sim = Simulation(LocomotionConfig())
+    runtime = LokaRuntime(
         sim,
-        StandLokaConfig(enable_llm=False),
+        LokaConfig(enable_llm=False),
         faults=[FaultSpec("mass", 2.5, {"delta_kg": 6.0, "body": "torso_link"})],
     )
     turn1_at, turn2_at = 3.5, 5.5

@@ -6,15 +6,15 @@ from pathlib import Path
 
 import mujoco
 
-from loka.control.stand import (
+from loka.control.locomotion import (
     HEIGHT_BAND,
     MAX_LEAN_XY,
     MAX_YAW,
     TASK_PARAMETER_NAMES,
-    StandController,
+    LocomotionController,
 )
-from loka.robot_context import build_robot_model_context
-from loka.stand_loka.policy import (
+from loka.agent.robot_context import build_robot_model_context
+from loka.agent.policy import (
     LLM_STAND_CONTROLLER_ALLOWLIST,
     stand_llm_catalogue,
 )
@@ -30,7 +30,7 @@ def default_stand_objective() -> str:
     )
 
 
-def build_stand_capabilities(controller: StandController) -> dict:
+def build_stand_capabilities(controller: LocomotionController) -> dict:
     limits = controller.lean_limits()
     return {
         "cost_weights": sorted(LLM_STAND_CONTROLLER_ALLOWLIST),
@@ -82,7 +82,7 @@ def format_stand_capabilities_block(capabilities: dict) -> str:
 LEAN_FRACTION_TEXT = "55%"
 
 
-def format_stand_configuration(controller: StandController) -> str:
+def format_stand_configuration(controller: LocomotionController) -> str:
     tasks = controller.task_snapshot()
     weights = controller.tunables()
     lines = ["## CURRENT STAND CONFIGURATION", "Task_Targets:"]
@@ -100,7 +100,7 @@ def format_stand_configuration(controller: StandController) -> str:
     return "\n".join(lines)
 
 
-def build_stand_robot_context(controller: StandController) -> str:
+def build_stand_robot_context(controller: LocomotionController) -> str:
     model = controller.robot.model
     xml_path = Path(controller.config.model_path)
     base = build_robot_model_context(model, str(xml_path))

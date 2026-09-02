@@ -13,7 +13,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from loka.control.stand import StandController
+from loka.control.locomotion import LocomotionController
 
 # Approximate lateral lever from pelvis to shoulder roll link [m].
 _SHOULDER_LEVER_M = 0.20
@@ -120,7 +120,7 @@ def should_stop_episode(
 
 def _infer_mass_belief(
     metrics: EpisodeMetrics,
-    controller: StandController,
+    controller: LocomotionController,
 ) -> dict[str, Any] | None:
     """Estimate an absolute body-mass belief update from CoM lateral residual."""
     import mujoco
@@ -161,7 +161,7 @@ def _infer_mass_belief(
 
 def build_accept_residual_scratchpad(
     metrics: EpisodeMetrics,
-    controller: StandController,
+    controller: LocomotionController,
     *,
     reason: str,
 ) -> dict[str, Any]:

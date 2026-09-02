@@ -1,5 +1,43 @@
 """Runtime model state: LOKA mutations vs hidden physical faults."""
 
+import mujoco
+
+
+def resolve_mjcf_name(model, obj_enum, name):
+    """Resolve an MJCF object name, tolerating LLM casing mistakes.
+
+    A mutation naming ``Left_Knee`` instead of ``left_knee`` is a spelling
+    slip, not a diagnosis error, and dropping it would silently discard an
+    otherwise sound belief update.
+    """
+    if not name:
+        return None, -1
+
+    obj_id = mujoco.mj_name2id(model, obj_enum, name)
+    if obj_id != -1:
+        return name, obj_id
+
+    lowered = name.lower()
+    if lowered != name:
+        obj_id = mujoco.mj_name2id(model, obj_enum, lowered)
+        if obj_id != -1:
+            return lowered, obj_id
+
+    counts = {
+        mujoco.mjtObj.mjOBJ_ACTUATOR: model.nu,
+        mujoco.mjtObj.mjOBJ_GEOM: model.ngeom,
+        mujoco.mjtObj.mjOBJ_BODY: model.nbody,
+    }
+    if obj_enum not in counts:
+        return None, -1
+
+    for i in range(counts[obj_enum]):
+        candidate = mujoco.mj_id2name(model, obj_enum, i)
+        if candidate and candidate.lower() == lowered:
+            return candidate, i
+
+    return None, -1
+
 
 def apply_loka_mutations(model, loka_state, nominal_gears):
     """Reset to nominal hardware, then apply LOKA's internal-model mutations."""

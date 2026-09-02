@@ -2,10 +2,12 @@
 
 Two halves:
 
-* ``loka.control`` / ``loka.sim`` -- the G1 standing controller (centroidal MPC
-  feeding a whole-body QP) and its MuJoCo harness.
-* ``loka.orchestrator`` and friends -- the LLM layer that compresses telemetry
-  into semantic tags and mutates the controller's parameters at runtime.
+* ``loka.control`` / ``loka.sim`` -- the G1 locomotion controller (centroidal
+  MPC feeding a whole-body QP, with a gait layer on top) and its MuJoCo
+  harness. Nothing here waits on a language model.
+* ``loka.agent`` -- the slow layer: compress proprioceptive anomalies into
+  semantic tags, diagnose them with an LLM, and mutate the controller's typed
+  parameters between control ticks.
 """
 
-__all__ = ["control", "evaluate", "sim"]
+__all__ = ["agent", "control", "sim"]

@@ -21,7 +21,7 @@ from loka.control.robot import (
     orientation_error,
     quat_to_rpy,
 )
-from loka.control.stand import DEFAULT_MODEL, StandConfig, StandController
+from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig, LocomotionController
 from loka.sim import Push, Simulation
 
 
@@ -42,19 +42,19 @@ def settled(sim: Simulation) -> Simulation:
 
 
 @pytest.fixture(scope="module")
-def controller() -> StandController:
-    return StandController()
+def controller() -> LocomotionController:
+    return LocomotionController()
 
 
 @pytest.fixture(scope="module")
-def nominal(controller: StandController):
+def nominal(controller: LocomotionController):
     return controller.robot.nominal_qpos.copy(), np.zeros(controller.robot.nv)
 
 
 # -- model ---------------------------------------------------------------
 
 
-def test_model_matches_unitree_layout(controller: StandController):
+def test_model_matches_unitree_layout(controller: LocomotionController):
     robot = controller.robot
     assert robot.nu == NUM_JOINTS
     assert robot.nv == QVEL_JOINT0 + NUM_JOINTS
@@ -62,7 +62,7 @@ def test_model_matches_unitree_layout(controller: StandController):
     assert 30.0 < robot.total_mass < 45.0
 
 
-def test_nominal_stance_has_flat_feet_on_the_floor(controller: StandController):
+def test_nominal_stance_has_flat_feet_on_the_floor(controller: LocomotionController):
     robot = controller.robot
     robot.update(robot.nominal_qpos, np.zeros(robot.nv))
     sole_z = robot.data.site_xpos[robot.contact_site_ids][:, 2]
@@ -70,7 +70,7 @@ def test_nominal_stance_has_flat_feet_on_the_floor(controller: StandController):
     assert abs(sole_z.mean()) < 1e-3, "soles are not resting on z=0"
 
 
-def test_nominal_com_sits_over_the_support_polygon(controller: StandController):
+def test_nominal_com_sits_over_the_support_polygon(controller: LocomotionController):
     """Equal fore/aft margin is what makes push recovery symmetric."""
     robot = controller.robot
     robot.update(robot.nominal_qpos, np.zeros(robot.nv))
@@ -79,7 +79,7 @@ def test_nominal_com_sits_over_the_support_polygon(controller: StandController):
     assert forward > 0.05, "no room to shift the centre of pressure"
 
 
-def test_com_inertia_matches_a_direct_sum(controller: StandController):
+def test_com_inertia_matches_a_direct_sum(controller: LocomotionController):
     robot = controller.robot
     robot.update(robot.nominal_qpos, np.zeros(robot.nv))
     model, data = robot.model, robot.data
@@ -278,8 +278,8 @@ def test_tunable_paths_resolve_to_real_config_fields(controller):
 def test_yaml_config_reproduces_the_dataclass_defaults(tmp_path):
     from pathlib import Path
 
-    config = StandConfig.from_yaml(Path("loka/config/stand.yaml"))
-    defaults = StandConfig()
+    config = LocomotionConfig.from_yaml(Path("loka/config/g1.yaml"))
+    defaults = LocomotionConfig()
     assert config.control_dt == defaults.control_dt
     assert config.mpc.horizon == defaults.mpc.horizon
     assert config.wbc.kp_posture_legs == defaults.wbc.kp_posture_legs
@@ -413,7 +413,7 @@ def test_absorbs_velocity_up_to_the_capture_point_limit():
 
 @pytest.mark.slow
 def test_control_loop_keeps_up_with_its_own_period():
-    config = StandConfig()
+    config = LocomotionConfig()
     stats = Simulation(config).run(3.0)
     # Mean cost must fit inside the control period, with headroom for the
     # decimated MPC ticks that land on top of it.

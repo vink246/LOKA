@@ -1,7 +1,7 @@
-"""Session log for standing LOKA turns (compressor + LLM).
+"""Session log for LOKA turns (compressor + LLM).
 
-Fixed paths under ``logs/stand_loka/`` (gitignored). Each new session
-truncates and rewrites ``session.log`` / ``session.jsonl``.
+Fixed paths under ``logs/loka/`` (gitignored). Each new session truncates and
+rewrites ``session.log`` / ``session.jsonl``.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DEFAULT_LOG_DIR = Path("logs") / "stand_loka"
+DEFAULT_LOG_DIR = Path("logs") / "loka"
 SESSION_LOG_NAME = "session.log"
 SESSION_JSONL_NAME = "session.jsonl"
 

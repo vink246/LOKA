@@ -6,15 +6,15 @@ from typing import Any
 
 import mujoco
 
-from loka.control.stand import StandController
-from loka.error_spec import format_error_spec, parse_error_tracking
-from loka.orchestrator import resolve_mjcf_name
-from loka.stand_loka.context import format_stand_configuration
-from loka.stand_loka.policy import filter_controller_targets
+from loka.control.locomotion import LocomotionController
+from loka.agent.error_spec import format_error_spec, parse_error_tracking
+from loka.agent.model_state import resolve_mjcf_name
+from loka.agent.context import format_stand_configuration
+from loka.agent.policy import filter_controller_targets
 
 
 def apply_stand_scratchpad(
-    controller: StandController,
+    controller: LocomotionController,
     scratchpad: dict[str, Any],
     loka_state: dict[str, Any],
     *,
@@ -31,7 +31,7 @@ def apply_stand_scratchpad(
     them — mutations still write the controller model.
 
     ``Controller_Targets`` are hard-filtered by
-    :data:`loka.stand_loka.policy.LLM_STAND_CONTROLLER_ALLOWLIST`.
+    :data:`loka.agent.policy.LLM_STAND_CONTROLLER_ALLOWLIST`.
     """
     summary: dict[str, Any] = {
         "ok": False,
@@ -156,7 +156,7 @@ def apply_stand_scratchpad(
             summary["mutations"] += 1
             print(f"     * {obj_type} '{resolved_name}' -> {attr} = {val}")
 
-        from loka.model_state import apply_loka_mutations
+        from loka.agent.model_state import apply_loka_mutations
 
         nominal = loka_state.get("nominal_gears")
         if nominal is None:
