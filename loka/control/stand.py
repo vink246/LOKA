@@ -51,12 +51,32 @@ DEFAULT_MODEL = REPO_ROOT / "models" / "g1" / "scene.xml"
 #: not allowed to produce.
 CONTACT_HEIGHT_TOLERANCE = 0.005
 
-# Mild swing-leg joint feedforward. Aggressive knee FF caused forward tip-over;
-# clearance is secondary to capture-point stepping (see gait.py).
-SWING_KNEE_FLEX_AMP = 0.18  # rad extra knee flexion at mid-swing
-SWING_HIP_PITCH_AMP = 0.08  # rad hip pitch (negative = retract)
-SWING_JOINT_KP = 300.0
-SWING_JOINT_W = 22.0
+# Per-leg joint order in the Unitree DDS layout.
+HIP_PITCH, HIP_ROLL, HIP_YAW, KNEE, ANKLE_PITCH, ANKLE_ROLL = range(6)
+
+#: Hip-yaw hold while walking, on both legs, so the feet stay square to the
+#: pelvis (whose yaw the base orientation task already owns).
+STANCE_YAW_KP = 150.0
+STANCE_YAW_KD = 15.0
+STANCE_YAW_WEIGHT = 30.0
+
+#: Swing-leg null space: damping only, like a planted leg. The 3-row Cartesian
+#: foot task cannot determine six joints, and near knee extension the leg
+#: Jacobian is ill-conditioned, so a stiffness term here would fight the foot
+#: task while an unregularised null space lets the QP fling the leg. What is
+#: needed is somewhere for excess joint velocity to go.
+SWING_NULLSPACE_W = 4.0
+SWING_NULLSPACE_KD = 20.0
+
+#: The foot-centre task constrains position only, leaving the ankle free. These
+#: hold the sole flat so it lands on the whole footprint.
+SWING_ANKLE_KP = 200.0
+SWING_ANKLE_KD = 20.0
+SWING_ANKLE_W = 20.0
+
+#: Floor on the base task weight, so single support does not silently hand the
+#: torso over to the posture task.
+MIN_BASE_WEIGHT_SCALE = 0.4
 
 
 @dataclass
@@ -69,10 +89,13 @@ class StandConfig:
     #: Starting guess for the floor height [m]. Refined from the soles
     #: whenever the robot is actually touching something.
     ground_height: float = 0.0
-    #: Clamps on the task-space accelerations handed to the WBC.
+    #: Clamps on the task-space accelerations handed to the WBC. The CoM cap is
+    #: deliberately near what the soles can actually deliver; a swing foot is a
+    #: light limb in free space and gets a much wider budget.
     max_linear_acc: float = 20.0
     max_angular_acc: float = 40.0
     max_joint_acc: float = 200.0
+    max_swing_acc: float = 120.0
     mpc: MPCConfig = field(default_factory=MPCConfig)
     wbc: WBCConfig = field(default_factory=WBCConfig)
     gait: GaitConfig = field(default_factory=GaitConfig)
@@ -150,6 +173,8 @@ class StandTelemetry:
     com: np.ndarray
     com_reference: np.ndarray
     com_error: np.ndarray
+    com_velocity: np.ndarray
+    com_velocity_reference: np.ndarray
     rpy: np.ndarray
     torque: np.ndarray
     contact_forces: np.ndarray
@@ -157,6 +182,12 @@ class StandTelemetry:
     contact_mask: np.ndarray
     mpc_cost: float
     solve_ms: float
+    walking: bool = False
+    gait_phase: float = 0.0
+    #: Swing-foot height above the foot line, and its distance from the
+    #: commanded point on the swing arc [m]. Zero while both feet are planted.
+    swing_clearance: float = 0.0
+    swing_error: float = 0.0
 
 
 class StandController:
@@ -261,13 +292,38 @@ class StandController:
 
     # -- main entry point -------------------------------------------------
 
+    def _contact_pos_preview(
+        self,
+        *,
+        foot_xy: np.ndarray,
+        feet: np.ndarray,
+        contact_pos: np.ndarray,
+        ground_z: float,
+    ) -> np.ndarray:
+        """Sole-point positions over the MPC horizon, ``(horizon, nc, 3)``.
+
+        The gait plans foot *centres*; the MPC reasons about the eight sole
+        points, so each planned centre is re-decorated with the sole offsets
+        measured on the robot right now.
+        """
+        horizon = int(foot_xy.shape[0])
+        per_foot = self.robot.num_contacts // 2
+        offsets = contact_pos - np.repeat(feet, per_foot, axis=0)
+        seq = np.zeros((horizon, self.robot.num_contacts, 3))
+        for leg in (0, 1):
+            rows = slice(leg * per_foot, (leg + 1) * per_foot)
+            seq[:, rows, :2] = foot_xy[:, leg, None, :] + offsets[None, rows, :2]
+            seq[:, rows, 2] = ground_z
+        return seq
+
     def compute_torque(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
         started = time.perf_counter()
         cfg = self.config
         robot = self.robot
+        qvel_arr = np.asarray(qvel, dtype=float)
 
         robot.update(qpos, qvel)
-        dynamics = robot.dynamics(np.asarray(qvel, dtype=float))
+        dynamics = robot.dynamics(qvel_arr)
 
         base_quat = np.asarray(qpos[3:7], dtype=float)
         rot = quat_to_mat(base_quat)
@@ -288,32 +344,22 @@ class StandController:
             foot_centers=feet,
             ground_z=ground_z,
             height=height,
-            yaw=float(self.command.yaw),
             measured_mask=measured_mask,
         )
         self._last_gait = gait_out
-        walking = float(self.gait.config.mode) >= MODE_WALK and (
-            float(self.gait.config.speed) > 1e-4 or self.gait._cmd_speed > 1e-4
-        )
+        walking = gait_out.walking
 
-        # Planned mask for walk; allow early measured contact on the swing foot.
         if walking:
             contact_mask = gait_out.contact_mask.copy()
-            if gait_out.swing.active:
-                half = slice(0, 4) if gait_out.swing.leg == 0 else slice(4, 8)
-                # Only accept early touchdown late in swing, once the foot is near
-                # the foothold (avoids toe-drag re-planting mid-swing).
-                if (
-                    measured_mask[half].any()
-                    and gait_out.swing.s > 0.80
-                    and float(np.linalg.norm(feet[gait_out.swing.leg, :2] - gait_out.swing.foothold[:2]))
-                    < 0.04
-                ):
-                    contact_mask[half] = True
-        else:
-            contact_mask = measured_mask
-
-        if walking:
+            swing = gait_out.swing
+            if swing.active and swing.s > 0.75:
+                # Accept an early touchdown once the foot is essentially at its
+                # foothold; earlier than that a measured contact is a toe scuff,
+                # and honouring it would re-plant the foot mid-stride.
+                rows = slice(0, 4) if swing.leg == 0 else slice(4, 8)
+                near = float(np.linalg.norm(feet[swing.leg, :2] - swing.foothold[:2]))
+                if measured_mask[rows].any() and near < 0.05:
+                    contact_mask[rows] = True
             com_ref = np.array(
                 [
                     gait_out.com_ref_xy[0] + self.command.com_offset_xy[0],
@@ -321,10 +367,12 @@ class StandController:
                     ground_z + height,
                 ]
             )
+            com_vel_ref = np.array([gait_out.com_vel_ref[0], gait_out.com_vel_ref[1], 0.0])
             face_yaw = float(self.gait.config.heading)
             if abs(float(self.command.yaw)) > 1e-3:
                 face_yaw = float(self.command.yaw)
         else:
+            contact_mask = measured_mask
             com_ref = np.array(
                 [
                     foot_mid[0] + self.nominal_com_offset[0] + self.command.com_offset_xy[0],
@@ -332,10 +380,24 @@ class StandController:
                     ground_z + height,
                 ]
             )
+            com_vel_ref = np.zeros(3)
             face_yaw = float(self.command.yaw)
 
         # --- centroidal MPC (decimated) ---
         if self._tick % cfg.mpc_decimation == 0:
+            schedule = None
+            contact_pos_seq = None
+            if walking:
+                legs_planted, foot_xy = self.gait.preview(
+                    horizon=cfg.mpc.horizon, dt=cfg.mpc.dt
+                )
+                schedule = np.repeat(legs_planted, robot.num_contacts // 2, axis=1)
+                contact_pos_seq = self._contact_pos_preview(
+                    foot_xy=foot_xy,
+                    feet=feet,
+                    contact_pos=dynamics.contact_pos,
+                    ground_z=ground_z,
+                )
             state = CentroidalState(
                 rpy=rpy,
                 com=dynamics.com,
@@ -344,8 +406,16 @@ class StandController:
                 inertia=robot.com_inertia(),
                 contact_pos=dynamics.contact_pos,
             )
-            reference = CentroidalReference(com=com_ref, yaw=face_yaw)
-            self._desired_forces = self.mpc.solve(state, reference, contact_mask)
+            reference = CentroidalReference(
+                com=com_ref, yaw=face_yaw, com_velocity=com_vel_ref
+            )
+            self._desired_forces = self.mpc.solve(
+                state,
+                reference,
+                contact_mask,
+                schedule=schedule,
+                contact_pos_seq=contact_pos_seq,
+            )
         self._tick += 1
 
         forces = self._desired_forces.copy()
@@ -354,22 +424,9 @@ class StandController:
 
         support = float(contact_mask.mean())
         wbc_cfg = cfg.wbc
-        vel_err = dynamics.com_vel.copy()
-        if walking:
-            # Track commanded planar velocity, but bleed it off hard if the torso
-            # has run ahead of the support-tied CoM reference (forward tip).
-            pos_err_fwd = float((dynamics.com - com_ref)[0] * np.cos(face_yaw)
-                                + (dynamics.com - com_ref)[1] * np.sin(face_yaw))
-            scale = float(np.clip(1.0 - pos_err_fwd / 0.05, 0.0, 1.0))
-            vel_err[0] -= scale * gait_out.com_vel_cmd[0]
-            vel_err[1] -= scale * gait_out.com_vel_cmd[1]
-            # Extra damping when tipping forward past the feet.
-            if pos_err_fwd > 0.03:
-                vel_err[0] += 1.5 * pos_err_fwd * np.cos(face_yaw)
-                vel_err[1] += 1.5 * pos_err_fwd * np.sin(face_yaw)
         base_linear_acc = np.clip(
             wbc_cfg.kp_base_position * (com_ref - dynamics.com)
-            - wbc_cfg.kd_base_position * vel_err,
+            - wbc_cfg.kd_base_position * (dynamics.com_vel - com_vel_ref),
             -cfg.max_linear_acc,
             cfg.max_linear_acc,
         )
@@ -392,77 +449,63 @@ class StandController:
         )
         joint_weights = self._posture_weight[state, joints].copy()
 
-        # Walk: pin hip_yaw / ankle_roll on the *stance* leg only. Planted-leg
-        # posture gains are zero by design for stand, so yaw otherwise drifts
-        # into a pigeon-toe shuffle. Holding both legs + swing FF tips the base.
-        swing_leg = int(gait_out.swing.leg) if (walking and gait_out.swing.active) else -1
+        qj = np.asarray(qpos[QPOS_JOINT0:], dtype=float)
+        dqj = qvel_arr[QVEL_JOINT0:]
+
+        def hold_joint(index: int, kp: float, kd: float, weight: float) -> None:
+            """Pin one joint to its nominal angle, overriding the posture row."""
+            joint_acc[index] = np.clip(
+                kp * (self.nominal_joint_pos[index] - qj[index]) - kd * dqj[index],
+                -cfg.max_joint_acc,
+                cfg.max_joint_acc,
+            )
+            joint_weights[index] = max(float(joint_weights[index]), weight)
+
+        per_leg = NUM_LEG_JOINTS // 2
         if walking:
-            qj = np.asarray(qpos[QPOS_JOINT0:], dtype=float)
-            dqj = np.asarray(qvel[QVEL_JOINT0:], dtype=float)
+            # Hip yaw carries no useful walking motion, and the planted-leg
+            # posture gains are zero by design so nothing else holds it; left
+            # free it drifts into a pigeon-toed shuffle.
             for leg_i in (0, 1):
-                if leg_i == swing_leg:
-                    continue
-                for local in (2, 5):  # hip_yaw, ankle_roll
-                    ji = leg_i * (NUM_LEG_JOINTS // 2) + local
-                    joint_acc[ji] = np.clip(
-                        200.0 * (self.nominal_joint_pos[ji] - qj[ji]) - 14.0 * dqj[ji],
-                        -cfg.max_joint_acc,
-                        cfg.max_joint_acc,
-                    )
-                    joint_weights[ji] = max(float(joint_weights[ji]), 32.0)
+                hold_joint(leg_i * per_leg + HIP_YAW, STANCE_YAW_KP, STANCE_YAW_KD,
+                           STANCE_YAW_WEIGHT)
 
         swing_jacobian = None
         swing_acc = None
         if walking and gait_out.swing.active:
             leg = int(gait_out.swing.leg)
+            swing = gait_out.swing
 
-            # Optional soft Cartesian XY (weight 0 by default — even mild 3D/XY
-            # swing tasks tip this plant when stacked on knee FF + stance yaw).
-            if wbc_cfg.weight_swing_foot > 1.0:
-                site_id = int(robot.foot_center_site_ids[leg])
-                qvel_arr = np.asarray(qvel, dtype=float)
-                j_f = robot.site_jacobian(site_id)
-                p = feet[leg]
-                v = j_f @ qvel_arr
-                p_des = gait_out.swing.des_pos
-                bias_s = robot.site_bias_acc(site_id, qvel_arr)
-                swing_acc = (
-                    wbc_cfg.kp_swing_foot * (p_des - p)
-                    - wbc_cfg.kd_swing_foot * v
-                    - bias_s
-                )
-                swing_acc[0] = float(
-                    np.clip(swing_acc[0], -cfg.max_linear_acc, cfg.max_linear_acc)
-                )
-                swing_acc[1] = float(
-                    np.clip(swing_acc[1], -cfg.max_linear_acc, cfg.max_linear_acc)
-                )
-                swing_acc[2] = 0.0
-                swing_jacobian = j_f
+            # The Cartesian foot task is the *primary* swing task: it is what
+            # actually executes the planned foothold. The arc's own acceleration
+            # does the work and the gains only mop up residual error, so a
+            # 0.25 s swing does not have to be conjured out of position error.
+            site_id = int(robot.foot_center_site_ids[leg])
+            j_f = robot.site_jacobian(site_id)
+            foot_vel = j_f @ qvel_arr
+            swing_acc = np.clip(
+                swing.des_acc
+                + wbc_cfg.kp_swing_foot * (swing.des_pos - feet[leg])
+                + wbc_cfg.kd_swing_foot * (swing.des_vel - foot_vel)
+                - robot.site_bias_acc(site_id, qvel_arr),
+                -cfg.max_swing_acc,
+                cfg.max_swing_acc,
+            )
+            swing_jacobian = j_f
 
-            # Knee/hip lift schedule. Pure joint FF + ss_lateral_bias is the
-            # stable envelope; DLS XY previously fought the stance base.
-            j0 = leg * (NUM_LEG_JOINTS // 2)
-            j1 = j0 + (NUM_LEG_JOINTS // 2)
-            q_leg = np.asarray(qpos[QPOS_JOINT0 + j0 : QPOS_JOINT0 + j1], dtype=float)
-            dq_leg = np.asarray(qvel[QVEL_JOINT0 + j0 : QVEL_JOINT0 + j1], dtype=float)
-            s = float(gait_out.swing.s)
-            lift = 4.0 * s * (1.0 - s)  # peaks at 1.0 mid-swing
-            q_des = q_leg.copy()
-            q_des[0] = float(self.nominal_joint_pos[j0 + 0]) - SWING_HIP_PITCH_AMP * lift
-            q_des[3] = float(self.nominal_joint_pos[j0 + 3]) + SWING_KNEE_FLEX_AMP * lift
-            q_des[2] = float(self.nominal_joint_pos[j0 + 2])  # hip_yaw
-            q_des[5] = float(self.nominal_joint_pos[j0 + 5])  # ankle_roll
-            joint_acc[j0:j1] = np.clip(
-                SWING_JOINT_KP * (q_des - q_leg) - 18.0 * dq_leg,
+            # The swing leg's joint rows become pure damping, so they condition
+            # the null space without arguing with the Cartesian task. The
+            # ankles are the exception: the foot-centre task leaves them free,
+            # and they decide whether the sole lands flat or on an edge.
+            j0 = leg * per_leg
+            joint_acc[j0 : j0 + per_leg] = np.clip(
+                -SWING_NULLSPACE_KD * dqj[j0 : j0 + per_leg],
                 -cfg.max_joint_acc,
                 cfg.max_joint_acc,
             )
-            joint_weights[j0:j1] = SWING_JOINT_W
-            joint_weights[j0 + 0] = SWING_JOINT_W * 1.5  # hip pitch
-            joint_weights[j0 + 3] = SWING_JOINT_W * 2.0  # knee — primary lift actuator
-            joint_weights[j0 + 2] = 40.0
-            joint_weights[j0 + 5] = 40.0
+            joint_weights[j0 : j0 + per_leg] = SWING_NULLSPACE_W
+            for local in (HIP_YAW, ANKLE_PITCH, ANKLE_ROLL):
+                hold_joint(j0 + local, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
 
         solution = self.wbc.solve(
             dynamics,
@@ -472,17 +515,24 @@ class StandController:
                 joint_acc=joint_acc,
                 contact_forces=forces,
                 joint_weights=joint_weights,
-                base_weight_scale=max(support, 0.2 if walking else support),
+                # Fewer contacts means less authority over the base, so the
+                # base tasks stand down rather than demand what the soles
+                # cannot deliver. Single support is half the contacts, and the
+                # floor keeps the task from vanishing there.
+                base_weight_scale=max(support, MIN_BASE_WEIGHT_SCALE),
                 swing_jacobian=swing_jacobian,
                 swing_acc=swing_acc,
             ),
             contact_mask=contact_mask,
         )
 
+        swing = gait_out.swing
         self.telemetry = StandTelemetry(
             com=dynamics.com,
             com_reference=com_ref,
             com_error=dynamics.com - com_ref,
+            com_velocity=dynamics.com_vel,
+            com_velocity_reference=com_vel_ref,
             rpy=rpy,
             torque=solution.torque,
             contact_forces=solution.forces,
@@ -490,6 +540,16 @@ class StandController:
             contact_mask=contact_mask,
             mpc_cost=self.mpc.cost,
             solve_ms=(time.perf_counter() - started) * 1e3,
+            walking=walking,
+            gait_phase=float(gait_out.phase),
+            swing_clearance=(
+                float(feet[swing.leg, 2] - ground_z) if swing.active else 0.0
+            ),
+            swing_error=(
+                float(np.linalg.norm(swing.des_pos - feet[swing.leg]))
+                if swing.active
+                else 0.0
+            ),
         )
         return solution.torque
 

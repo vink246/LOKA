@@ -289,11 +289,9 @@ def render_gait_overlays(viewer, controller) -> None:
     gait = getattr(controller, "_last_gait", None)
     if gait is None:
         return
-    from loka.control.gait import MODE_WALK, _bezier_swing_pos
+    from loka.control.gait import swing_reference
 
-    if float(controller.gait.config.mode) < MODE_WALK:
-        return
-    if float(controller.gait.config.speed) <= 1e-4 and controller.gait._cmd_speed <= 1e-4:
+    if not controller.gait.wants_walk():
         return
 
     scene = viewer.user_scn
@@ -326,13 +324,13 @@ def render_gait_overlays(viewer, controller) -> None:
     des = np.asarray(swing.des_pos, dtype=float).copy()
     _add_sphere(scene, des, 0.028, (1.0, 0.2, 0.85, 0.95))
 
-    # Sampled Bézier path from lift-off to foothold.
+    # Sampled swing arc from lift-off to foothold.
     start = np.asarray(swing.start, dtype=float)
     end = np.asarray(swing.foothold, dtype=float)
     height = float(controller.gait.config.swing_height)
     prev = None
     for s in np.linspace(0.0, 1.0, 9):
-        p = _bezier_swing_pos(start, end, float(s), swing_height=height, ground_z=ground_z)
+        p, _, _ = swing_reference(start, end, float(s), swing_height=height)
         _add_sphere(scene, p, 0.012, (1.0, 0.9, 0.15, 0.8))
         if prev is not None:
             _add_capsule(scene, prev, p, 0.006, (1.0, 0.85, 0.1, 0.55))

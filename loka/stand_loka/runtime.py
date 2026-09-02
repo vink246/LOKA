@@ -26,7 +26,6 @@ from loka.stand_loka.context import (
     format_stand_configuration,
 )
 from loka.stand_loka.anomaly import assess_stand_anomaly
-from loka.control.gait import MODE_WALK
 from loka.stand_loka.error_defaults import (
     default_stand_error_spec,
     default_walk_error_spec,
@@ -167,10 +166,7 @@ class StandLokaRuntime:
                 contact_speed = 0.0
 
         cmd = self.controller.task_snapshot()
-        gait = self.controller.gait
-        walking = float(gait.config.mode) >= MODE_WALK and (
-            float(gait.config.speed) > 1e-4 or gait._cmd_speed > 1e-4
-        )
+        walking = self.controller.gait.wants_walk()
         wbc_total = int(self.controller.wbc._qp.failures)
         mpc_total = int(self.controller.mpc._qp.failures)
         wbc_delta = max(0, wbc_total - self._prev_wbc_failures)

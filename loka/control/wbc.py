@@ -78,14 +78,18 @@ class WBCConfig:
     kp_posture_legs: float = 0.0
     kd_posture_legs: float = 2.0
     #: An airborne leg has no contact holding it, so it reverts to a real
-    #: position task that carries it back to the landing pose.
+    #: position task that carries it back to the landing pose. While walking the
+    #: Cartesian foot task takes over and this is demoted to a null-space bias.
     weight_posture_swing: float = 5.0
     kp_posture_swing: float = 200.0
     kd_posture_swing: float = 20.0
-    #: Cartesian swing-foot tracking (foot-center Jacobian). Primary swing task
-    #: when walking; joint posture_swing becomes a light null-space bias.
-    weight_swing_foot: float = 0.0
-    kp_swing_foot: float = 200.0
+    #: Cartesian swing-foot tracking on the foot-centre Jacobian. This is what
+    #: executes the planned foothold, so it has to outrank the leg posture task
+    #: by a wide margin -- at zero the footstep planner has no actuator at all.
+    weight_swing_foot: float = 60.0
+    #: Error feedback only -- the arc supplies its own acceleration -- so these
+    #: are moderate, with ``kd ≈ 2√kp`` for a settled, non-ringing landing.
+    kp_swing_foot: float = 300.0
     kd_swing_foot: float = 30.0
     kp_posture_upper: float = 100.0
     kd_posture_upper: float = 10.0

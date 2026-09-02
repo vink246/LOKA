@@ -13,8 +13,13 @@ problem a single convex QP.
 
 Only the first force block of the solution is used; the horizon exists so the
 controller anticipates where the centroidal state is heading rather than
-reacting to it, and so a contact schedule can be dropped in when this grows
-into a walking controller.
+reacting to it.
+
+Walking feeds the horizon a *schedule*: which feet are planted at each step and
+where they are planned to be. A 0.3 s horizon spans most of a step, so pinning
+the measured contact set across all of it -- which is what a standing
+controller can get away with -- would have the force plan bracing against feet
+that are in the air.
 """
 
 from __future__ import annotations
@@ -161,11 +166,7 @@ class ConvexMPC:
 
     # -- dynamics ---------------------------------------------------------
 
-    def _discrete_dynamics(
-        self, state: CentroidalState
-    ) -> tuple[np.ndarray, np.ndarray]:
-        cfg = self.config
-        yaw = state.rpy[2]
+    def _state_matrix(self, yaw: float) -> np.ndarray:
         cos_y, sin_y = np.cos(yaw), np.sin(yaw)
         # Rz(ψ)ᵀ maps world angular velocity to roll-pitch-yaw rates under the
         # usual small roll/pitch assumption.
@@ -175,47 +176,68 @@ class ConvexMPC:
         a_c[0:3, 6:9] = rz_t
         a_c[3:6, 9:12] = np.eye(3)
         a_c[11, 12] = 1.0  # x[12] carries -g
+        return np.eye(STATE_DIM) + a_c * self.config.dt
 
-        inertia_inv = np.linalg.inv(state.inertia)
+    def _input_matrix(
+        self, contact_pos: np.ndarray, com: np.ndarray, inertia_inv: np.ndarray
+    ) -> np.ndarray:
+        """Force-to-state map for one horizon step.
+
+        Depends on the contact geometry, which moves as the robot steps, so
+        this is rebuilt per horizon step while the state matrix is not.
+        """
         b_c = np.zeros((STATE_DIM, self.force_dim))
-        offsets = state.contact_pos - state.com
+        offsets = np.asarray(contact_pos, dtype=float) - np.asarray(com, dtype=float)
         for i in range(self.num_contacts):
             b_c[6:9, 3 * i : 3 * i + 3] = inertia_inv @ _skew(offsets[i])
             b_c[9:12, 3 * i : 3 * i + 3] = np.eye(3) / self.mass
-
-        a_d = np.eye(STATE_DIM) + a_c * cfg.dt
-        b_d = b_c * cfg.dt
-        return a_d, b_d
+        return b_c * self.config.dt
 
     def _condense(
-        self, a_d: np.ndarray, b_d: np.ndarray
+        self, a_d: np.ndarray, b_seq: list[np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Roll the horizon into ``X = A_qp x₀ + B_qp U``."""
+        """Roll the horizon into ``X = A_qp x₀ + B_qp U``.
+
+        ``A`` is held constant over the horizon (it depends only on yaw), so its
+        powers are accumulated once; ``B`` varies per step with the planned
+        contact positions.
+        """
         n = self.config.horizon
         a_qp = np.zeros((STATE_DIM * n, STATE_DIM))
         b_qp = np.zeros((STATE_DIM * n, self.num_vars))
-        power = np.eye(STATE_DIM)
+
+        powers = [np.eye(STATE_DIM)]
+        for _ in range(n):
+            powers.append(powers[-1] @ a_d)
         for k in range(n):
-            power = power @ a_d
-            a_qp[STATE_DIM * k : STATE_DIM * (k + 1)] = power
-        for k in range(n):
+            a_qp[STATE_DIM * k : STATE_DIM * (k + 1)] = powers[k + 1]
             for j in range(k + 1):
-                block = np.linalg.matrix_power(a_d, k - j) @ b_d
                 b_qp[
                     STATE_DIM * k : STATE_DIM * (k + 1),
                     self.force_dim * j : self.force_dim * (j + 1),
-                ] = block
+                ] = powers[k - j] @ b_seq[j]
         return a_qp, b_qp
 
     # -- solve ------------------------------------------------------------
 
-    def _apply_contact_mask(self, contact_mask: np.ndarray | None) -> None:
-        """Zero the normal-force bounds of airborne contacts."""
+    def _schedule(
+        self, contact_mask: np.ndarray | None, schedule: np.ndarray | None
+    ) -> np.ndarray:
+        """Per-horizon-step contact flags, ``(horizon, nc)`` bool."""
+        n = self.config.horizon
+        if schedule is not None:
+            return np.asarray(schedule, dtype=bool).reshape(n, self.num_contacts)
+        if contact_mask is None:
+            return np.ones((n, self.num_contacts), dtype=bool)
+        return np.tile(np.asarray(contact_mask, dtype=bool), (n, 1))
+
+    def _apply_schedule(self, schedule: np.ndarray) -> None:
+        """Zero the normal-force bounds of contacts that are airborne then."""
         cfg = self.config
         for k in range(cfg.horizon):
             for i in range(self.num_contacts):
                 row = 5 * (k * self.num_contacts + i) + 4
-                loaded = True if contact_mask is None else bool(contact_mask[i])
+                loaded = bool(schedule[k, i])
                 self._lower[row] = cfg.fz_min if loaded else 0.0
                 self._upper[row] = cfg.fz_max if loaded else 0.0
 
@@ -224,11 +246,20 @@ class ConvexMPC:
         state: CentroidalState,
         reference: CentroidalReference,
         contact_mask: np.ndarray | None = None,
+        schedule: np.ndarray | None = None,
+        contact_pos_seq: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Return the desired contact forces now, shape ``(nc, 3)``."""
+        """Return the desired contact forces now, shape ``(nc, 3)``.
+
+        ``schedule`` is ``(horizon, nc)`` planned contact flags and
+        ``contact_pos_seq`` the matching ``(horizon, nc, 3)`` contact positions.
+        Omit both to hold the measured contact set across the horizon, which is
+        what standing wants.
+        """
         cfg = self.config
         n = cfg.horizon
-        self._apply_contact_mask(contact_mask)
+        plan = self._schedule(contact_mask, schedule)
+        self._apply_schedule(plan)
 
         x0 = np.concatenate(
             [
@@ -239,21 +270,45 @@ class ConvexMPC:
                 [-GRAVITY],
             ]
         )
+
+        # The reference travels: holding a fixed CoM target while asking for a
+        # non-zero CoM velocity is self-contradictory, and the position term
+        # wins, which is how the MPC ended up braking every step.
+        velocity = np.asarray(reference.com_velocity, dtype=float)
+        com_ref = np.asarray(reference.com, dtype=float)
         x_ref = np.concatenate(
             [
-                [0.0, 0.0, reference.yaw],
-                reference.com,
-                np.zeros(3),
-                reference.com_velocity,
-                [-GRAVITY],
+                np.concatenate(
+                    [
+                        [0.0, 0.0, reference.yaw],
+                        com_ref + velocity * (k + 1) * cfg.dt,
+                        np.zeros(3),
+                        velocity,
+                        [-GRAVITY],
+                    ]
+                )
+                for k in range(n)
             ]
         )
 
-        a_d, b_d = self._discrete_dynamics(state)
-        a_qp, b_qp = self._condense(a_d, b_d)
+        a_d = self._state_matrix(float(state.rpy[2]))
+        inertia_inv = np.linalg.inv(state.inertia)
+        if contact_pos_seq is None:
+            b_seq = [self._input_matrix(state.contact_pos, state.com, inertia_inv)] * n
+        else:
+            positions = np.asarray(contact_pos_seq, dtype=float).reshape(
+                n, self.num_contacts, 3
+            )
+            b_seq = [
+                self._input_matrix(
+                    positions[k], state.com + velocity * k * cfg.dt, inertia_inv
+                )
+                for k in range(n)
+            ]
+        a_qp, b_qp = self._condense(a_d, b_seq)
 
         state_w = np.tile(cfg.state_weights(), n)
-        drift = a_qp @ x0 - np.tile(x_ref, n)
+        drift = a_qp @ x0 - x_ref
 
         weighted_b = b_qp * state_w[:, None]
         hessian = 2.0 * (b_qp.T @ weighted_b)

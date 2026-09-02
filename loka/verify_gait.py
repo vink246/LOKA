@@ -1,211 +1,154 @@
-"""Layered walk verification: scheduler → Raibert → Bézier → closed-loop.
+"""Walking diagnostics: report numbers, not verdicts.
 
-Run::
+``python -m loka.verify_gait`` prints, in order:
 
-    python -m loka.verify_gait
+  1. the planner's own limit cycle, with the robot replaced by perfect
+     tracking, so plan defects separate cleanly from tracking defects;
+  2. closed-loop behaviour across a matrix of gait policies.
 
-Prints PASS/FAIL per layer so planner bugs are not confused with tracking.
-GUI markers (cyan foothold, yellow Bézier, magenta des_pos, green CoM) are
-drawn by ``render_gait_overlays`` when you launch::
+The layering matters because the two halves currently disagree: the plan is a
+textbook DCM limit cycle that settles on the commanded velocity, while the
+closed loop topples sideways after roughly 8-16 steps. Keeping them apart is
+what stops a plan bug and a balance bug from being mistaken for one another.
 
-    python -m loka.run_stand_loka --mode walk
+This deliberately reports measurements rather than PASS/FAIL. The pass/fail
+gates live in ``tests/test_gait.py``, where the open defect is a documented
+xfail instead of a silently loosened threshold -- the previous version of both
+files passed a 0.019 m/s shuffle with 3 mm of foot clearance.
 """
 
 from __future__ import annotations
 
-import sys
-
 import numpy as np
 
-from loka.control.gait import (
-    MODE_WALK,
-    GaitConfig,
-    GaitScheduler,
-    LegPhase,
-    _bezier_swing_pos,
-)
+from loka.control.gait import MODE_WALK, GaitConfig, GaitScheduler
 from loka.sim import Simulation
 
-
-def _ok(name: str, passed: bool, detail: str) -> bool:
-    tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] {name}: {detail}")
-    return passed
+HEIGHT = 0.70
+FEET = np.array([[0.0, 0.1185, 0.0], [0.0, -0.1185, 0.0]])
+PLANTED = np.ones(8, dtype=bool)
 
 
-def layer_scheduler() -> bool:
-    print("1) Gait scheduler (phase windows + contact masks)")
-    duty, period = 0.60, 0.40
-    sched = GaitScheduler(
-        GaitConfig(mode=MODE_WALK, speed=0.3, step_period=period, duty_factor=duty)
+def plan_only(speed: float, *, ticks: int = 3000, dt: float = 0.002, **overrides):
+    """Run the planner against a robot that tracks it exactly."""
+    cfg = dict(
+        mode=MODE_WALK,
+        speed=speed,
+        step_period=0.70,
+        duty_factor=0.65,
+        stance_width=0.24,
+        capture_gain=1.0,
+        walk_accel=50.0,
     )
-    feet = np.array([[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]])
-    mask = np.ones(8, dtype=bool)
-    sched.step(
-        dt=0.002,
-        com=np.array([0.0, 0.0, 0.7]),
-        com_vel=np.zeros(3),
-        foot_centers=feet,
-        ground_z=0.0,
-        height=0.7,
-        yaw=0.0,
-        measured_mask=mask,
-    )
-    saw_left = saw_right = saw_ds = False
-    bad = False
-    for _ in range(int(period / 0.002) * 3):
+    cfg.update(overrides)
+    sched = GaitScheduler(GaitConfig(**cfg))
+
+    com = np.array([0.0, 0.0, HEIGHT])
+    vel = np.zeros(3)
+    feet = FEET.copy()
+    rows = []
+    for _ in range(ticks):
         out = sched.step(
-            dt=0.002,
-            com=np.array([0.0, 0.0, 0.7]),
-            com_vel=np.array([0.25, 0.0, 0.0]),
-            foot_centers=feet,
-            ground_z=0.0,
-            height=0.7,
-            yaw=0.0,
-            measured_mask=mask,
-        )
-        if out.left_phase == LegPhase.SWING:
-            saw_left = True
-            if out.contact_mask[:4].any():
-                bad = True
-        if out.right_phase == LegPhase.SWING:
-            saw_right = True
-            if out.contact_mask[4:].any():
-                bad = True
-        if out.left_phase == LegPhase.STANCE and out.right_phase == LegPhase.STANCE:
-            saw_ds = True
-            if not (out.contact_mask[:4].any() and out.contact_mask[4:].any()):
-                bad = True
-    return _ok(
-        "scheduler",
-        saw_left and saw_right and saw_ds and not bad,
-        f"left_swing={saw_left} right_swing={saw_right} DS={saw_ds} mask_ok={not bad}",
-    )
-
-
-def layer_raibert() -> bool:
-    print("2) Raibert footholds (forward + lateral)")
-    sched = GaitScheduler(
-        GaitConfig(
-            mode=MODE_WALK,
-            speed=0.35,
-            step_period=0.5,
-            duty_factor=0.7,
-            stance_width=0.24,
-            walk_accel=5.0,
-            step_length_max=0.15,
-        )
-    )
-    feet = np.array([[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]])
-    mask = np.ones(8, dtype=bool)
-    left_fh = right_fh = None
-    com = np.array([0.0, 0.0, 0.7])
-    for _ in range(800):
-        out = sched.step(
-            dt=0.002,
+            dt=dt,
             com=com,
-            com_vel=np.array([0.30, 0.0, 0.0]),
+            com_vel=vel,
             foot_centers=feet,
             ground_z=0.0,
-            height=0.7,
-            yaw=0.0,
-            measured_mask=mask,
+            height=HEIGHT,
+            measured_mask=PLANTED,
         )
-        if out.swing.active and out.swing.s < 0.05:
-            if out.swing.leg == 0 and left_fh is None:
-                left_fh = out.swing.foothold.copy()
-            elif out.swing.leg == 1 and right_fh is None:
-                right_fh = out.swing.foothold.copy()
-        com = com + np.array([0.30, 0.0, 0.0]) * 0.002
-    if left_fh is None or right_fh is None:
-        return _ok("raibert", False, "never captured both footholds")
-    width = float(left_fh[1] - right_fh[1])
-    fwd = 0.5 * (float(left_fh[0]) + float(right_fh[0]))
-    ok = 0.20 < width < 0.30 and fwd > -0.05
-    return _ok(
-        "raibert",
-        ok,
-        f"width={width:.3f}m mean_fwd_x={fwd:.3f} L={left_fh[:2]} R={right_fh[:2]}",
-    )
+        com[:2] = sched._com_ref
+        vel[:2] = sched._com_vel_ref
+        if out.swing.active:
+            feet[out.swing.leg, :2] = out.swing.des_pos[:2]
+        rows.append((com.copy(), vel.copy(), out.dcm_ref.copy()))
+    return rows
 
 
-def layer_bezier() -> bool:
-    print("3) Bézier swing path (planned clearance)")
-    height = 0.05
-    mid = _bezier_swing_pos(
-        np.array([0.0, 0.0, 0.0]),
-        np.array([0.15, 0.0, 0.0]),
-        0.5,
-        swing_height=height,
-        ground_z=0.0,
-    )
-    ok = float(mid[2]) >= 0.9 * height
-    return _ok("bezier", ok, f"mid_z={mid[2]:.3f} (want ≥ {0.9*height:.3f})")
+def report_plan() -> None:
+    print("1) Planner in isolation (robot replaced by perfect tracking)")
+    print(f"   {'speed':>6}  {'settled vx':>10}  {'CoM sway':>9}  {'DCM sway':>9}  "
+          f"{'y drift':>8}")
+    for speed in (0.05, 0.10, 0.20, 0.30, 0.40):
+        rows = plan_only(speed)
+        tail = rows[-1000:]
+        vx = float(np.mean([v[0] for _, v, _ in tail]))
+        ys = np.array([c[1] for c, _, _ in tail])
+        dcm = np.array([d[1] for _, _, d in tail])
+        print(f"   {speed:6.2f}  {vx:10.3f}  {np.abs(ys).max():9.4f}  "
+              f"{np.abs(dcm).max():9.4f}  {ys.mean():+8.4f}")
+    print("   (settled vx should equal speed; sway bounded and centred on 0)")
 
 
-def layer_closed_loop(T: float = 5.0) -> bool:
-    print(f"4) Closed-loop walk (≥{T:.0f}s stability + DCM catch + toe)")
+def walk(speed: float, duration: float, **gait) -> dict:
     sim = Simulation()
-    c = sim.controller
-    c.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25, "gait.heading": 0.0})
-    peak_act = 0.0
-    peak_des = 0.0
-    yaw_max = 0.0
-    y_max = 0.0
-    while float(sim.data.time) < T:
+    controller = sim.controller
+    controller.set_task_targets({"gait.mode": "walk", "gait.speed": speed, **gait})
+
+    start = np.array(sim.data.qpos[:2])
+    steps, airborne, clearance, swing_err = 0, False, 0.0, 0.0
+    while sim.data.time < duration:
         sim.step()
-        q = sim.data.qpos
-        y_max = max(y_max, abs(float(q[1])))
-        yaw_max = max(yaw_max, abs(float(q[9])), abs(float(q[15])))
-        g = c._last_gait
-        if g is not None and g.swing.active and 0.35 < g.swing.s < 0.65:
-            feet = c.robot.foot_center_positions()
-            peak_act = max(peak_act, float(feet[g.swing.leg, 2]))
-            peak_des = max(peak_des, float(g.swing.des_pos[2]))
+        telemetry = controller.telemetry
+        if telemetry.swing_clearance > 0.0:
+            clearance = max(clearance, telemetry.swing_clearance)
+            swing_err = max(swing_err, telemetry.swing_error)
+            if not airborne:
+                steps += 1
+            airborne = True
+        else:
+            airborne = False
         if sim.fell:
             break
-    reached = float(sim.data.time) >= T
-    stable = (
-        not sim.fell
-        and reached
-        and float(sim.data.qpos[2]) > 0.45
-        and y_max < 0.20
-        and float(sim.data.qpos[0]) > 0.04
+
+    travel = np.array(sim.data.qpos[:2]) - start
+    elapsed = float(sim.data.time)
+    return dict(
+        elapsed=elapsed,
+        fell=bool(sim.fell),
+        forward=float(travel[0]),
+        lateral=float(travel[1]),
+        speed=float(travel[0]) / max(elapsed, 1e-9),
+        steps=steps,
+        clearance=clearance,
+        swing_err=swing_err,
     )
-    toes = yaw_max < 0.35
-    planner = peak_des >= 0.03
-    _ok("planner des_z", planner, f"peak_des={peak_des:.3f}")
-    _ok(
-        "stability",
-        stable,
-        f"t={sim.data.time:.2f} fell={sim.fell} reached_{T:.0f}s={reached} "
-        f"x={float(sim.data.qpos[0]):+.3f} |y|_max={y_max:.3f}",
-    )
-    _ok("toe-in (hip_yaw)", toes, f"max_|hip_yaw|={yaw_max:.3f} (want < 0.35)")
-    _ok(
-        "swing clearance (info)",
-        True,
-        f"peak_act_z={peak_act:.3f} (mild FF by design; DCM stepping is primary)",
-    )
-    return stable and toes and planner
 
 
-def main() -> int:
-    print("LOKA gait verification\n")
-    results = [
-        layer_scheduler(),
-        layer_raibert(),
-        layer_bezier(),
-        layer_closed_loop(),
+def report_closed_loop(duration: float = 10.0) -> None:
+    print(f"\n2) Closed loop on the robot (up to {duration:.0f} s)")
+    print(f"   {'policy':<34} {'t':>5} {'fell':>5} {'fwd':>7} {'lat':>7} "
+          f"{'v':>6} {'n':>3} {'lift':>6} {'swerr':>6}")
+    matrix = [
+        ("speed=0.10", dict(speed=0.10)),
+        ("speed=0.20", dict(speed=0.20)),
+        ("speed=0.30", dict(speed=0.30)),
+        ("speed=0.20 period=0.55", dict(speed=0.20, **{"gait.step_period": 0.55})),
+        ("speed=0.20 period=0.90", dict(speed=0.20, **{"gait.step_period": 0.90})),
+        ("speed=0.20 duty=0.55", dict(speed=0.20, **{"gait.duty_factor": 0.55})),
+        ("speed=0.20 duty=0.75", dict(speed=0.20, **{"gait.duty_factor": 0.75})),
+        ("speed=0.20 width=0.28", dict(speed=0.20, **{"gait.stance_width": 0.28})),
+        ("speed=0.20 capture=1.0", dict(speed=0.20, **{"gait.capture_gain": 1.0})),
+        ("speed=0.20 heading=0.3", dict(speed=0.20, **{"gait.heading": 0.3})),
     ]
-    print()
-    if all(results):
-        print("All layers PASS. In the GUI, cyan = next foothold, yellow = "
-              "Bézier path, magenta = current des_pos, green = CoM ref.")
-        return 0
-    print("Some layers FAILED — planner vs tracking is split above.")
-    return 1
+    for label, spec in matrix:
+        speed = spec.pop("speed")
+        result = walk(speed, duration, **spec)
+        print(f"   {label:<34} {result['elapsed']:5.2f} "
+              f"{str(result['fell']):>5} {result['forward']:+7.3f} "
+              f"{result['lateral']:+7.3f} {result['speed']:+6.3f} "
+              f"{result['steps']:3d} {result['clearance']*1000:5.1f}mm "
+              f"{result['swing_err']*1000:5.1f}mm")
+
+
+def main() -> None:
+    report_plan()
+    report_closed_loop()
+    print(
+        "\nOpen defect: lateral CoM error compounds until the robot topples "
+        "sideways.\nThe plan and the sagittal loop are sound; see docs/walking.md."
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -12,10 +12,13 @@ control_dt: 0.002        # whole-body QP period  -> 500 Hz
 mpc_decimation: 10       # MPC every 10 QP ticks ->  50 Hz
 ground_height: 0.0       # starting guess; refined from the soles once loaded
 
-# Saturation on the task-space accelerations handed to the QP.
+# Saturation on the task-space accelerations handed to the QP. The CoM cap sits
+# near what the soles can actually deliver; a swing foot is a light limb moving
+# through free space, so it gets a much wider budget.
 max_linear_acc: 20.0     # m/s^2
 max_angular_acc: 40.0    # rad/s^2
 max_joint_acc: 200.0     # rad/s^2
+max_swing_acc: 120.0     # m/s^2
 
 mpc:
   horizon: 6             # x dt = 0.30 s lookahead
@@ -66,25 +69,26 @@ wbc:
   kd_posture_legs: 2.0
   kp_posture_swing: 200.0       # ... but a swing leg needs a real position task
   kd_posture_swing: 20.0
-  # Cartesian swing task off by default (joint FF handles lift). Set >1 to
-  # enable soft XY-only tracking; high 3D weight tips the base in SS.
-  weight_swing_foot: 0.0
-  kp_swing_foot: 200.0
+  # Cartesian swing-foot task: the actuator behind the footstep plan. While
+  # walking this outranks the swing leg's joint posture task, which drops to a
+  # null-space bias. At zero the planned footholds are never executed.
+  weight_swing_foot: 60.0
+  kp_swing_foot: 300.0
   kd_swing_foot: 30.0
   kp_posture_upper: 100.0
   kd_posture_upper: 10.0
 
-# High-level gait policy (LLM Task_Targets: gait.*). Geometry stays classical.
+# High-level gait policy (LLM Task_Targets: gait.*). Geometry stays classical:
+# the walk line, footstep plan and DCM reference are computed in gait.py.
 gait:
   mode: 0                 # 0=stand 1=walk 2=tread 3=limp
   speed: 0.0              # m/s in heading frame
   heading: 0.0            # world-frame travel direction [rad]
-  step_period: 0.50
-  duty_factor: 0.82
-  step_length_max: 0.08
-  swing_height: 0.04      # planned arc (GUI markers); actual clearance is lower
-  stance_width: 0.26
-  capture_gain: 1.0       # DCM / capture-point feedback scale (× 1/ω0)
-  walk_accel: 0.08
-  ss_lateral_bias: 0.018  # mild CoM bias toward stance foot in SS [m]
-  foothold_retarget_s: 0.30  # retarget Raibert/DCM foothold early in swing
+  step_period: 0.70       # full two-step cycle; a step is half of this
+  duty_factor: 0.65       # stance fraction per leg -> 0.245 s swing at 0.70 s
+  step_length_max: 0.30
+  swing_height: 0.06
+  stance_width: 0.24      # nominal G1 stance measures 0.237
+  capture_gain: 0.6       # DCM foothold feedback (1.0 = deadbeat capture point)
+  walk_accel: 0.5
+  foothold_retarget_s: 0.70  # fraction of swing the foothold may still move
