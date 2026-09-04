@@ -105,23 +105,33 @@ def _actuator_capacity(model, actuator_id: int) -> float:
 
 
 def _mean_motor_loads(frames, model):
-    """Per-actuator mean/peak |force| and utilization vs gear*ctrlrange capacity."""
+    """Per-actuator commanded |ctrl| vs realized |force|, capacity from *belief* gears."""
     if not frames:
         return {}
 
     force_stacks = []
+    cmd_stacks = []
     for frame in frames:
-        force = frame.get("actuator_force")
+        force = frame.get("actuator_torque")
+        if force is None:
+            force = frame.get("actuator_force")
         if force is None:
             continue
         force_stacks.append(np.abs(np.asarray(force, dtype=float)))
+        cmd = frame.get("planner_cmd", frame.get("ctrl"))
+        if cmd is None:
+            cmd = np.zeros_like(force_stacks[-1])
+        cmd_stacks.append(np.abs(np.asarray(cmd, dtype=float)))
 
     if not force_stacks:
         return {}
 
     stacked = np.stack(force_stacks, axis=0)
+    cmd_stacked = np.stack(cmd_stacks, axis=0)
     mean_abs = np.mean(stacked, axis=0)
     peak_abs = np.max(stacked, axis=0)
+    cmd_mean = np.mean(cmd_stacked, axis=0)
+    cmd_peak = np.max(cmd_stacked, axis=0)
 
     loads = {}
     for actuator_id in range(model.nu):
@@ -132,6 +142,8 @@ def _mean_motor_loads(frames, model):
         loads[name] = {
             "mean": mean_load,
             "peak": peak_load,
+            "cmd_mean": float(cmd_mean[actuator_id]),
+            "cmd_peak": float(cmd_peak[actuator_id]),
             "util_mean": mean_load / capacity,
             "util_peak": peak_load / capacity,
         }
@@ -141,8 +153,9 @@ def _mean_motor_loads(frames, model):
 def _format_motor_load_section(anom_slice, nominal_baseline, model, has_baseline):
     lines = [
         "2. MOTOR LOAD (Per-Actuator Force)",
-        "Reports mean and peak |actuator_force| for each MJCF motor over the window.",
-        "Utilization is |force| / (|gear| * max|ctrlrange|).",
+        "Reports commanded |ctrl| vs realized |actuator_force| for each MJCF motor.",
+        "Capacity / utilization use the planner's believed |gear| * max|ctrlrange|.",
+        "Commanded effort with near-zero force means the plant is not delivering torque.",
         "",
     ]
 
@@ -157,16 +170,17 @@ def _format_motor_load_section(anom_slice, nominal_baseline, model, has_baseline
         if has_baseline and name in nom_loads:
             nom = nom_loads[name]
             lines.append(
-                f"- {name}: Nominal mean {nom['mean']:.2f} "
+                f"- {name}: Nominal cmd {nom['cmd_mean']:.2f} force {nom['mean']:.2f} "
                 f"(util {nom['util_mean']:.0%}) | "
-                f"Current mean {stats['mean']:.2f} (util {stats['util_mean']:.0%}) | "
-                f"Peak {stats['peak']:.2f} (util {stats['util_peak']:.0%})"
+                f"Current cmd {stats['cmd_mean']:.2f} force {stats['mean']:.2f} "
+                f"(util {stats['util_mean']:.0%}) | "
+                f"Peak force {stats['peak']:.2f} (util {stats['util_peak']:.0%})"
             )
         else:
             lines.append(
-                f"- {name}: Current mean {stats['mean']:.2f} "
+                f"- {name}: Current cmd {stats['cmd_mean']:.2f} force {stats['mean']:.2f} "
                 f"(util {stats['util_mean']:.0%}) | "
-                f"Peak {stats['peak']:.2f} (util {stats['util_peak']:.0%})"
+                f"Peak force {stats['peak']:.2f} (util {stats['util_peak']:.0%})"
             )
 
     lines.append("")

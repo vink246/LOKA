@@ -13,6 +13,7 @@ from loka.mjcf_utils import (
     SUPPORTED_PLANNER_NUMERICS,
     set_model_numeric,
 )
+from loka.model_state import apply_loka_mutations
 from loka.robot_context import (
     format_capabilities_block,
     format_current_error_tracking,
@@ -57,8 +58,46 @@ def resolve_mjcf_name(model, obj_enum, name):
     return None, -1
 
 
+def _snapshot_agent_params(agent):
+    try:
+        weights = {name: float(val) for name, val in agent.get_cost_weights().items()}
+    except Exception:
+        weights = {}
+    try:
+        tasks = dict(agent.get_task_parameters())
+    except Exception:
+        tasks = {}
+    return weights, tasks
+
+
+def reinit_agent_from_belief(model, agent, task_id):
+    """Rebuild the MJPC server from the *belief* model only.
+
+    The C++ agent holds a serialized copy of whatever MjModel we pass to Init.
+    That copy must be nominal hardware plus LOKA Model_Mutations — never the
+    hidden plant. Cost weights and task parameters are restored after Init.
+    """
+    weights, tasks = _snapshot_agent_params(agent)
+    agent.close()
+    agent = mpc_agent.Agent(task_id=task_id, model=model)
+    if weights:
+        try:
+            agent.set_cost_weights(weights)
+        except Exception:
+            pass
+    for name, value in tasks.items():
+        try:
+            if isinstance(value, str):
+                agent.set_task_parameter(name, value)
+            else:
+                agent.set_task_parameter(name, float(value))
+        except Exception:
+            pass
+    return agent
+
+
 def recreate_agent_with_planner_settings(model, agent, settings, task_id):
-    """Apply planner settings and recreate the MPC agent to pick them up."""
+    """Apply planner settings on the belief model and recreate the MPC agent."""
     applied = {}
     for name, value in settings.items():
         if name not in SUPPORTED_PLANNER_NUMERICS:
@@ -69,8 +108,7 @@ def recreate_agent_with_planner_settings(model, agent, settings, task_id):
     if not applied:
         return agent
 
-    agent.close()
-    return mpc_agent.Agent(task_id=task_id, model=model)
+    return reinit_agent_from_belief(model, agent, task_id)
 
 
 def _live_task_parameter_names(agent) -> set[str]:
@@ -151,6 +189,52 @@ def apply_scratchpad(
         except Exception:
             pass
 
+    mutations = scratchpad.get("Model_Mutations", [])
+    queued_mutations = 0
+    if mutations:
+        print("\n  -> Internal Model Mutations Queued:")
+        for mut in mutations:
+            obj_type = mut.get("object_type")
+            name = mut.get("name")
+            attr = mut.get("attribute")
+            val = mut.get("value")
+
+            obj_enum = None
+            if obj_type == "actuator":
+                obj_enum = mujoco.mjtObj.mjOBJ_ACTUATOR
+            elif obj_type == "geom":
+                obj_enum = mujoco.mjtObj.mjOBJ_GEOM
+            elif obj_type == "body":
+                obj_enum = mujoco.mjtObj.mjOBJ_BODY
+
+            if obj_enum is not None:
+                resolved_name, obj_id = resolve_mjcf_name(model, obj_enum, name)
+                if obj_id != -1:
+                    loka_state["mutations"].append({
+                        "type": obj_type,
+                        "id": obj_id,
+                        "attr": attr,
+                        "val": val,
+                        "name": resolved_name,
+                        "applied_at": data.time if data is not None else None,
+                    })
+                    queued_mutations += 1
+                    if resolved_name != name:
+                        print(
+                            f"     * Queued {obj_type} '{resolved_name}' "
+                            f"(resolved from '{name}') -> {attr} = {val}"
+                        )
+                    else:
+                        print(f"     * Queued {obj_type} '{resolved_name}' -> {attr} = {val}")
+                else:
+                    print(f"     * [WARN] Could not find {obj_type} named '{name}'")
+
+    # Belief model = nominal MJCF + LOKA mutations. Never serialize plant faults.
+    nominal_gears = loka_state.get("nominal_gears")
+    if nominal_gears is None:
+        nominal_gears = model.actuator_gear[:, 0].copy()
+    apply_loka_mutations(model, loka_state, nominal_gears)
+
     planner_targets = scratchpad.get("Planner_Targets", {})
     if planner_targets:
         print("  -> Planner Metaparameters Updated:")
@@ -172,6 +256,19 @@ def apply_scratchpad(
                 )
         except Exception as e:
             print(f"     * Failed to apply planner settings: {e}")
+    elif queued_mutations:
+        try:
+            agent = reinit_agent_from_belief(model, agent, task_id)
+            if data is not None:
+                agent.set_state(
+                    time=data.time,
+                    qpos=data.qpos,
+                    qvel=data.qvel,
+                    act=data.act,
+                )
+            print("  -> Planner internal model rebuilt from LOKA belief")
+        except Exception as e:
+            print(f"  -> Failed to rebuild planner belief: {e}")
 
     if weights_dict:
         try:
@@ -205,44 +302,6 @@ def apply_scratchpad(
             print(format_error_spec(new_spec))
         except Exception as e:
             print(f"     * [WARN] Invalid Error_Tracking (ignored): {e}")
-
-    mutations = scratchpad.get("Model_Mutations", [])
-    if mutations:
-        print("\n  -> Internal Model Mutations Queued:")
-        for mut in mutations:
-            obj_type = mut.get("object_type")
-            name = mut.get("name")
-            attr = mut.get("attribute")
-            val = mut.get("value")
-
-            obj_enum = None
-            if obj_type == "actuator":
-                obj_enum = mujoco.mjtObj.mjOBJ_ACTUATOR
-            elif obj_type == "geom":
-                obj_enum = mujoco.mjtObj.mjOBJ_GEOM
-            elif obj_type == "body":
-                obj_enum = mujoco.mjtObj.mjOBJ_BODY
-
-            if obj_enum is not None:
-                resolved_name, obj_id = resolve_mjcf_name(model, obj_enum, name)
-                if obj_id != -1:
-                    loka_state["mutations"].append({
-                        "type": obj_type,
-                        "id": obj_id,
-                        "attr": attr,
-                        "val": val,
-                        "name": resolved_name,
-                        "applied_at": data.time if data is not None else None,
-                    })
-                    if resolved_name != name:
-                        print(
-                            f"     * Queued {obj_type} '{resolved_name}' "
-                            f"(resolved from '{name}') -> {attr} = {val}"
-                        )
-                    else:
-                        print(f"     * Queued {obj_type} '{resolved_name}' -> {attr} = {val}")
-                else:
-                    print(f"     * [WARN] Could not find {obj_type} named '{name}'")
 
     print("=" * 55 + "\n")
     return agent

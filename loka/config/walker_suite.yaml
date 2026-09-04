@@ -1,0 +1,30 @@
+# Walker perturbation suite. CLI flags override these values.
+# Mass and force are decimals of total walker mass / bodyweight (m*g), not kg or N.
+
+output_dir: results/walker
+record: true
+record_camera: side_follow
+record_fps: 30
+record_width: 1920
+record_height: 1080
+log_hz: 100
+
+defaults:
+  goal_distance_m: 10.0
+  perturbation_time_s: 2.0
+  timeout_s: 60.0
+  speed_goal: 1.0
+
+baselines: [loka, fixed_mpc]
+
+tests:
+  - name: dead_right_hip
+    perturbation: {kind: actuator_dead, actuator: right_hip}
+  - name: ice
+    perturbation: {kind: friction, mu: 0.2}
+  - name: backpack
+    perturbation: {kind: mass, mass_frac: 0.25, body: torso}
+  - name: shove_back
+    perturbation: {kind: force, force_frac: 0.5, direction: backward, duration_s: 0.2}
+  - name: box
+    perturbation: {kind: obstacle, size: [0.15, 0.40, 0.10], x: 4.0}
