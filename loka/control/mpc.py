@@ -1,25 +1,19 @@
-"""Convex single-rigid-body MPC over ground-reaction forces.
+"""Convex single-rigid-body MPC over finite-foot ground-reaction forces.
 
-This is the standard SRBD formulation used by the MIT Cheetah convex MPC
-(Di Carlo et al., IROS 2018) and by most humanoid MPC+WBC stacks: collapse the
-robot to one rigid body, keep the contact points fixed over the horizon, and
-optimise the contact forces that drive the centroidal state to its reference.
+This is the Di Carlo / MIT Cheetah formulation (IROS 2018): state
+``x = [θ, p, ω, v, g] ∈ R¹³``, one condensed convex QP, friction pyramids,
+horizon 6 × 50 ms. The humanoid extras are *not* a nonlinear program:
 
-The state is ``x = [θ, p, ω, v, g] ∈ R¹³`` where ``θ`` is the base
-roll-pitch-yaw, ``p`` / ``v`` are the CoM position / velocity, ``ω`` is the
-world-frame angular velocity, and the trailing gravity constant makes the
-dynamics affine-free (a plain linear system), which is what keeps the whole
-problem a single convex QP.
+* Per-foot CoP-in-sole inequalities (Sleiman et al., TRO 2021 — the contact
+  *surface*, not a 12 mm-shrunk patch; the gait already insets the ZMP
+  *reference*).
+* A scheduled contact mask and Bézier-posed airborne soles so the force plan
+  does not brace on a foot the WBC has not planted.
+* Optional RTI linearisation of the CoM along the last primal (still a QP).
 
-Only the first force block of the solution is used; the horizon exists so the
-controller anticipates where the centroidal state is heading rather than
-reacting to it.
-
-Walking feeds the horizon a *schedule*: which feet are planted at each step and
-where they are planned to be. A 0.3 s horizon spans most of a step, so pinning
-the measured contact set across all of it -- which is what a standing
-controller can get away with -- would have the force plan bracing against feet
-that are in the air.
+Galliker et al., Humanoids 2022 is whole-body *nonlinear* MPC (ocs2, torques
+over the horizon). That is not this class. ``CentroidalNMPC`` remains a
+compatibility alias.
 """
 
 from __future__ import annotations
@@ -33,12 +27,18 @@ from loka.control.qp import QP, Sparsity
 from loka.control.robot import GRAVITY
 
 STATE_DIM = 13
+#: Four sole sites per foot, matching ``CONTACT_SITES`` in ``robot.py``.
+SITES_PER_FOOT = 4
+#: G1 sole half-length / half-width from the contact sites about the foot
+#: centre (heel −85 mm, toe +85 mm, y ±25–30 mm). See ``g1_29dof.xml``.
+SOLE_HALF_LENGTH = 0.085
+SOLE_HALF_WIDTH = 0.030
 
 
 @dataclass
 class MPCConfig:
-    #: 6 x 50 ms = 0.3 s lookahead. Longer horizons buy nothing for standing
-    #: and the condensed QP cost grows roughly cubically in the horizon.
+    #: 6 x 50 ms = 0.3 s lookahead. Galliker's HZD-as-terminal-cost lesson:
+    #: a good gait reference is what makes a short horizon work, not a 2 s NLP.
     horizon: int = 6
     dt: float = 0.05
     friction_mu: float = 0.5
@@ -48,7 +48,7 @@ class MPCConfig:
     fz_max: float = 400.0
     #: Diagonal state cost over [roll, pitch, yaw, x, y, z, ωx, ωy, ωz, vx, vy, vz].
     weight_orientation: Sequence[float] = (500.0, 500.0, 300.0)
-    weight_position: Sequence[float] = (200.0, 200.0, 1000.0)
+    weight_position: Sequence[float] = (120.0, 120.0, 1000.0)
     weight_angular_velocity: Sequence[float] = (10.0, 10.0, 10.0)
     weight_linear_velocity: Sequence[float] = (60.0, 60.0, 60.0)
     #: Force-effort weight. Must stay tiny: the forces are O(100 N) so their
@@ -56,6 +56,12 @@ class MPCConfig:
     #: magnitude below the state weights. It exists only to pick a sensible
     #: (evenly shared) point out of the redundant eight-contact null space.
     weight_force: float = 1e-6
+    #: Numeric shrink of the CoP box from the physical sole edge [m].
+    #: Sleiman et al. (TRO 2021) keep CoP inside the *contact surface*, not a
+    #: shrunken patch: the gait already insets the ZMP *reference* by
+    #: ``ZMP_INSET``, which is what leaves spare travel. A 12 mm hard box
+    #: here stole that spare and the lateral orbit died by step 4.
+    cop_margin: float = 0.002
 
     def state_weights(self) -> np.ndarray:
         return np.concatenate(
@@ -92,26 +98,34 @@ def _skew(vec: np.ndarray) -> np.ndarray:
 
 
 class ConvexMPC:
-    """Solves for a horizon of contact forces; returns the first block."""
+    """Di Carlo convex SRBD force QP; returns the first contact-force block.
+
+    Same ``solve(state, reference, schedule, contact_pos_seq) -> (nc, 3)``
+    contract the WBC already consumes. Standing omits the schedule and holds
+    the measured two-foot set.
+    """
 
     def __init__(self, config: MPCConfig, num_contacts: int, mass: float) -> None:
+        if num_contacts % SITES_PER_FOOT != 0:
+            raise ValueError(
+                f"ConvexMPC needs {SITES_PER_FOOT} sites/foot, got {num_contacts}"
+            )
         self.config = config
         self.num_contacts = num_contacts
+        self.num_feet = num_contacts // SITES_PER_FOOT
         self.mass = mass
         self.force_dim = 3 * num_contacts
         self.num_vars = self.force_dim * config.horizon
-        # The friction constraints never change, so OSQP keeps them verbatim
-        # from setup; only the (dense) cost is refreshed each solve.
+        self._n_friction = 5 * num_contacts * config.horizon
+        self._n_cop = 4 * self.num_feet * config.horizon
         self._constraint, self._lower, self._upper = self._build_constraints()
-        # The friction block is re-uploaded each solve so that mu and the force
-        # limits can be retuned live; its pattern never changes, so this costs
-        # a fancy-index copy of a very sparse matrix.
         self._qp = QP(
             "mpc",
             hessian_pattern=Sparsity.upper_triangular(self.num_vars),
             constraint_pattern=Sparsity(self._constraint != 0.0),
         )
         self.last_forces = self._gravity_share()
+        self._last_horizon = np.tile(self.last_forces, (config.horizon, 1, 1))
         self.cost = 0.0
 
     # -- setup ------------------------------------------------------------
@@ -124,14 +138,15 @@ class ConvexMPC:
         return forces
 
     def _build_constraints(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Linearised friction pyramid plus normal-force bounds.
+        """Friction pyramids, normal-force bounds, and per-foot CoP boxes.
 
-        Constant across solves: the pattern and the numbers only depend on μ
-        and the force limits.
+        Friction numbers depend only on μ. CoP coefficients depend on the
+        current sole geometry and are overwritten every solve; the *pattern*
+        (four ``fz`` columns per foot, per horizon step) is pinned here so
+        OSQP can refactor once.
         """
         cfg = self.config
         mu = cfg.friction_mu
-        # |fx| ≤ μ fz, |fy| ≤ μ fz, fz_min ≤ fz ≤ fz_max
         block = np.array(
             [
                 [1.0, 0.0, -mu],
@@ -146,13 +161,33 @@ class ConvexMPC:
 
         rows_per_contact = block.shape[0]
         num_blocks = self.num_contacts * cfg.horizon
-        constraint = np.zeros((rows_per_contact * num_blocks, self.num_vars))
+        n_rows = self._n_friction + self._n_cop
+        constraint = np.zeros((n_rows, self.num_vars))
         for b in range(num_blocks):
             r = b * rows_per_contact
             c = b * 3
             constraint[r : r + rows_per_contact, c : c + 3] = block
-        lower = np.tile(lower_block, num_blocks)
-        upper = np.tile(upper_block, num_blocks)
+        lower = np.concatenate(
+            [
+                np.tile(lower_block, num_blocks),
+                np.full(self._n_cop, -np.inf),
+            ]
+        )
+        upper = np.concatenate(
+            [
+                np.tile(upper_block, num_blocks),
+                np.zeros(self._n_cop),
+            ]
+        )
+        # Structural nonzeros for the CoP box: |Σ fz o| ≤ half Σ fz, four
+        # inequalities × feet × horizon, each touching that foot's four fz.
+        for k in range(cfg.horizon):
+            for foot in range(self.num_feet):
+                for side in range(4):
+                    row = self._n_friction + 4 * (k * self.num_feet + foot) + side
+                    for j in range(SITES_PER_FOOT):
+                        col = k * self.force_dim + 3 * (foot * SITES_PER_FOOT + j) + 2
+                        constraint[row, col] = 1.0
         return constraint, lower, upper
 
     def refresh(self) -> None:
@@ -160,7 +195,7 @@ class ConvexMPC:
 
         The cost is rebuilt from ``self.config`` on every solve, so weights
         need no refresh at all; only ``friction_mu`` and the force limits land
-        here.
+        here. CoP geometry is filled in ``solve``.
         """
         self._constraint, self._lower, self._upper = self._build_constraints()
 
@@ -188,9 +223,10 @@ class ConvexMPC:
         """
         b_c = np.zeros((STATE_DIM, self.force_dim))
         offsets = np.asarray(contact_pos, dtype=float) - np.asarray(com, dtype=float)
+        inv_mass = 1.0 / self.mass
         for i in range(self.num_contacts):
             b_c[6:9, 3 * i : 3 * i + 3] = inertia_inv @ _skew(offsets[i])
-            b_c[9:12, 3 * i : 3 * i + 3] = np.eye(3) / self.mass
+            b_c[9:12, 3 * i : 3 * i + 3] = inv_mass * np.eye(3)
         return b_c * self.config.dt
 
     def _condense(
@@ -200,7 +236,7 @@ class ConvexMPC:
 
         ``A`` is held constant over the horizon (it depends only on yaw), so its
         powers are accumulated once; ``B`` varies per step with the planned
-        contact positions.
+        contact positions and the RTI CoM rollout.
         """
         n = self.config.horizon
         a_qp = np.zeros((STATE_DIM * n, STATE_DIM))
@@ -217,6 +253,72 @@ class ConvexMPC:
                     self.force_dim * j : self.force_dim * (j + 1),
                 ] = powers[k - j] @ b_seq[j]
         return a_qp, b_qp
+
+    def _rollout_com(self, state: CentroidalState) -> list[np.ndarray]:
+        """Predicted CoM along last horizon's forces (RTI linearisation point).
+
+        The previous convex SRBD used ``com + v_ref * k dt``, i.e. the
+        *reference* rather than the dynamics. Sequential QP linearises the
+        centroidal translational dynamics about the last primal.
+        """
+        dt = self.config.dt
+        com = np.asarray(state.com, dtype=float).copy()
+        vel = np.asarray(state.com_velocity, dtype=float).copy()
+        seq = [com.copy()]
+        gravity = np.array([0.0, 0.0, -GRAVITY])
+        for k in range(self.config.horizon - 1):
+            force = self._last_horizon[k].sum(axis=0)
+            acc = force / self.mass + gravity
+            vel = vel + acc * dt
+            com = com + vel * dt
+            seq.append(com.copy())
+        return seq
+
+    # -- sole CoP ---------------------------------------------------------
+
+    def _fill_cop(
+        self,
+        positions: np.ndarray,
+        yaw: float,
+    ) -> None:
+        """Write per-foot CoP-in-sole inequalities into the constraint block.
+
+        ``|Σ fz o_axis| ≤ (half − margin) Σ fz`` in the heading frame, four
+        linear inequalities per foot per horizon step. ``fz ≥ 0`` at the four
+        corners already keeps CoP in the hull; the tiny numeric margin is only
+        so OSQP does not sit on a singular edge. The gait ZMP inset is the
+        *reference*; this box is the physical sole (Sleiman).
+        """
+        cfg = self.config
+        c, s = np.cos(yaw), np.sin(yaw)
+        # Columns are world (x, y); rows are (forward, left).
+        rotate = np.array([[c, s], [-s, c]])
+        half_f = SOLE_HALF_LENGTH
+        half_l = max(1e-3, SOLE_HALF_WIDTH - float(cfg.cop_margin))
+        n_fric = self._n_friction
+        self._constraint[n_fric:] = 0.0
+        for k in range(cfg.horizon):
+            for foot in range(self.num_feet):
+                sl = slice(foot * SITES_PER_FOOT, (foot + 1) * SITES_PER_FOOT)
+                pts = np.asarray(positions[k, sl, :2], dtype=float)
+                center = pts.mean(axis=0)
+                local = (pts - center) @ rotate.T
+                # Four rows: +forward, −forward, +left, −left.
+                coeffs = np.stack(
+                    [
+                        local[:, 0] - half_f,
+                        -local[:, 0] - half_f,
+                        local[:, 1] - half_l,
+                        -local[:, 1] - half_l,
+                    ],
+                    axis=0,
+                )
+                base = n_fric + 4 * (k * self.num_feet + foot)
+                for side in range(4):
+                    row = base + side
+                    for j in range(SITES_PER_FOOT):
+                        col = k * self.force_dim + 3 * (foot * SITES_PER_FOOT + j) + 2
+                        self._constraint[row, col] = float(coeffs[side, j])
 
     # -- solve ------------------------------------------------------------
 
@@ -252,9 +354,10 @@ class ConvexMPC:
         """Return the desired contact forces now, shape ``(nc, 3)``.
 
         ``schedule`` is ``(horizon, nc)`` planned contact flags and
-        ``contact_pos_seq`` the matching ``(horizon, nc, 3)`` contact positions.
-        Omit both to hold the measured contact set across the horizon, which is
-        what standing wants.
+        ``contact_pos_seq`` the matching ``(horizon, nc, 3)`` contact positions
+        (Bézier pose while a foot is airborne, foothold once it is scheduled
+        down). Omit both to hold the measured contact set across the horizon,
+        which is what standing wants.
         """
         cfg = self.config
         n = cfg.horizon
@@ -294,20 +397,25 @@ class ConvexMPC:
         a_d = self._state_matrix(float(state.rpy[2]))
         inertia_inv = np.linalg.inv(state.inertia)
         if contact_pos_seq is None:
-            b_seq = [self._input_matrix(state.contact_pos, state.com, inertia_inv)] * n
+            positions = np.tile(state.contact_pos, (n, 1, 1))
         else:
             positions = np.asarray(contact_pos_seq, dtype=float).reshape(
                 n, self.num_contacts, 3
             )
-            b_seq = [
-                self._input_matrix(
-                    positions[k], state.com + velocity * k * cfg.dt, inertia_inv
-                )
-                for k in range(n)
-            ]
+        com_seq = self._rollout_com(state)
+        b_seq = [
+            self._input_matrix(positions[k], com_seq[k], inertia_inv) for k in range(n)
+        ]
+        self._fill_cop(positions, float(state.rpy[2]))
         a_qp, b_qp = self._condense(a_d, b_seq)
 
         state_w = np.tile(cfg.state_weights(), n)
+        # Height cost 5× the plan in xy is what standing wants. Over a
+        # scheduled walk it is scaled by how many contacts that horizon
+        # step actually has, so single support does not spend force holding
+        # a height the remaining sole cannot produce.
+        for k in range(n):
+            state_w[STATE_DIM * k + 5] *= float(plan[k].mean())
         drift = a_qp @ x0 - x_ref
 
         weighted_b = b_qp * state_w[:, None]
@@ -318,11 +426,18 @@ class ConvexMPC:
         solution = self._qp.solve(
             hessian, gradient, self._constraint, self._lower, self._upper
         )
-        forces = solution[: self.force_dim].reshape(self.num_contacts, 3)
+        horizon_forces = solution.reshape(n, self.num_contacts, 3)
+        forces = horizon_forces[0]
 
         if not np.all(np.isfinite(forces)):
             forces = self._gravity_share()
+            horizon_forces = np.tile(forces, (n, 1, 1))
         self.last_forces = forces
+        self._last_horizon = horizon_forces
         residual = drift + b_qp @ solution
         self.cost = float(residual @ (state_w * residual))
         return forces
+
+
+#: Compatibility alias. This class is not Sleiman/Galliker NMPC.
+CentroidalNMPC = ConvexMPC

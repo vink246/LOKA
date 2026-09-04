@@ -104,10 +104,16 @@ TUNABLES: tuple[Tunable, ...] = (
     Tunable("wbc.kd_posture_legs", "Planted-leg damping", 0.0, 50.0, log=False),
     Tunable("wbc.kp_posture_swing", "Airborne-leg stiffness", 0.0, 1e3, log=False),
     Tunable("wbc.kd_posture_swing", "Airborne-leg damping", 0.0, 100.0, log=False),
-    Tunable("wbc.weight_swing_foot", "WBC: Cartesian swing-foot tracking weight",
-            1.0, 500.0),
+    Tunable("wbc.weight_swing_foot", "WBC: Cartesian swing-foot tracking weight. "
+            "Must stay well above posture and in the same decade as contact "
+            "or the QP will not lift the foot",
+            1.0, 2e3),
     Tunable("wbc.kp_swing_foot", "Swing-foot Cartesian stiffness", 10.0, 2e3, log=False),
     Tunable("wbc.kd_swing_foot", "Swing-foot Cartesian damping", 1.0, 200.0, log=False),
+    Tunable("wbc.weight_swing_orient", "WBC: late-swing sole-flat orientation weight",
+            1.0, 500.0),
+    Tunable("wbc.kp_swing_orient", "Swing-foot orientation stiffness", 10.0, 2e3, log=False),
+    Tunable("wbc.kd_swing_orient", "Swing-foot orientation damping", 1.0, 200.0, log=False),
     Tunable("wbc.kp_posture_upper", "Waist/arm stiffness", 0.0, 1e3, log=False),
     Tunable("wbc.kd_posture_upper", "Waist/arm damping", 0.0, 100.0, log=False),
     # -- saturation --------------------------------------------------------

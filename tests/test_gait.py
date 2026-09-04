@@ -11,8 +11,8 @@ Layered so a failure localises itself:
 
 Layers 1-5 exercise the planner as a pure function of its inputs, with the
 robot replaced by perfect tracking. They pin down what the plan *asks for*.
-Layer 6 is the only one that involves the whole-body QP and the physics, and it
-is the one that currently fails; see :func:`test_closed_loop_walk_stays_up`.
+Layer 6 is the closed-loop walk. Eight seconds at 0.10–0.30 m/s and
+thirty seconds at 0.10/0.20/0.35/0.50 (``--slow``) are required gates.
 """
 
 from __future__ import annotations
@@ -25,12 +25,27 @@ from loka.control.gait import (
     GaitConfig,
     GaitScheduler,
     LegPhase,
+    gait_schedule_for_speed,
     swing_reference,
 )
+from loka.control.locomotion import (
+    ANKLE_PITCH,
+    ANKLE_ROLL,
+    HIP_YAW,
+    KNEE,
+    NUM_LEG_JOINTS,
+    STANCE_KNEE_MIN,
+    SWING_ANKLE_RELEASE_S,
+    SWING_ANKLE_W,
+    SWING_NULLSPACE_W,
+)
+from loka.control.robot import QPOS_JOINT0
 from loka.sim import Simulation
 
 #: Minimum closed-loop walk duration for the smoke test.
 WALK_TEST_DURATION = 8.0
+#: Honest limit-cycle gate (slow): pelvis-z for 8 s is not a walk.
+WALK_LIMIT_CYCLE_DURATION = 30.0
 
 FEET = np.array([[0.0, 0.1185, 0.0], [0.0, -0.1185, 0.0]])
 PLANTED = np.ones(8, dtype=bool)
@@ -103,6 +118,52 @@ def test_swing_arc_derivatives_match_finite_differences():
         np.testing.assert_allclose(acc, (v_hi - v_lo) / (2 * eps), atol=1e-4)
 
 
+def test_speed_schedule_slows_the_lateral_orbit_at_low_speed():
+    slow = gait_schedule_for_speed(0.10)
+    mid = gait_schedule_for_speed(0.20)
+    fast = gait_schedule_for_speed(0.50)
+    assert slow["gait.step_period"] > fast["gait.step_period"]
+    assert slow["gait.duty_factor"] > fast["gait.duty_factor"]
+    assert slow["gait.stance_width"] < fast["gait.stance_width"]
+    # Closed-loop 0.20 m/s needs ~0.80 duty (0.65 / 0.75 still pitch over).
+    assert mid["gait.duty_factor"] == pytest.approx(0.80, abs=0.01)
+    assert slow["gait.duty_factor"] >= 0.81
+    assert fast["gait.duty_factor"] >= 0.73
+    assert fast["gait.duty_factor"] < mid["gait.duty_factor"]
+
+
+def test_speed_schedule_fills_cadence_unless_the_user_pins_it():
+    sched = GaitScheduler(GaitConfig(mode=MODE_WALK, speed=0.0))
+    applied = sched.apply_updates({"gait.mode": MODE_WALK, "gait.speed": 0.50})
+    assert applied["gait.step_period"] == pytest.approx(
+        gait_schedule_for_speed(0.50)["gait.step_period"]
+    )
+    pinned = GaitScheduler(GaitConfig(mode=MODE_WALK, speed=0.0))
+    pinned.apply_updates(
+        {
+            "gait.mode": MODE_WALK,
+            "gait.speed": 0.50,
+            "gait.step_period": 0.70,
+        }
+    )
+    assert pinned.config.step_period == pytest.approx(0.70)
+
+
+def test_mpc_preview_puts_the_swing_foot_on_the_bezier():
+    """Airborne horizon steps must carry the Bézier lift, not the foothold z=0."""
+    sched = walking_scheduler()
+    com = np.array([0.0, 0.0, HEIGHT])
+    out = _run_until_swing(sched, com=com, feet=FEET)
+    contact, pose = sched.preview(horizon=6, dt=0.05)
+    assert pose.shape == (6, 2, 3)
+    swing = int(out.swing.leg)
+    airborne = ~contact[:, swing]
+    assert airborne.any(), "preview never shows the swing foot airborne"
+    assert float(pose[airborne, swing, 2].max()) > 0.01
+    planted = contact[:, swing]
+    assert np.all(pose[planted, swing, 2] == pytest.approx(0.0, abs=1e-12))
+
+
 # -- 2. gait clock --------------------------------------------------------
 
 
@@ -144,6 +205,252 @@ def test_swing_duration_follows_duty_factor():
     # Two swings per cycle, each (1 - duty) of the cycle.
     expected = 2.0 * (1.0 - duty) / period
     assert swinging * dt / (3000 * dt) == pytest.approx(expected * 0.5, rel=0.15)
+
+
+def _run_until_swing(sched, *, com, feet, dt=0.002):
+    """Advance until the first non-opening swing, returning that output."""
+    for _ in range(4000):
+        out = sched.step(
+            dt=dt,
+            com=com,
+            com_vel=np.zeros(3),
+            foot_centers=feet,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=PLANTED,
+        )
+        if out.swing.active and sched._step >= 1:
+            return out
+    raise AssertionError("never entered swing")
+
+
+def _airborne_mask(leg: int) -> np.ndarray:
+    mask = PLANTED.copy()
+    if leg == 0:
+        mask[0:4] = False
+    else:
+        mask[4:8] = False
+    return mask
+
+
+def _place_swing(feet, out, *, z=0.0, xy=None):
+    """Put the in-flight foot at the planned foothold (or a chosen xy)."""
+    placed = feet.copy()
+    placed[out.swing.leg, 2] = z
+    placed[out.swing.leg, :2] = out.swing.foothold[:2] if xy is None else np.asarray(xy)
+    return placed
+
+
+def test_gait_clock_waits_while_the_swing_foot_is_airborne():
+    """The clock must not name an airborne foot as the next stance.
+
+    Closed-loop traces showed the right swing still 30–40 mm up at T_step;
+    incrementing anyway is what threw the robot over at step 4.
+    """
+    from loka.control.gait import MAX_TOUCHDOWN_HOLD
+
+    sched = walking_scheduler(step_period=0.60, duty_factor=0.70)
+    com = np.array([0.0, 0.0, HEIGHT])
+    feet = FEET.copy()
+    dt = 0.002
+    out = _run_until_swing(sched, com=com, feet=feet, dt=dt)
+    step = sched._step
+    leg = out.swing.leg
+
+    high = _place_swing(feet, out, z=0.04)
+    mask = _airborne_mask(leg)
+
+    # Well past the scheduled step duration, foot still up → still this step.
+    for _ in range(int(0.30 / dt)):
+        out = sched.step(
+            dt=dt,
+            com=com,
+            com_vel=np.zeros(3),
+            foot_centers=high,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=mask,
+        )
+        assert sched._step == step
+        assert out.swing.active and out.swing.leg == leg
+        assert sched._touchdown_hold <= MAX_TOUCHDOWN_HOLD + dt
+        high = _place_swing(high, out, z=0.04)
+
+    # Plant it at the planned foothold: the next tick must commit the step.
+    planted = _place_swing(high, out, z=0.0)
+    mask[:] = True
+    sched.step(
+        dt=dt,
+        com=com,
+        com_vel=np.zeros(3),
+        foot_centers=planted,
+        ground_z=0.0,
+        height=HEIGHT,
+        measured_mask=mask,
+    )
+    assert sched._step == step + 1
+    assert sched._touchdown_hold == 0.0
+
+
+def test_gait_clock_gives_up_waiting_after_the_touchdown_timeout():
+    from loka.control.gait import MAX_TOUCHDOWN_HOLD
+
+    sched = walking_scheduler(step_period=0.60, duty_factor=0.70)
+    com = np.array([0.0, 0.0, HEIGHT])
+    feet = FEET.copy()
+    dt = 0.002
+    out = _run_until_swing(sched, com=com, feet=feet, dt=dt)
+    step = sched._step
+    leg = out.swing.leg
+    high = feet.copy()
+    high[leg, 2] = 0.04
+    mask = _airborne_mask(leg)
+
+    for _ in range(int((0.35 + MAX_TOUCHDOWN_HOLD + 0.05) / dt)):
+        sched.step(
+            dt=dt,
+            com=com,
+            com_vel=np.zeros(3),
+            foot_centers=high,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=mask,
+        )
+        if sched._step > step:
+            break
+    assert sched._step == step + 1
+
+
+def test_gait_clock_advances_early_once_the_swing_foot_plants():
+    """A real swing that seats before T_step must not wait out the Bézier.
+
+    The late hold is the matching path: the clock already waits for a late
+    foot. Isolation tests keep z = 0, so they never set ``_swing_cleared``
+    and keep the nominal cadence.
+    """
+    from loka.control.gait import EARLY_PLANT_S
+
+    sched = walking_scheduler(step_period=0.60, duty_factor=0.70)
+    com = np.array([0.0, 0.0, HEIGHT])
+    feet = FEET.copy()
+    dt = 0.002
+    out = _run_until_swing(sched, com=com, feet=feet, dt=dt)
+    step = sched._step
+    leg = out.swing.leg
+    t_step, t_swing, t_ds = sched._durations()
+    high = feet.copy()
+    high[leg, 2] = 0.04
+    mask = _airborne_mask(leg)
+    ready = t_ds + EARLY_PLANT_S * t_swing
+    while sched._tau < ready + 0.02:
+        out = sched.step(
+            dt=dt,
+            com=com,
+            com_vel=np.zeros(3),
+            foot_centers=high,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=mask,
+        )
+        assert sched._step == step
+    assert sched._swing_cleared
+    assert sched._tau < t_step
+    planted = _place_swing(high, out, z=0.0)
+    mask[:] = True
+    sched.step(
+        dt=dt,
+        com=com,
+        com_vel=np.zeros(3),
+        foot_centers=planted,
+        ground_z=0.0,
+        height=HEIGHT,
+        measured_mask=mask,
+    )
+    assert sched._step == step + 1
+
+
+def _hover_until_waiting(sched, *, com, feet, out, dt):
+    """Lift the swing foot and run until the late hold starts, not past it."""
+    from loka.control.gait import MAX_TOUCHDOWN_HOLD
+
+    step = sched._step
+    high = _place_swing(feet, out, z=0.04)
+    mask = _airborne_mask(out.swing.leg)
+    for _ in range(int((0.50 + MAX_TOUCHDOWN_HOLD) / dt)):
+        out = sched.step(
+            dt=dt,
+            com=com,
+            com_vel=np.zeros(3),
+            foot_centers=high,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=mask,
+        )
+        assert sched._step == step
+        high = _place_swing(high, out, z=0.04)
+        if sched._touchdown_hold > 0.0:
+            return out, high
+    raise AssertionError("clock never entered the touchdown hold")
+
+
+def test_gait_clock_does_not_commit_a_short_plant():
+    """Height + contact is not enough: the planned point must still be on the sole.
+
+    Closed-loop traces landed 16–32 mm short of the first foothold. Honouring
+    that as stance named the next ZMP in the air.
+    """
+    from loka.control.gait import TOUCHDOWN_RADIUS
+
+    sched = walking_scheduler(step_period=0.60, duty_factor=0.70)
+    com = np.array([0.0, 0.0, HEIGHT])
+    feet = FEET.copy()
+    dt = 0.002
+    out = _run_until_swing(sched, com=com, feet=feet, dt=dt)
+    step = sched._step
+    out, high = _hover_until_waiting(sched, com=com, feet=feet, out=out, dt=dt)
+    short = feet[out.swing.leg, :2].copy()
+    assert float(np.linalg.norm(short - out.swing.foothold[:2])) > TOUCHDOWN_RADIUS
+    planted = _place_swing(high, out, z=0.0, xy=short)
+    mask = PLANTED.copy()
+    for _ in range(int(0.05 / dt)):
+        sched.step(
+            dt=dt,
+            com=com,
+            com_vel=np.zeros(3),
+            foot_centers=planted,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=mask,
+        )
+        assert sched._step == step
+
+
+def test_committed_support_reanchors_at_the_measured_plant():
+    """The next nominal must chain from where the foot actually is."""
+    from loka.control.gait import TOUCHDOWN_RADIUS
+
+    sched = walking_scheduler(step_period=0.60, duty_factor=0.70)
+    com = np.array([0.0, 0.0, HEIGHT])
+    feet = FEET.copy()
+    dt = 0.002
+    out = _run_until_swing(sched, com=com, feet=feet, dt=dt)
+    step = sched._step
+    out, high = _hover_until_waiting(sched, com=com, feet=feet, out=out, dt=dt)
+    offset = np.array([-0.5 * TOUCHDOWN_RADIUS, 0.0])
+    plant_xy = out.swing.foothold[:2] + offset
+    planted = _place_swing(high, out, z=0.0, xy=plant_xy)
+    sched.step(
+        dt=dt,
+        com=com,
+        com_vel=np.zeros(3),
+        foot_centers=planted,
+        ground_z=0.0,
+        height=HEIGHT,
+        measured_mask=PLANTED,
+    )
+    assert sched._step == step + 1
+    support = sched._steps[sched._step]
+    np.testing.assert_allclose(support.pos, plant_xy, atol=1e-9)
 
 
 def test_stand_mode_keeps_every_contact():
@@ -270,6 +577,46 @@ def test_plan_lateral_motion_is_a_bounded_limit_cycle():
     assert float(np.abs(dcm_ys).max()) < 0.12
 
 
+def test_first_lift_has_limit_cycle_lateral_velocity():
+    """Opening ZMP on the upcoming swing-foot inset preloads the DCM orbit.
+
+    A midpoint opening ZMP left first lift-off at ~0.01 m/s against a
+    0.10 m/s cycle; a stance-foot opening reversed the sign. The APA
+    (ZMP on the foot about to swing, inset into the sole) throws CoM
+    onto the stance orbit so first lift-off matches the cycle.
+    """
+    from loka.control.gait import heading_frame
+
+    sched = walking_scheduler(speed=0.20, stance_width=0.24)
+    com = np.array([0.0, 0.0, HEIGHT])
+    vel = np.zeros(3)
+    feet = FEET.copy()
+    _, left = heading_frame(0.0)
+    lift_vl = {}
+    for _ in range(2500):
+        out = sched.step(
+            dt=0.002,
+            com=com,
+            com_vel=vel,
+            foot_centers=feet,
+            ground_z=0.0,
+            height=HEIGHT,
+            measured_mask=PLANTED,
+        )
+        com[:2] = sched._com_ref
+        vel[:2] = sched._com_vel_ref
+        if out.swing.active:
+            feet[out.swing.leg, :2] = out.swing.des_pos[:2]
+            step = int(sched._step)
+            if step not in lift_vl:
+                lift_vl[step] = float(vel[:2] @ left)
+    assert 1 in lift_vl and 5 in lift_vl
+    cycle = lift_vl[5]
+    assert abs(cycle) > 0.06
+    assert np.sign(lift_vl[1]) == np.sign(cycle)
+    assert lift_vl[1] == pytest.approx(cycle, rel=0.25)
+
+
 def test_com_reference_never_leads_the_robot_unboundedly():
     """A robot that refuses to move must not drag the plan onto itself.
 
@@ -349,30 +696,138 @@ def _walk(speed: float, duration: float, **gait):
     )
 
 
+def test_swing_ankles_release_on_the_descending_arc():
+    """Ankle pitch/roll must go limp late in swing so the sole can lay flat.
+
+    Holding them at the stand keyframe for the whole swing left the right
+    foot on a toe while the centre was still 10 mm up. Hip yaw stays held.
+    """
+    sim = Simulation()
+    sim.controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25})
+    saw_held = saw_released = False
+    per_leg = NUM_LEG_JOINTS // 2
+    while sim.data.time < 2.5 and not sim.fell:
+        sim.step()
+        gait = sim.controller._last_gait
+        if gait is None or not gait.swing.active:
+            continue
+        leg = int(gait.swing.leg)
+        weights = sim.controller._last_joint_weights
+        j0 = leg * per_leg
+        ankle = float(weights[j0 + ANKLE_PITCH])
+        yaw = float(weights[j0 + HIP_YAW])
+        assert yaw == pytest.approx(SWING_ANKLE_W)
+        if gait.swing.s <= SWING_ANKLE_RELEASE_S:
+            assert ankle == pytest.approx(SWING_ANKLE_W)
+            saw_held = True
+        else:
+            assert ankle == pytest.approx(SWING_NULLSPACE_W)
+            assert float(weights[j0 + ANKLE_ROLL]) == pytest.approx(SWING_NULLSPACE_W)
+            saw_released = True
+        if saw_held and saw_released:
+            return
+    raise AssertionError(
+        f"never saw both sides of the release (held={saw_held} released={saw_released})"
+    )
+
+
+def test_swing_sole_orientation_engages_on_the_descending_arc():
+    """Late swing must command a world-flat sole, not a limp or pinned ankle.
+
+    The task is off on the way up (ankles stay at the stand pose there) and
+    on after ``SWING_ANKLE_RELEASE_S``, which is also when the ankles go limp
+    so the QP can use them.
+    """
+    sim = Simulation()
+    sim.controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25})
+    saw_off = saw_on = False
+    while sim.data.time < 2.5 and not sim.fell:
+        sim.step()
+        gait = sim.controller._last_gait
+        if gait is None or not gait.swing.active:
+            continue
+        active = bool(sim.controller._last_swing_orient_active)
+        if gait.swing.s <= SWING_ANKLE_RELEASE_S:
+            assert not active
+            saw_off = True
+        elif active:
+            # Dropped again once the foot is accepted into the contact mask.
+            saw_on = True
+        if saw_off and saw_on:
+            return
+    raise AssertionError(
+        f"never saw both sides of the orientation task (off={saw_off} on={saw_on})"
+    )
+
+
+def test_com_height_stiffness_tracks_support():
+    """Vertical CoM kp must follow the planted-contact fraction.
+
+    Standing (eight sites) keeps full height hold. Single support is half
+    the contacts, so the spring is half — that is what stops the stance
+    leg vaulting without a hardcoded crouch.
+    """
+    sim = Simulation()
+    sim.step()
+    assert sim.controller._last_com_z_scale == pytest.approx(1.0)
+    sim.controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25})
+    while sim.data.time < 2.5 and not sim.fell:
+        sim.step()
+        gait = sim.controller._last_gait
+        if gait is not None and gait.swing.active:
+            assert sim.controller._last_com_z_scale == pytest.approx(0.5, abs=0.05)
+            return
+    raise AssertionError("never reached single support")
+
+
+def test_stance_knee_stays_above_the_flexion_floor():
+    """Planted knees must not slam through the 15° emergency floor.
+
+    With planted-leg kp = 0 the CoM-height task drove the stance knee from
+    18° to −10° in 32 ms. A light keyframe bias plus a one-sided kick
+    below 15° should keep both stance knees out of the stop.
+    """
+    sim = Simulation()
+    sim.controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25})
+    per_leg = NUM_LEG_JOINTS // 2
+    stance_min = [np.inf, np.inf]
+    while sim.data.time < 1.6 and not sim.fell:
+        sim.step()
+        gait = sim.controller._last_gait
+        if gait is None or not gait.walking:
+            continue
+        qj = np.asarray(sim.data.qpos[QPOS_JOINT0:], dtype=float)
+        for leg in (0, 1):
+            if gait.swing.active and int(gait.swing.leg) == leg:
+                continue
+            stance_min[leg] = min(stance_min[leg], float(qj[leg * per_leg + KNEE]))
+    assert stance_min[0] < np.inf and stance_min[1] < np.inf, "never saw a stance knee"
+    slack = np.radians(8.0)
+    for leg, q in enumerate(stance_min):
+        assert q > STANCE_KNEE_MIN - slack, (
+            f"{'LR'[leg]} stance knee reached {np.degrees(q):.1f} deg "
+            f"(floor {np.degrees(STANCE_KNEE_MIN):.0f} deg)"
+        )
+
+
 def test_walk_command_produces_real_steps_not_a_shuffle():
     """The plan must actually lift the feet and commit to footholds.
 
     This is the regression guard for the original defect, where the controller
     stayed upright by shuffling: ~3 mm of foot clearance and 8% of commanded
-    speed. It deliberately says nothing about staying upright, so it keeps
-    working as a shuffle detector while the balance problem is open.
+    speed. High double-support (the orbit that stays up) shortens air time,
+    so closed-loop peak clearance is ~22 mm against a 45 mm Bézier — still
+    a step, not a scrape. Keep this well above the old 3 mm shuffle.
     """
     result = _walk(0.20, 3.0)
     assert result["steps"] >= 4, "no swing phases executed"
-    assert result["clearance"] > 0.02, (
-        f"swing foot only cleared {result['clearance']*1000:.1f} mm -- "
-        "the Cartesian swing task is not tracking the planned arc"
-    )
+    assert result["clearance"] > 0.018, (
+            f"swing foot only cleared {result['clearance']*1000:.1f} mm -- "
+            "the Cartesian swing task is not tracking the planned arc"
+        )
     assert result["forward"] > 0.15, "barely any forward travel"
 
 
-@pytest.mark.xfail(
-    reason="Known open defect: lateral divergence. The footstep plan and DCM "
-    "reference are correct in isolation (layers 1-5) and sagittal tracking "
-    "holds to a few cm, but lateral CoM error compounds over roughly 8-16 "
-    "steps until the robot topples sideways. See docs/walking.md.",
-    strict=False,
-)
 @pytest.mark.parametrize("speed", [0.10, 0.20, 0.30])
 def test_closed_loop_walk_stays_up(speed):
     result = _walk(speed, WALK_TEST_DURATION)
@@ -384,3 +839,17 @@ def test_closed_loop_walk_stays_up(speed):
     achieved = result["forward"] / result["elapsed"]
     assert achieved > 0.6 * speed, f"tracked {achieved:.3f} of {speed:.3f} m/s"
     assert abs(result["lateral"]) < 0.25, "walked sideways"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("speed", [0.10, 0.20, 0.35, 0.50])
+def test_closed_loop_walk_is_a_limit_cycle(speed):
+    result = _walk(speed, WALK_LIMIT_CYCLE_DURATION)
+    assert not result["fell"], (
+        f"fell after {result['elapsed']:.2f}s / {result['steps']} steps "
+        f"(forward {result['forward']:+.2f} m, lateral {result['lateral']:+.2f} m)"
+    )
+    assert result["elapsed"] >= WALK_LIMIT_CYCLE_DURATION - 0.05
+    achieved = result["forward"] / result["elapsed"]
+    assert achieved > 0.6 * speed, f"tracked {achieved:.3f} of {speed:.3f} m/s"
+    assert abs(result["lateral"]) < 0.20, "lateral drift is not a bounded orbit"

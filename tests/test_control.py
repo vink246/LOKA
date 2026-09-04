@@ -68,6 +68,8 @@ def test_nominal_stance_has_flat_feet_on_the_floor(controller: LocomotionControl
     sole_z = robot.data.site_xpos[robot.contact_site_ids][:, 2]
     assert np.ptp(sole_z) < 1e-6, "soles are not coplanar"
     assert abs(sole_z.mean()) < 1e-3, "soles are not resting on z=0"
+    assert robot.sole_tilt(0) < np.radians(1.0)
+    assert robot.sole_tilt(1) < np.radians(1.0)
 
 
 def test_nominal_com_sits_over_the_support_polygon(controller: LocomotionController):

@@ -84,13 +84,22 @@ class WBCConfig:
     kp_posture_swing: float = 200.0
     kd_posture_swing: float = 20.0
     #: Cartesian swing-foot tracking on the foot-centre Jacobian. This is what
-    #: executes the planned foothold, so it has to outrank the leg posture task
-    #: by a wide margin -- at zero the footstep planner has no actuator at all.
-    weight_swing_foot: float = 60.0
+    #: executes the planned foothold. Stance contact is weighted ~2000, so this
+    #: has to be hundreds — at 60 the QP inverted the lift and the foot only
+    #: cleared 8 mm. At zero the footstep planner has no actuator at all.
+    weight_swing_foot: float = 500.0
     #: Error feedback only -- the arc supplies its own acceleration -- so these
     #: are moderate, with ``kd ≈ 2√kp`` for a settled, non-ringing landing.
-    kp_swing_foot: float = 300.0
-    kd_swing_foot: float = 30.0
+    #: 500/40 (was 300/30) closes the last centimetre once the QP actually
+    #: tracks the task; 300 left a 10 mm hover at s = 1 that held the clock.
+    kp_swing_foot: float = 500.0
+    kd_swing_foot: float = 40.0
+    #: Late-swing sole orientation: world-flat roll/pitch so the four sites
+    #: arrive together. Below the Cartesian weight so a height residual still
+    #: wins if the two disagree; ``kd ≈ 2√kp`` again.
+    weight_swing_orient: float = 40.0
+    kp_swing_orient: float = 200.0
+    kd_swing_orient: float = 28.0
     kp_posture_upper: float = 100.0
     kd_posture_upper: float = 10.0
 
@@ -112,6 +121,9 @@ class WBCTargets:
     #: ``a* = kp(p*-p) - kd v`` (world frame).
     swing_jacobian: np.ndarray | None = None  # (3, nv)
     swing_acc: np.ndarray | None = None  # (3,)
+    #: Optional sole-orientation task, same residual form on ``J_ω``.
+    swing_orient_jacobian: np.ndarray | None = None  # (3, nv)
+    swing_orient_acc: np.ndarray | None = None  # (3,)
 
 
 @dataclass
@@ -241,6 +253,7 @@ class WholeBodyController:
         dynamics: DynamicsTerms,
         targets: WBCTargets,
         contact_mask: np.ndarray | None = None,
+        contact_hold_mask: np.ndarray | None = None,
     ) -> WBCSolution:
         cfg = self.config
         nv = self.nv
@@ -267,10 +280,16 @@ class WholeBodyController:
 
         # Lifted contacts (if any) carry no force and are dropped from the
         # contact task; everything else about the problem is unchanged.
+        # ``contact_hold_mask`` may be a subset: a peeling swing foot can
+        # still take force without the kinematic hold pinning it to the ground.
         if contact_mask is None:
             planted = np.ones(self.num_contacts, dtype=bool)
         else:
             planted = np.asarray(contact_mask, dtype=bool)
+        if contact_hold_mask is None:
+            held = planted
+        else:
+            held = np.asarray(contact_hold_mask, dtype=bool) & planted
         fric = self._friction_slice
         for i, in_contact in enumerate(planted):
             r = fric.start + 5 * i
@@ -278,8 +297,9 @@ class WholeBodyController:
             self._upper[r + 4] = cfg.fz_max if in_contact else 0.0
 
         # Contact task: J q̈ ≈ a_c - J̇q̇, weighted heavily and folded into the
-        # cost. Rows for airborne points are zeroed so they contribute nothing.
-        active = np.repeat(planted, 3)
+        # cost. Rows for airborne (or peeling) points are zeroed so they
+        # contribute nothing.
+        active = np.repeat(held, 3)
         jac_active = jac * active[:, None]
         contact_acc = -cfg.contact_kd * dynamics.contact_vel.reshape(-1)
         contact_rhs = (contact_acc - dynamics.contact_bias_acc) * active
@@ -308,17 +328,22 @@ class WholeBodyController:
         gradient = -weights * target
         gradient[:nv] -= cfg.weight_contact * (jac_active.T @ contact_rhs)
 
-        # Cartesian swing-foot task (Phase B). Hessian already dense on q̈.
-        if (
-            targets.swing_jacobian is not None
-            and targets.swing_acc is not None
-            and cfg.weight_swing_foot > 0.0
-        ):
-            j_s = np.asarray(targets.swing_jacobian, dtype=float).reshape(3, nv)
-            a_s = np.asarray(targets.swing_acc, dtype=float).reshape(3)
-            w_s = float(cfg.weight_swing_foot)
-            hessian[:nv, :nv] += w_s * (j_s.T @ j_s)
-            gradient[:nv] -= w_s * (j_s.T @ a_s)
+        # Cartesian / orientation swing-foot tasks (Phase B). Hessian already
+        # dense on q̈. Each is an optional 3-row residual ``J q̈ ≈ a*``.
+        def add_swing_task(jacobian, acc, weight: float) -> None:
+            if jacobian is None or acc is None or weight <= 0.0:
+                return
+            j_s = np.asarray(jacobian, dtype=float).reshape(3, nv)
+            a_s = np.asarray(acc, dtype=float).reshape(3)
+            hessian[:nv, :nv] += weight * (j_s.T @ j_s)
+            gradient[:nv] -= weight * (j_s.T @ a_s)
+
+        add_swing_task(targets.swing_jacobian, targets.swing_acc, cfg.weight_swing_foot)
+        add_swing_task(
+            targets.swing_orient_jacobian,
+            targets.swing_orient_acc,
+            cfg.weight_swing_orient,
+        )
 
         solution = self._qp.solve(
             hessian, gradient, self._constraint, self._lower, self._upper

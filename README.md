@@ -19,27 +19,34 @@ surfaces — `update_weights()` for costs and gains, `set_task_targets()` for
 setpoints and gait policy. A knob you can reach by hand in the dashboard is a
 knob the model can reach later, by the same name, with the same clamp.
 
-Standing is solid and measured below. **Walking is not finished**: the robot
-steps at the commanded speed and then topples sideways after eight to sixteen
-steps. `docs/walking.md` has the diagnosis and what to try next; the failure is
-pinned by an `xfail` in `tests/test_gait.py` rather than hidden.
+Standing is solid and measured below. Walking holds 8 s at 0.10–0.30 m/s and
+30 s at 0.10/0.20/0.35/0.50 m/s under `gait_schedule_for_speed` (high
+double-support at a crawl, more swing time at 0.50 m/s). Isolation's duty
+0.65 still falls at ~3 s. Diagnosis and remaining CoP-edge notes:
+`docs/walking.md`.
 
 ## The G1 locomotion controller
 
-Two layers, both quadratic programs, running in one process with MuJoCo:
+Two layers, both quadratic programs, running in one process with MuJoCo, plus a
+classical gait in front of them:
 
 ```text
-(qpos, qvel) ──► centroidal MPC  (50 Hz) ──► desired contact forces
-             └─► whole-body QP  (500 Hz) ──► 29 joint torques ──► plant
+(qpos, qvel) ──► GaitScheduler   (500 Hz) ──► contacts, DCM, swing Bézier
+             ──► ConvexMPC       (50 Hz)  ──► desired contact forces
+             └─► whole-body QP   (500 Hz) ──► 29 joint torques ──► plant
 ```
 
-The **MPC** treats the robot as a single rigid body and optimises contact forces
-over a 0.3 s horizon, so it can anticipate where the centre of mass is heading
-rather than only reacting to where it is. The **whole-body QP** runs ten times
-faster and answers a different question: what torques realise those forces while
-keeping the feet planted, the torso upright, and the posture near nominal. It
-solves over `[q̈, f]` subject to the floating base's unactuated equations of
-motion, friction cones, and actuator limits.
+The **gait** (Englsberger DCM, Pratt capture point) is the reference a
+short-horizon force plan needs (Galliker et al. 2022). The **MPC** is Di
+Carlo et al. 2018's convex SRBD QP with Sleiman et al. 2021 finite-foot CoP
+constraints (implementation notes and citations in `docs/walking.md`). It
+is not ocs2 centroidal NMPC. The **whole-body QP** runs ten times faster
+and answers a different question: what torques realise those forces while
+keeping the feet planted, the torso upright, and the swing foot on its arc.
+
+The LLM (`python -m loka.run_loka`) mutates `gait.*` Task_Targets and a small
+impedance allowlist on a 0.5–5 s cadence. It never waits in the control
+thread and never sets footholds.
 
 Nothing in `loka/control/` imports MuJoCo for anything but kinematics queries, and
 the controller's interface is `compute_torque(qpos, qvel) -> torque`. Swapping the
@@ -72,7 +79,7 @@ controller, not better tuning.
 loka/control/
 ├── robot.py       # G1 model wrapper: indices, contact sites, dynamics, stance margins
 ├── qp.py          # OSQP front-end with pinned sparsity patterns for warm starts
-├── mpc.py         # convex single-rigid-body MPC over contact forces
+├── mpc.py         # ConvexMPC: Di Carlo SRBD QP + finite-foot CoP (Sleiman contact idea)
 ├── wbc.py         # whole-body QP: accelerations + forces -> torques
 ├── gait.py        # gait clock, footstep plan, DCM reference, swing arcs
 ├── locomotion.py  # ties them together; the LOKA-facing command surface
@@ -162,8 +169,9 @@ prompt-ready text.
 ## Tests
 
 ```bash
-pytest                      # ~30 s
-pytest -m 'not slow'        # invariants only, no closed-loop runs
+pytest                      # ~3 min (includes 30 s walks)
+pytest -m 'not slow'        # invariants + 8 s walk gates (~1 min)
+pytest -m slow              # 30 s limit-cycle walks + standing recovery
 ```
 
 The suite splits into physics identities checked at a single state (contact forces
@@ -172,9 +180,9 @@ differences) and short closed-loop runs for drops, tilts, crouches and pushes. T
 capture-point test asserts recovery *and* asserts that a kick 50% past the limit
 still falls, so the suite cannot be satisfied by loosening what counts as a fall.
 
-The one known failure is marked, not hidden: `test_closed_loop_walk_stays_up` is
-an `xfail`, so it reports if the lateral divergence is ever fixed by accident,
-and the gait planner's own invariants are tested in isolation either way.
+The closed-loop walk gates live in `tests/test_gait.py`: 8 s at 0.10/0.20/0.30
+and 30 s at 0.10/0.20/0.35/0.50 (`pytest -m slow`). The gait planner's own
+invariants are tested in isolation either way.
 
 ## Notes on the design
 

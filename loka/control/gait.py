@@ -3,24 +3,26 @@
 Walking geometry stays classical and outside the LLM vocabulary. The
 orchestrator only tunes the high-level ``gait.*`` policy knobs declared in
 :data:`GAIT_LIMITS`; footstep coordinates and per-tick contact flags are
-decided here.
+decided here. If the LLM sets only ``gait.speed``, :func:`gait_schedule_for_speed`
+fills period, duty and stance width so 0.10 and 0.50 m/s share one controller.
 
 The plan *leads* the robot rather than following it:
 
 * **Footsteps** form a chain anchored at the current support foot. Each link
   advances by ``speed × T_step`` along the heading and crosses ``stance_width``
   to the other side, so commanded progress is built into the geometry.
-* The **CoM reference** is the divergent-component-of-motion (DCM) trajectory
-  implied by that footstep sequence, treating each footstep as a piecewise
-  constant ZMP held for one step:
+* The **CoM reference** is the DCM trajectory implied by that footstep sequence.
+  Each foothold is where the foot lands; the ZMP sits *inside* the sole, inset
+  from the centre, so the orbit leaves CoP travel for tracking. Within a step
+  the ZMP slides across double support onto that inset rather than jumping:
 
-      ξ(τ)      = p_k + (ξ_eos,k − p_k) · e^{ω₀(τ − T_step)}     within step k
+      ξ(τ)      = p(τ) + (ξ_eos,k − p(τ)) · e^{ω₀(τ − T_step)}   within step k
       ξ_eos,k−1 = p_k + (ξ_eos,k − p_k) · e^{−ω₀ T_step}         backward
       ċ_ref     = ω₀ (ξ_ref − c_ref)                             CoM from DCM
 
   The backward recursion is Englsberger's DCM planner; the forward CoM
   integration is a stable first-order filter, so the position reference is
-  continuous even when the ZMP reference steps sideways.
+  continuous even when the ZMP reference moves sideways.
 
 Anchoring the chain to the support foot is what keeps the plan *coherent*
 without letting measurement set the pace. Every link is exactly one commanded
@@ -77,17 +79,58 @@ MAX_COM_REF_ERROR = 0.06
 #: push, small enough that it cannot invert the nominal stride.
 MAX_DCM_CORRECTION = 0.20
 
-#: Length of the opening double-support weight transfer, in step durations.
+#: Length of the opening double-support, in step durations.
 #:
-#: The DCM reference is the steady-state limit cycle from the first tick, but
-#: the CoM reference starts wherever the robot is standing and converges onto
-#: it with a time constant of ``1/ω₀`` (~0.27 s). Lift a foot before that has
-#: run its course and the first step enters with roughly half the lateral
-#: velocity the cycle calls for; the CoM then fails to travel far enough over
-#: the stance foot, leaves with a surplus of outward velocity, and each step
-#: compounds the last into a sideways topple. Both feet stay planted here, so
-#: spending a couple of step times getting the entry condition right is free.
-OPENING_TRANSFER_STEPS = 2.0
+#: LIPM acceleration is away from the ZMP, so loading the first *stance* foot
+#: throws CoM onto the swing side and first lift-off has the wrong sign. The
+#: opening ZMP sits on the upcoming swing-foot inset (APA). A midpoint ZMP
+#: never loads the orbit; a stance-foot ZMP reverses it.
+OPENING_TRANSFER_STEPS = 1.0
+
+#: Inset of the planned ZMP from each foot centre toward the midline [m].
+#: The G1 sole is 60 mm wide; parking ZMP at the centre spent 87% of that
+#: on the nominal orbit and left ~0.05 m/s² of rejectable accel. 12 mm in
+#: leaves the outer 18 mm for tracking.
+ZMP_INSET = 0.012
+
+#: How close the swing-foot *centre* must be to the ground before the gait
+#: clock may leave single support [m]. Contact sites trigger at 5 mm, but a
+#: pitched sole can scuff a toe while the centre is still 15 mm up -- which
+#: is how a 40 mm miss used to count as a landing. 8 mm is just above the
+#: sensor and well below a hovering foot.
+TOUCHDOWN_HEIGHT = 0.008
+
+#: Height that distinguishes a real swing from a scuff [m]. The seated
+#: test is 8 mm; a 9 mm hop that never tracked the Bézier must not count
+#: as airborne, or the clock early-plants at ``s = 0.75`` and cuts off the
+#: lagged Cartesian lift. Isolation tests keep z = 0 and never reach this.
+SWING_CLEARED_HEIGHT = 0.020
+
+#: Longest extra single-support, past ``T_step``, spent waiting for that
+#: contact [s]. The right swing was landing 30–40 mm high at clock timeout;
+#: ~0.1 s of PD on the Cartesian task closes that, and 0.2 s is a hard cap
+#: so a falling robot cannot freeze the scheduler.
+MAX_TOUCHDOWN_HOLD = 0.20
+
+#: Earliest the clock may commit a step, as a fraction of the swing window.
+#: Same test as the late hold (centre down *and* a measured sole contact),
+#: but only after the foot has actually been airborne this swing — otherwise
+#: planner-isolation tests, which keep z = 0, would skip the last quarter of
+#: every Bézier.
+EARLY_PLANT_S = 0.75
+
+#: How close the swing-foot centre must be to the planned foothold [m] before
+#: a real (airborne) swing counts as planted. The G1 sole is 60 mm wide; if
+#: the planned point is farther than that, it is no longer on the real sole
+#: and the next ZMP is a lie. Isolation tests never leave the ground, so
+#: they skip this gate and keep the nominal cadence.
+TOUCHDOWN_RADIUS = 0.030
+
+#: Extra horizontal speed the Cartesian swing task can spend catching a
+#: moving foothold [m/s]. Capture that outruns this in the remaining swing
+#: is not a kinematically feasible plant (Galliker et al. 2022: the foot
+#: pose at contact enters through kinematics, not as an unbounded DCM nudge).
+SWING_CATCHUP_SPEED = 0.45
 
 #: Minimum lateral gap between consecutive footholds [m], so a lateral
 #: correction can never plant one foot on top of the other. The G1 sole is
@@ -113,7 +156,7 @@ class GaitConfig:
     #: two swing windows would overlap and leave the robot airborne.
     duty_factor: float = 0.65
     step_length_max: float = 0.30  # cap on stride between consecutive footholds [m]
-    swing_height: float = 0.06  # peak clearance above the foot line [m]
+    swing_height: float = 0.045  # peak clearance above the foot line [m]
     stance_width: float = 0.24  # lateral foot separation [m]; nominal G1 is 0.237
     #: DCM foothold feedback gain. 1.0 is deadbeat capture-point placement;
     #: below 1 trades disturbance rejection for a smoother nominal stride.
@@ -172,6 +215,32 @@ GAIT_LIMITS: dict[str, tuple[float, float]] = {
 }
 
 GAIT_PARAMETER_NAMES = frozenset(GAIT_LIMITS.keys())
+
+#: Cadence / width knobs the speed schedule may fill when the LLM omitted them.
+_SCHEDULED_FIELDS = frozenset({"step_period", "duty_factor", "stance_width"})
+
+
+def gait_schedule_for_speed(speed: float) -> dict[str, float]:
+    """Period, duty and stance width that keep a DCM orbit on a 60 mm sole.
+
+    Closed-loop 0.20 m/s with isolation's duty 0.65 falls at ~3 s: CoP sits
+    on the sole edge, then sagittal ``land_f`` grows. Pinning duty ~0.80
+    (more double-support, shorter single-support exponential) is a bounded
+    walk. High speed needs the opposite — enough swing time to finish a
+    longer stride — so duty falls and the cycle shortens toward 0.50 m/s.
+    Stance stays near the G1's 0.237 m; widening it grew the orbit. The LLM
+    may override any of these; this is what runs when it only sets
+    ``gait.speed``.
+    """
+    t = float(np.clip(abs(float(speed)) / 0.50, 0.0, 1.0))
+    period = 0.80 * (1.0 - t) + 0.64 * t
+    duty = 0.84 * (1.0 - t) + 0.74 * t
+    width = 0.22 * (1.0 - t) + 0.24 * t
+    return {
+        "gait.step_period": float(np.clip(period, *GAIT_LIMITS["gait.step_period"])),
+        "gait.duty_factor": float(np.clip(duty, *GAIT_LIMITS["gait.duty_factor"])),
+        "gait.stance_width": float(np.clip(width, *GAIT_LIMITS["gait.stance_width"])),
+    }
 
 
 def parse_gait_mode(value) -> float:
@@ -246,8 +315,8 @@ class Footstep:
     #: is committed -- planting the foot behind the capture point.
     correction: np.ndarray = field(default_factory=lambda: np.zeros(2))
     frozen: bool = False
-    #: The opening step of a walk, where both feet stay planted while the CoM
-    #: reference transfers off the stance midpoint.
+    #: The opening step of a walk, where both feet stay planted while the
+    #: opening ZMP slides onto the upcoming swing foot (APA).
     initial: bool = False
 
 
@@ -283,6 +352,9 @@ class GaitScheduler:
 
     def __init__(self, config: GaitConfig | None = None) -> None:
         self.config = config or GaitConfig()
+        #: ``step_period`` / ``duty_factor`` / ``stance_width`` the operator or
+        #: LLM set explicitly. The speed schedule fills the rest.
+        self._user_gait_fields: set[str] = set()
         self.reset()
 
     # -- lifecycle ---------------------------------------------------------
@@ -298,7 +370,10 @@ class GaitScheduler:
         self._dcm_ref = np.zeros(2)
         self._swing = SwingState()
         self._initial_feet = np.zeros((2, 2))
+        self._opening_zmp = np.zeros(2)
         self._active = False
+        self._touchdown_hold = 0.0
+        self._swing_cleared = False
 
     def set_config(self, config: GaitConfig) -> None:
         self.config = config
@@ -351,8 +426,26 @@ class GaitScheduler:
             value = float(np.clip(value, lo, hi))
             setattr(cfg, field_name, value)
             applied[name] = value
+            if field_name in _SCHEDULED_FIELDS:
+                self._user_gait_fields.add(field_name)
             if field_name == "mode" and value == MODE_STAND:
+                self._user_gait_fields.clear()
                 self.reset()
+        applied.update(self.apply_speed_schedule())
+        return applied
+
+    def apply_speed_schedule(self) -> dict[str, float]:
+        """Fill cadence/width from ``gait.speed`` unless the user pinned them."""
+        cfg = self.config
+        if float(cfg.mode) < MODE_WALK or abs(float(cfg.speed)) < 1e-4:
+            return {}
+        applied: dict[str, float] = {}
+        for name, value in gait_schedule_for_speed(cfg.speed).items():
+            field_name = name.split(".", 1)[1]
+            if field_name in self._user_gait_fields:
+                continue
+            setattr(cfg, field_name, value)
+            applied[name] = value
         return applied
 
     # -- timing ------------------------------------------------------------
@@ -383,6 +476,44 @@ class GaitScheduler:
 
     def _omega(self, height: float) -> float:
         return float(np.sqrt(GRAVITY / max(0.30, float(height))))
+
+    def _swing_leg(self) -> int:
+        """Leg currently airborne, or -1 when both feet should be down."""
+        landing = self._steps.get(self._step + 1)
+        if landing is None or landing.leg < 0:
+            return -1
+        return int(landing.leg)
+
+    def _swing_foot_down(
+        self,
+        feet: np.ndarray,
+        ground_z: float,
+        measured_mask: np.ndarray,
+    ) -> bool:
+        """True when the in-flight foot has actually planted.
+
+        Height and measured contact both have to agree. Height alone would
+        accept a sole that is close but unloaded; contact alone would accept
+        a toe scuff 4 cm up if a site flickered. A swing that actually left
+        the ground also has to finish near the planned foothold — otherwise
+        the clock names a short scuff as stance and the next ZMP sits off
+        the sole. Isolation tests keep z = 0, never set ``_swing_cleared``,
+        and still tick on time.
+        """
+        leg = self._swing_leg()
+        if leg < 0:
+            return True
+        height = float(feet[leg, 2] - ground_z)
+        rows = slice(0, 4) if leg == 0 else slice(4, 8)
+        planted = bool(np.asarray(measured_mask, dtype=bool).reshape(-1)[rows].any())
+        if height > TOUCHDOWN_HEIGHT or not planted:
+            return False
+        if not self._swing_cleared:
+            return True
+        landing = self._steps.get(self._step + 1)
+        if landing is None:
+            return True
+        return float(np.linalg.norm(feet[leg, :2] - landing.pos)) <= TOUCHDOWN_RADIUS
 
     @property
     def phase(self) -> float:
@@ -476,7 +607,7 @@ class GaitScheduler:
             target.frozen = True
             return
 
-        support_zmp = self._steps[self._step].pos
+        support_zmp = self._zmp_of(self._steps[self._step])
         remaining = max(self._current_duration(t_step) - self._tau, 1e-3)
         predicted = support_zmp + (np.asarray(dcm) - support_zmp) * float(
             np.exp(omega * remaining)
@@ -488,6 +619,18 @@ class GaitScheduler:
         if norm > MAX_DCM_CORRECTION:
             correction *= MAX_DCM_CORRECTION / norm
         pos = target.nominal + correction
+        # Late-swing only: remaining Bézier time is how far the target may
+        # still travel. Early swing keeps the full capture (isolation tests
+        # and a racing CoM need that). After mid-swing, a 95–200 mm yank is
+        # how step 5 landed 21 mm short — Galliker: the foot pose at contact
+        # is kinematic, not an unbounded DCM nudge.
+        if s > 0.45:
+            _, t_swing, _ = self._durations()
+            budget = SWING_CATCHUP_SPEED * max((1.0 - s) * t_swing, 1e-3)
+            delta = pos - np.asarray(target.pos, dtype=float)
+            dnorm = float(np.linalg.norm(delta))
+            if dnorm > budget:
+                pos = np.asarray(target.pos, dtype=float) + delta * (budget / dnorm)
 
         support = self._steps.get(self._step)
         if support is not None and not support.initial:
@@ -509,26 +652,53 @@ class GaitScheduler:
 
     # -- DCM reference -----------------------------------------------------
 
+    def _left_axis(self) -> np.ndarray:
+        _, left = heading_frame(float(self.config.heading))
+        return left
+
+    def _zmp_of(self, step: Footstep) -> np.ndarray:
+        """Inset ZMP for a foothold: inside the sole, toward the midline.
+
+        ``step.pos`` is where the foot lands. The orbit's ZMP sits 12 mm in
+        from the centre so CoP has spare travel (see :data:`ZMP_INSET`).
+        """
+        pos = np.asarray(step.pos, dtype=float).reshape(2)
+        if step.leg < 0:
+            return pos.copy()
+        side = 1.0 if step.leg == 0 else -1.0
+        return pos - side * ZMP_INSET * self._left_axis()
+
+    def _zmp_now(self, *, t_step: float, t_ds: float) -> np.ndarray:
+        """ZMP at the current instant: opening APA, then the stance inset."""
+        step = self._steps.get(self._step)
+        if step is None:
+            return np.zeros(2)
+        if step.initial:
+            return self._opening_zmp.copy()
+        return self._zmp_of(step)
+
     def _dcm_eos(self, *, omega: float, t_step: float) -> np.ndarray:
         """Planned DCM at the end of the current step.
 
         Recurses backward from the last planned footstep, where the robot is
         assumed to come to rest. Each step back attenuates by
         ``e^{-ω₀ T_step}``, so the terminal assumption is invisible from here.
+        Future ZMPs are the inset footholds; the current step's DS slide is
+        a local forward smoothing and does not enter the recursion.
         """
         last = self._step + PLAN_HORIZON
-        eos = self._steps[last].pos.copy()
+        eos = self._zmp_of(self._steps[last])
         decay = float(np.exp(-omega * t_step))
         for index in range(last, self._step, -1):
-            zmp = self._steps[index].pos
+            zmp = self._zmp_of(self._steps[index])
             eos = zmp + (eos - zmp) * decay
         return eos
 
-    def _dcm_at(self, *, omega: float, t_step: float) -> np.ndarray:
+    def _dcm_at(self, *, omega: float, t_step: float, t_ds: float) -> np.ndarray:
         """DCM reference for the current instant."""
         eos = self._dcm_eos(omega=omega, t_step=t_step)
-        zmp = self._steps[self._step].pos
         span = self._current_duration(t_step)
+        zmp = self._zmp_now(t_step=t_step, t_ds=t_ds)
         return zmp + (eos - zmp) * float(np.exp(omega * (self._tau - span)))
 
     def _integrate_com_ref(self, *, dt: float, omega: float, dcm_ref: np.ndarray) -> None:
@@ -554,21 +724,30 @@ class GaitScheduler:
 
     def _begin(self, *, feet_xy: np.ndarray, com_xy: np.ndarray) -> None:
         """Seed the plan from the current stance."""
-        mid = feet_xy.mean(axis=0)
+        stance = 1  # right supports first, so the left steps out
+        swing = 1 - stance
         self._com_ref = com_xy.copy()
         self._com_vel_ref = np.zeros(2)
         self._step = 0
         self._tau = 0.0
         self._swing = SwingState()
         self._initial_feet = feet_xy.copy()
-        # Step 0 holds both feet while the CoM reference transfers off the
-        # stance midpoint; step 1 is the existing foot we then stand on.
+        # Opening contact is still both feet. The DCM ZMP slides from the
+        # midpoint onto the upcoming swing-foot inset (APA); the stored
+        # footstep is the stance so the chain after it is coherent.
+        left = self._left_axis()
+        swing_inset = feet_xy[swing] - (1.0 if swing == 0 else -1.0) * ZMP_INSET * left
+        self._opening_zmp = swing_inset
         self._steps = {
-            0: Footstep(leg=-1, pos=mid.copy(), frozen=True, initial=True),
-            1: Footstep(leg=1, pos=feet_xy[1].copy(), frozen=True),
+            0: Footstep(
+                leg=stance, pos=feet_xy[stance].copy(), frozen=True, initial=True
+            ),
+            1: Footstep(leg=stance, pos=feet_xy[stance].copy(), frozen=True),
         }
-        self._first_leg = 1  # right foot supports first, so the left steps out
+        self._first_leg = stance
         self._active = True
+        self._touchdown_hold = 0.0
+        self._swing_cleared = False
 
     def _may_stop(self, *, t_step: float) -> bool:
         """True once halting would leave the feet square and level.
@@ -633,17 +812,57 @@ class GaitScheduler:
         omega = self._omega(height)
 
         # -- advance the clock ---------------------------------------------
+        # The Bézier is scheduled to arrive at T_step, but the plant does not
+        # always make it: the right swing was still 30–40 mm up when this
+        # used to increment, and the next tick named that airborne foot as
+        # stance. Hold the clock at the end of the step until the foot is
+        # actually down (or the hold times out). The matching early path
+        # commits once a *real* swing has seated, so a late Bézier does not
+        # keep dragging a planted foot.
+        span = self._current_duration(t_step)
         self._tau += dt
-        if self._tau >= self._current_duration(t_step):
-            self._tau -= self._current_duration(t_step)
-            self._step += 1
-            if self._may_stop(t_step=t_step):
-                self.reset()
-                return self._stand_output(measured_mask, feet_xy)
+        if (
+            self._swing_cleared
+            and t_swing > 1e-6
+            and self._tau >= t_ds + EARLY_PLANT_S * t_swing
+            and self._tau < span
+            and self._swing_foot_down(feet, ground_z, measured_mask)
+        ):
+            self._tau = span
+        if self._tau >= span:
             support = self._steps.get(self._step)
-            if support is not None:
-                support.frozen = True  # it is on the ground now
-            self._swing = SwingState()
+            waiting = (
+                support is not None
+                and not support.initial
+                and not self._swing_foot_down(feet, ground_z, measured_mask)
+                and self._touchdown_hold < MAX_TOUCHDOWN_HOLD
+            )
+            if waiting:
+                self._tau = span
+                self._touchdown_hold += dt
+            else:
+                self._tau = max(0.0, self._tau - span)
+                self._step += 1
+                self._touchdown_hold = 0.0
+                # Isolation keeps z = 0 and never clears, so the planned
+                # chain is already the truth. A real swing is re-anchored
+                # at the measured plant: a short landing must shorten the
+                # next nominal, not leave a ZMP in the air.
+                cleared = self._swing_cleared
+                self._swing_cleared = False
+                if self._may_stop(t_step=t_step):
+                    self.reset()
+                    return self._stand_output(measured_mask, feet_xy)
+                support = self._steps.get(self._step)
+                if support is not None:
+                    if support.leg >= 0 and cleared:
+                        support.pos = feet_xy[support.leg].copy()
+                        if support.nominal is not None:
+                            support.correction = support.pos - support.nominal
+                    support.frozen = True
+                self._swing = SwingState()
+        else:
+            self._touchdown_hold = 0.0
 
         self._refresh_plan(t_step=t_step, v_cmd=v_cmd)
 
@@ -656,7 +875,7 @@ class GaitScheduler:
         dcm = com_xy + com_vel_xy / omega
         if in_swing:
             self._apply_dcm_correction(dcm=dcm, s=s, omega=omega, t_step=t_step)
-        dcm_ref = self._dcm_at(omega=omega, t_step=t_step)
+        dcm_ref = self._dcm_at(omega=omega, t_step=t_step, t_ds=t_ds)
         self._dcm_ref = dcm_ref
         self._integrate_com_ref(dt=dt, omega=omega, dcm_ref=dcm_ref)
 
@@ -672,6 +891,9 @@ class GaitScheduler:
                 # Lift off from where the foot actually is, not where the plan
                 # thought it would be.
                 self._swing = SwingState(active=True, leg=leg, start=feet[leg].copy())
+                self._swing_cleared = False
+            if float(feet[leg, 2] - ground_z) > SWING_CLEARED_HEIGHT:
+                self._swing_cleared = True
             foothold = np.array(
                 [
                     self._steps[self._step + 1].pos[0],
@@ -714,53 +936,79 @@ class GaitScheduler:
     # -- MPC preview -------------------------------------------------------
 
     def preview(self, *, horizon: int, dt: float) -> tuple[np.ndarray, np.ndarray]:
-        """Planned contact flags and foot centres over an MPC horizon.
+        """Planned contact flags and foot poses over an MPC horizon.
 
-        Returns ``(contact, foot_xy)`` with shapes ``(horizon, 2)`` bool and
-        ``(horizon, 2, 2)``. The centroidal MPC plans 0.3 s ahead, which spans
-        most of a step, so replicating the *current* contact set across the
-        horizon -- as this used to -- misstates who is even touching the ground.
+        Returns ``(contact, foot_pose)`` with shapes ``(horizon, 2)`` bool and
+        ``(horizon, 2, 3)``. ``foot_pose[..., 2]`` is clearance above the foot
+        line (zero when planted, the Bézier lift while airborne). The centroidal
+        MPC plans 0.3 s ahead, which spans most of a step, so replicating the
+        *current* contact set across the horizon -- as this used to -- misstates
+        who is even touching the ground. Airborne soles follow the swing arc
+        rather than sitting at the foothold the WBC has not planted yet.
         """
         contact = np.ones((horizon, 2), dtype=bool)
-        foot_xy = np.zeros((horizon, 2, 2))
+        foot_pose = np.zeros((horizon, 2, 3))
         t_step, t_swing, t_ds = self._durations()
+        height = float(self.config.swing_height)
+
+        def _xy3(xy: np.ndarray) -> np.ndarray:
+            pose = np.zeros(3)
+            pose[:2] = xy
+            return pose
 
         here = self._steps.get(self._step)
         if not self._active or t_step <= 0.0 or here is None or here.initial:
             # Standing, or still in the opening transfer: both feet stay where
             # they are for longer than the horizon reaches.
             fallback = self._initial_feet if self._active else np.zeros((2, 2))
-            foot_xy[:] = fallback
-            return contact, foot_xy
+            foot_pose[:, :, :2] = fallback
+            return contact, foot_pose
 
         for k in range(horizon):
-            ahead = self._tau + (k + 1) * dt
+            # While waiting on a late touchdown the plant is still in this
+            # step's single support; do not tell the MPC the swing foot is
+            # already the new stance. k = 0 stays here, later ticks proceed
+            # as if we land on the next control step.
+            if self._touchdown_hold > 0.0:
+                ahead = (t_step - 1e-6) + k * dt
+            else:
+                ahead = self._tau + (k + 1) * dt
             index = self._step + int(ahead // t_step)
             tau = ahead % t_step
             support = self._steps.get(index)
             landing = self._steps.get(index + 1)
             previous = self._steps.get(index - 1)
             if support is None or landing is None:
-                foot_xy[k] = foot_xy[k - 1] if k else 0.0
+                foot_pose[k] = foot_pose[k - 1] if k else 0.0
                 continue
 
             if support.initial:
                 # Opening double support: both feet are where they started.
-                foot_xy[k] = self._initial_feet
+                foot_pose[k, :, :2] = self._initial_feet
                 continue
 
             swing_leg = landing.leg
-            foot_xy[k, support.leg, :] = support.pos
+            foot_pose[k, support.leg, :2] = support.pos
             if tau >= t_ds and t_swing > 1e-6:
                 contact[k, swing_leg] = False
-                foot_xy[k, swing_leg, :] = landing.pos
+                if previous is None:
+                    start_xy = self._initial_feet[swing_leg]
+                elif previous.initial:
+                    start_xy = self._initial_feet[swing_leg]
+                else:
+                    start_xy = previous.pos
+                s = float(np.clip((tau - t_ds) / t_swing, 0.0, 1.0))
+                pos, _, _ = swing_reference(
+                    _xy3(start_xy), _xy3(landing.pos), s, swing_height=height
+                )
+                foot_pose[k, swing_leg] = pos
             elif previous is None:
-                foot_xy[k, swing_leg, :] = landing.pos
+                foot_pose[k, swing_leg, :2] = landing.pos
             elif previous.initial:
                 # The opening step carries no foothold of its own.
-                foot_xy[k, swing_leg, :] = self._initial_feet[swing_leg]
+                foot_pose[k, swing_leg, :2] = self._initial_feet[swing_leg]
             else:
                 # Double support: the swing leg is still on its last foothold,
                 # which is where it stood while supporting the previous step.
-                foot_xy[k, swing_leg, :] = previous.pos
-        return contact, foot_xy
+                foot_pose[k, swing_leg, :2] = previous.pos
+        return contact, foot_pose

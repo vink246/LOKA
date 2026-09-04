@@ -19,6 +19,7 @@ max_linear_acc: 20.0     # m/s^2
 max_angular_acc: 40.0    # rad/s^2
 max_joint_acc: 200.0     # rad/s^2
 max_swing_acc: 120.0     # m/s^2
+max_swing_ang_acc: 80.0  # rad/s^2; late-swing sole flatten, not a slap
 
 mpc:
   horizon: 6             # x dt = 0.30 s lookahead
@@ -29,13 +30,12 @@ mpc:
 
   # Diagonal state cost on [roll pitch yaw], [x y z], [wx wy wz], [vx vy vz].
   weight_orientation: [500.0, 500.0, 300.0]
-  weight_position: [200.0, 200.0, 1000.0]
+  weight_position: [120.0, 120.0, 1000.0]
   weight_angular_velocity: [10.0, 10.0, 10.0]
   weight_linear_velocity: [60.0, 60.0, 60.0]
-  # Keep this tiny. Forces are O(100 N), so their squares swamp the tracking
-  # terms unless the weight is orders of magnitude smaller; at 2e-4 the MPC
-  # stops tracking altogether and just minimises effort.
-  weight_force: 1.0e-6
+  # CoP stays in the physical sole (Sleiman). The 12 mm ZMP inset lives in
+  # the gait *reference*, so the outer sole remains available for tracking.
+  cop_margin: 0.002
 
 wbc:
   friction_mu: 0.5
@@ -69,25 +69,35 @@ wbc:
   kd_posture_legs: 2.0
   kp_posture_swing: 200.0       # ... but a swing leg needs a real position task
   kd_posture_swing: 20.0
-  # Cartesian swing-foot task: the actuator behind the footstep plan. While
-  # walking this outranks the swing leg's joint posture task, which drops to a
-  # null-space bias. At zero the planned footholds are never executed.
-  weight_swing_foot: 60.0
-  kp_swing_foot: 300.0
-  kd_swing_foot: 30.0
+  # Cartesian swing-foot task: the actuator behind the footstep plan. Stance
+  # contact is weighted 2000, so this has to be hundreds or the QP inverts
+  # the lift (commanded +z, realised −z) and the foot scrapes at 8 mm.
+  # Outranks swing-leg joint posture, which drops to a null-space bias.
+  weight_swing_foot: 500.0
+  kp_swing_foot: 500.0
+  kd_swing_foot: 40.0
+  # Late-swing sole orientation (world-flat). Below the Cartesian weight so
+  # foothold height still wins if the two disagree.
+  weight_swing_orient: 40.0
+  kp_swing_orient: 200.0
+  kd_swing_orient: 28.0
   kp_posture_upper: 100.0
   kd_posture_upper: 10.0
 
 # High-level gait policy (LLM Task_Targets: gait.*). Geometry stays classical:
 # the walk line, footstep plan and DCM reference are computed in gait.py.
+# If the LLM only sets gait.speed, period / duty / stance_width follow
+# gait_schedule_for_speed (duty ~0.82 at a crawl, ~0.74 at 0.50 m/s so the
+# swing still has time to land a longer stride). Pin those knobs to override.
+# The 0.65 / 0.70 numbers below are isolation-planner defaults, not the walk.
 gait:
   mode: 0                 # 0=stand 1=walk 2=tread 3=limp
   speed: 0.0              # m/s in heading frame
   heading: 0.0            # world-frame travel direction [rad]
   step_period: 0.70       # full two-step cycle; a step is half of this
-  duty_factor: 0.65       # stance fraction per leg -> 0.245 s swing at 0.70 s
+  duty_factor: 0.65       # isolation default; walk fills ~0.74–0.84 from speed
   step_length_max: 0.30
-  swing_height: 0.06
+  swing_height: 0.045
   stance_width: 0.24      # nominal G1 stance measures 0.237
   capture_gain: 0.6       # DCM foothold feedback (1.0 = deadbeat capture point)
   walk_accel: 0.5

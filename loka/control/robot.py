@@ -144,10 +144,34 @@ class G1Model:
     # -- queries ----------------------------------------------------------
 
     def site_jacobian(self, site_id: int, data: mujoco.MjData | None = None) -> np.ndarray:
+        jacp, _ = self.site_spatial_jacobian(site_id, data)
+        return jacp
+
+    def site_spatial_jacobian(
+        self, site_id: int, data: mujoco.MjData | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Linear and rotational Jacobians of a site, both ``(3, nv)`` world frame."""
         d = self.data if data is None else data
         self._jacp[:] = 0.0
-        mujoco.mj_jacSite(self.model, d, self._jacp, None, int(site_id))
-        return self._jacp.copy()
+        self._jacr[:] = 0.0
+        mujoco.mj_jacSite(self.model, d, self._jacp, self._jacr, int(site_id))
+        return self._jacp.copy(), self._jacr.copy()
+
+    def site_quat(self, site_id: int) -> np.ndarray:
+        """World-frame site orientation as a MuJoCo ``[w, x, y, z]`` quaternion."""
+        quat = np.zeros(4)
+        mujoco.mju_mat2Quat(
+            quat, np.asarray(self.data.site_xmat[int(site_id)], dtype=float)
+        )
+        return quat
+
+    def sole_tilt(self, foot: int) -> float:
+        """Angle between the foot +z axis and world +z [rad]. Zero is a flat sole."""
+        mat = np.asarray(
+            self.data.site_xmat[int(self.foot_center_site_ids[int(foot)])],
+            dtype=float,
+        ).reshape(3, 3)
+        return float(np.arccos(np.clip(mat[2, 2], -1.0, 1.0)))
 
     def contact_jacobian(self, data: mujoco.MjData | None = None) -> np.ndarray:
         """Stacked linear Jacobians of the sole contact points, ``(3nc, nv)``."""
@@ -173,16 +197,23 @@ class G1Model:
 
     def site_bias_acc(self, site_id: int, qvel: np.ndarray) -> np.ndarray:
         """``J̇ q̇`` for one site via finite-differencing ``J q̇``."""
+        bias_lin, _ = self.site_spatial_bias_acc(site_id, qvel)
+        return bias_lin
+
+    def site_spatial_bias_acc(
+        self, site_id: int, qvel: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Linear and rotational ``J̇ q̇`` for one site, both world frame."""
         eps = 1e-6
-        jac = self.site_jacobian(site_id)
+        jacp, jacr = self.site_spatial_jacobian(site_id)
         s = self._scratch
         s.qpos[:] = self.data.qpos
         mujoco.mj_integratePos(self.model, s.qpos, qvel, eps)
         s.qvel[:] = qvel
         mujoco.mj_kinematics(self.model, s)
         mujoco.mj_comPos(self.model, s)
-        jac_next = self.site_jacobian(site_id, s)
-        return (jac_next - jac) @ qvel / eps
+        jacp_next, jacr_next = self.site_spatial_jacobian(site_id, s)
+        return (jacp_next - jacp) @ qvel / eps, (jacr_next - jacr) @ qvel / eps
 
     def com_inertia(self) -> np.ndarray:
         """Composite rigid-body rotational inertia about the CoM, world frame.

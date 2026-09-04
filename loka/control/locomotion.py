@@ -1,15 +1,21 @@
-"""Locomotion controller: centroidal MPC on top of a whole-body QP.
+"""Locomotion controller: convex SRBD MPC on top of a whole-body QP.
 
-    state ──► GaitScheduler   (500 Hz) ──► contacts, CoM reference, swing arc
-           ──► ConvexMPC       (50 Hz) ──► desired contact forces
+    state ──► GaitScheduler    (500 Hz) ──► contacts, CoM / DCM ref, swing Bézier
+           ──► ConvexMPC        (50 Hz) ──► desired contact forces (finite-foot)
            └► WholeBodyController (500 Hz) ──► joint torques
 
 The gait layer decides *who is on the ground and where the body should be*;
 standing is simply the case where it hands back both feet and a stationary
 reference. The MPC decides *how hard each foot should push* to track that
-centroidal reference. The WBC runs an order of magnitude faster and answers
-the different question of *what torques realise those forces* while keeping
-the planted feet still, the torso upright, and the swing foot on its arc.
+centroidal reference, with CoP constrained to the sole and airborne contacts
+on the Bézier. The WBC runs an order of magnitude faster and answers the
+different question of *what torques realise those forces* while keeping the
+planted feet still, the torso upright, and the swing foot on its arc.
+
+Papers: Di Carlo et al. IROS 2018 (this QP); Sleiman et al. TRO 2021 (CoP in
+the sole, not a nonlinear centroidal NLP); Galliker et al. Humanoids 2022
+(short horizon because the gait is the reference — we keep DCM + Bézier, not
+ocs2).
 
 Nothing here knows about MuJoCo simulation or DDS: feed it ``(qpos, qvel)`` and
 it returns 29 torques, so the same object drives the simulator today and a
@@ -28,12 +34,20 @@ import yaml
 
 from loka.control import tuning
 from loka.control.gait import (
+    EARLY_PLANT_S,
+    TOUCHDOWN_HEIGHT,
+    TOUCHDOWN_RADIUS,
     GAIT_PARAMETER_NAMES,
     MODE_WALK,
     GaitConfig,
     GaitScheduler,
 )
-from loka.control.mpc import CentroidalReference, CentroidalState, ConvexMPC, MPCConfig
+from loka.control.mpc import (
+    ConvexMPC,
+    CentroidalReference,
+    CentroidalState,
+    MPCConfig,
+)
 from loka.control.robot import (
     NUM_LEG_JOINTS,
     QPOS_JOINT0,
@@ -71,15 +85,40 @@ STANCE_YAW_WEIGHT = 30.0
 SWING_NULLSPACE_W = 4.0
 SWING_NULLSPACE_KD = 20.0
 
-#: The foot-centre task constrains position only, leaving the ankle free. These
-#: hold the sole flat so it lands on the whole footprint.
+#: The foot-centre task constrains position only, leaving the ankle free. Hold
+#: the sole to the stand pose on the way *up* so it does not flap; release
+#: pitch and roll on the descending arc and hand them to a world-flat
+#: orientation task so the four sites arrive together. Pinning them to the
+#: stand keyframe for the whole swing left the right sole on a toe; releasing
+#: them with no plane left them flopping. Hip yaw is not a landing DOF and
+#: stays held.
 SWING_ANKLE_KP = 200.0
 SWING_ANKLE_KD = 20.0
 SWING_ANKLE_W = 20.0
+SWING_ANKLE_RELEASE_S = 0.70
+
+#: Stance-knee singularity guard while walking. Planted-leg posture is
+#: damping only, which left the 24° stand flexion unheld and let the
+#: CoM-height task slam the knee through the −5° stop. A stiff keyframe
+#: hold stopped the vault but pinned the pelvis so the swing foot only
+#: cleared 8 mm. Two layers: a light bias at the keyframe, and a hard
+#: one-sided kick only when the knee is near the stop.
+STANCE_KNEE_MIN = 0.262  # 15 deg; emergency band
+STANCE_KNEE_KP = 150.0
+STANCE_KNEE_KD = 15.0
+STANCE_KNEE_W = 12.0
+STANCE_KNEE_STOP_KP = 800.0
+STANCE_KNEE_STOP_KD = 80.0
+STANCE_KNEE_STOP_W = 200.0
 
 #: Floor on the base task weight, so single support does not silently hand the
 #: torso over to the posture task.
 MIN_BASE_WEIGHT_SCALE = 0.4
+
+#: Lateral CoM stiffness as a fraction of ``kp_base_position`` while walking.
+#: The sole's leftover CoP travel is ~0.05 m/s²; kp=50 on a centimetre of
+#: error already spends that. Standing keeps the full gain.
+WALK_KP_XY_SCALE = 0.5
 
 
 @dataclass
@@ -99,6 +138,9 @@ class LocomotionConfig:
     max_angular_acc: float = 40.0
     max_joint_acc: float = 200.0
     max_swing_acc: float = 120.0
+    #: Cap on the late-swing sole-orientation acceleration [rad/s²]. Soft on
+    #: purpose: this should lay the sole down, not slap it.
+    max_swing_ang_acc: float = 80.0
     mpc: MPCConfig = field(default_factory=MPCConfig)
     wbc: WBCConfig = field(default_factory=WBCConfig)
     gait: GaitConfig = field(default_factory=GaitConfig)
@@ -191,6 +233,8 @@ class LocomotionTelemetry:
     #: commanded point on the swing arc [m]. Zero while both feet are planted.
     swing_clearance: float = 0.0
     swing_error: float = 0.0
+    #: Angle between the swing sole's +z and world +z [rad]. Zero is flat.
+    swing_tilt: float = 0.0
 
 
 class LocomotionController:
@@ -276,6 +320,10 @@ class LocomotionController:
         self.telemetry: LocomotionTelemetry | None = None
         self.gait = GaitScheduler(self.config.gait)
         self._last_gait = None
+        self._last_joint_weights = np.zeros(self.robot.nu)
+        self._last_swing_orient_active = False
+        self._last_knee_guard = np.zeros(2, dtype=bool)
+        self._last_com_z_scale = 1.0
 
     # -- references -------------------------------------------------------
 
@@ -298,25 +346,33 @@ class LocomotionController:
     def _contact_pos_preview(
         self,
         *,
-        foot_xy: np.ndarray,
+        foot_pose: np.ndarray,
         feet: np.ndarray,
         contact_pos: np.ndarray,
         ground_z: float,
     ) -> np.ndarray:
         """Sole-point positions over the MPC horizon, ``(horizon, nc, 3)``.
 
-        The gait plans foot *centres*; the MPC reasons about the eight sole
-        points, so each planned centre is re-decorated with the sole offsets
-        measured on the robot right now.
+        The gait plans foot *centres* (xy) plus Bézier clearance (z). The MPC
+        reasons about the eight sole points, so each planned centre is
+        re-decorated with the sole offsets measured on the robot right now.
+        Airborne sites sit at the swing height, not on the ground-height
+        foothold — ``fz`` is already gated to zero by the schedule.
         """
-        horizon = int(foot_xy.shape[0])
+        pose = np.asarray(foot_pose, dtype=float)
+        if pose.ndim != 3 or pose.shape[1:] != (2, 3):
+            # Back-compat if a caller still hands ``(horizon, 2, 2)`` xy.
+            xy = pose.reshape(-1, 2, 2)
+            pose = np.zeros((xy.shape[0], 2, 3))
+            pose[:, :, :2] = xy
+        horizon = int(pose.shape[0])
         per_foot = self.robot.num_contacts // 2
         offsets = contact_pos - np.repeat(feet, per_foot, axis=0)
         seq = np.zeros((horizon, self.robot.num_contacts, 3))
         for leg in (0, 1):
             rows = slice(leg * per_foot, (leg + 1) * per_foot)
-            seq[:, rows, :2] = foot_xy[:, leg, None, :] + offsets[None, rows, :2]
-            seq[:, rows, 2] = ground_z
+            seq[:, rows, :2] = pose[:, leg, None, :2] + offsets[None, rows, :2]
+            seq[:, rows, 2] = ground_z + pose[:, leg, 2, None]
         return seq
 
     def compute_torque(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
@@ -352,17 +408,26 @@ class LocomotionController:
         self._last_gait = gait_out
         walking = gait_out.walking
 
+        swing_accepted = False
         if walking:
             contact_mask = gait_out.contact_mask.copy()
             swing = gait_out.swing
-            if swing.active and swing.s > 0.75:
-                # Accept an early touchdown once the foot is essentially at its
-                # foothold; earlier than that a measured contact is a toe scuff,
-                # and honouring it would re-plant the foot mid-stride.
+            if swing.active and swing.s > EARLY_PLANT_S:
+                # Sleiman 6-DoF contact: a toe scuff is not a plant. Step 5
+                # used to drop the Cartesian task at s=0.83 with the centre
+                # 11 mm up and 21 mm short (6° pitched sole, one site in
+                # contact, xy inside TOUCHDOWN_RADIUS). The ZMP then jumped
+                # back onto a short foot and capture saturated.
                 rows = slice(0, 4) if swing.leg == 0 else slice(4, 8)
                 near = float(np.linalg.norm(feet[swing.leg, :2] - swing.foothold[:2]))
-                if measured_mask[rows].any() and near < 0.05:
+                seated = float(feet[swing.leg, 2] - ground_z) <= TOUCHDOWN_HEIGHT
+                if (
+                    seated
+                    and measured_mask[rows].any()
+                    and near < TOUCHDOWN_RADIUS
+                ):
                     contact_mask[rows] = True
+                    swing_accepted = True
             com_ref = np.array(
                 [
                     gait_out.com_ref_xy[0] + self.command.com_offset_xy[0],
@@ -391,12 +456,12 @@ class LocomotionController:
             schedule = None
             contact_pos_seq = None
             if walking:
-                legs_planted, foot_xy = self.gait.preview(
+                legs_planted, foot_pose = self.gait.preview(
                     horizon=cfg.mpc.horizon, dt=cfg.mpc.dt
                 )
                 schedule = np.repeat(legs_planted, robot.num_contacts // 2, axis=1)
                 contact_pos_seq = self._contact_pos_preview(
-                    foot_xy=foot_xy,
+                    foot_pose=foot_pose,
                     feet=feet,
                     contact_pos=dynamics.contact_pos,
                     ground_z=ground_z,
@@ -427,12 +492,28 @@ class LocomotionController:
 
         support = float(contact_mask.mean())
         wbc_cfg = cfg.wbc
+        # Vertical CoM stiffness tracks how much sole is actually planted.
+        # Standing (support = 1) is unchanged. Single support cannot hold
+        # stand height the way two feet can, and demanding it vaults the
+        # pelvis over the stance foot. Damping stays, so a drop is still
+        # caught; only the spring is relaxed. Lateral gain is lowered while
+        # walking so the QP does not spend the whole sole on an unachievable
+        # vref (see WALK_KP_XY_SCALE).
+        kp_xy = wbc_cfg.kp_base_position * (WALK_KP_XY_SCALE if walking else 1.0)
+        kp_com = np.array(
+            [
+                kp_xy,
+                kp_xy,
+                wbc_cfg.kp_base_position * support,
+            ]
+        )
         base_linear_acc = np.clip(
-            wbc_cfg.kp_base_position * (com_ref - dynamics.com)
+            kp_com * (com_ref - dynamics.com)
             - wbc_cfg.kd_base_position * (dynamics.com_vel - com_vel_ref),
             -cfg.max_linear_acc,
             cfg.max_linear_acc,
         )
+        self._last_com_z_scale = support
         yaw_quat = np.array(
             [np.cos(0.5 * face_yaw), 0.0, 0.0, np.sin(0.5 * face_yaw)]
         )
@@ -475,7 +556,9 @@ class LocomotionController:
 
         swing_jacobian = None
         swing_acc = None
-        if walking and gait_out.swing.active:
+        swing_orient_jacobian = None
+        swing_orient_acc = None
+        if walking and gait_out.swing.active and not swing_accepted:
             leg = int(gait_out.swing.leg)
             swing = gait_out.swing
 
@@ -484,22 +567,44 @@ class LocomotionController:
             # does the work and the gains only mop up residual error, so a
             # 0.25 s swing does not have to be conjured out of position error.
             site_id = int(robot.foot_center_site_ids[leg])
-            j_f = robot.site_jacobian(site_id)
+            j_f, j_w = robot.site_spatial_jacobian(site_id)
+            bias_lin, bias_ang = robot.site_spatial_bias_acc(site_id, qvel_arr)
             foot_vel = j_f @ qvel_arr
             swing_acc = np.clip(
                 swing.des_acc
                 + wbc_cfg.kp_swing_foot * (swing.des_pos - feet[leg])
                 + wbc_cfg.kd_swing_foot * (swing.des_vel - foot_vel)
-                - robot.site_bias_acc(site_id, qvel_arr),
+                - bias_lin,
                 -cfg.max_swing_acc,
                 cfg.max_swing_acc,
             )
             swing_jacobian = j_f
 
-            # The swing leg's joint rows become pure damping, so they condition
-            # the null space without arguing with the Cartesian task. The
-            # ankles are the exception: the foot-centre task leaves them free,
-            # and they decide whether the sole lands flat or on an edge.
+            # World-flat sole on the descending arc. Ankles are released in
+            # the same window so the QP can use them; the stand-pose hold is
+            # the wrong frame (pelvis-relative) and a limp ankle just flops.
+            if swing.s > SWING_ANKLE_RELEASE_S:
+                foot_quat = robot.site_quat(site_id)
+                des_quat = np.array(
+                    [np.cos(0.5 * face_yaw), 0.0, 0.0, np.sin(0.5 * face_yaw)]
+                )
+                err_world = quat_to_mat(foot_quat) @ orientation_error(
+                    foot_quat, des_quat
+                )
+                omega = j_w @ qvel_arr
+                swing_orient_acc = np.clip(
+                    wbc_cfg.kp_swing_orient * err_world
+                    - wbc_cfg.kd_swing_orient * omega
+                    - bias_ang,
+                    -cfg.max_swing_ang_acc,
+                    cfg.max_swing_ang_acc,
+                )
+                swing_orient_jacobian = j_w
+
+            # Damping-only null space, plus a hip-yaw hold so the foot stays
+            # square. Ankle pitch/roll stay pinned on the way up and are
+            # released past SWING_ANKLE_RELEASE_S so the orientation task
+            # owns the sole plane.
             j0 = leg * per_leg
             joint_acc[j0 : j0 + per_leg] = np.clip(
                 -SWING_NULLSPACE_KD * dqj[j0 : j0 + per_leg],
@@ -507,8 +612,32 @@ class LocomotionController:
                 cfg.max_joint_acc,
             )
             joint_weights[j0 : j0 + per_leg] = SWING_NULLSPACE_W
-            for local in (HIP_YAW, ANKLE_PITCH, ANKLE_ROLL):
-                hold_joint(j0 + local, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
+            hold_joint(j0 + HIP_YAW, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
+            if swing.s <= SWING_ANKLE_RELEASE_S:
+                for local in (ANKLE_PITCH, ANKLE_ROLL):
+                    hold_joint(j0 + local, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
+
+        knee_guard = np.zeros(2, dtype=bool)
+        if walking:
+            # After the swing overwrite so only planted knees are eligible.
+            for leg_i in (0, 1):
+                knee = leg_i * per_leg + KNEE
+                if state[knee] != 0:
+                    continue
+                if qj[knee] < STANCE_KNEE_MIN:
+                    hold_joint(
+                        knee,
+                        STANCE_KNEE_STOP_KP,
+                        STANCE_KNEE_STOP_KD,
+                        STANCE_KNEE_STOP_W,
+                    )
+                else:
+                    hold_joint(knee, STANCE_KNEE_KP, STANCE_KNEE_KD, STANCE_KNEE_W)
+                knee_guard[leg_i] = True
+
+        self._last_joint_weights = joint_weights
+        self._last_swing_orient_active = swing_orient_jacobian is not None
+        self._last_knee_guard = knee_guard
 
         solution = self.wbc.solve(
             dynamics,
@@ -525,6 +654,8 @@ class LocomotionController:
                 base_weight_scale=max(support, MIN_BASE_WEIGHT_SCALE),
                 swing_jacobian=swing_jacobian,
                 swing_acc=swing_acc,
+                swing_orient_jacobian=swing_orient_jacobian,
+                swing_orient_acc=swing_orient_acc,
             ),
             contact_mask=contact_mask,
         )
@@ -552,6 +683,9 @@ class LocomotionController:
                 float(np.linalg.norm(swing.des_pos - feet[swing.leg]))
                 if swing.active
                 else 0.0
+            ),
+            swing_tilt=(
+                float(robot.sole_tilt(swing.leg)) if swing.active else 0.0
             ),
         )
         return solution.torque
@@ -653,6 +787,8 @@ class LocomotionController:
             ):
                 self.gait.config.speed = 0.25
                 applied["gait.speed"] = 0.25  # crawl default; safer than 0.3 with lift
+            applied.update(self.gait.apply_speed_schedule())
+            self.config.gait = self.gait.config
             # Align facing with travel heading when starting a walk if yaw~0.
             if (
                 "gait.mode" in gait_applied

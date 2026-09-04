@@ -136,21 +136,33 @@ time, so the file itself stays plant-agnostic.
 ### 4.1 Control law
 
 ```text
-(qpos, qvel) ──► centroidal MPC (~50 Hz) ──► desired contact forces f*
-             └─► whole-body QP (~500 Hz) ──► 29 joint torques τ ──► MuJoCo
+LLM YAML (0.5–5 s)
+    gait.* Task_Targets  ──►  GaitScheduler (500 Hz)  ──►  contacts, DCM, Bézier
+                                    │
+                                    ▼
+(qpos, qvel) ──► ConvexMPC      (~50 Hz) ──► desired contact forces f*
+             └─► whole-body QP  (~500 Hz) ──► 29 joint torques τ ──► MuJoCo
 ```
 
-- **MPC:** single rigid-body CoM dynamics; optimises contact forces over a short
-  horizon subject to friction cones.
-- **WBC:** realises those forces with base / posture / contact tasks under
-  floating-base dynamics, friction, and torque limits (OSQP).
+- **Gait:** classical DCM / capture-point planner (`gait.py`). The LLM may set
+  mode, speed, heading, cadence, width; it never sets footholds. Omitted
+  cadence knobs follow `gait_schedule_for_speed`.
+- **MPC:** Di Carlo convex SRBD QP (`mpc.py`, `ConvexMPC`) with Sleiman-style
+  CoP-in-sole inequalities. Galliker et al. Humanoids 2022 is cited for the
+  short-horizon *because the gait is the reference* lesson, not the solver.
+  Same `solve(...) -> (nc, 3)` the WBC already consumed. Not ocs2, not
+  Sleiman centroidal NMPC, not whole-body torque NMPC.
+- **WBC:** realises those forces with base / posture / contact / swing tasks
+  under floating-base dynamics, friction, and torque limits (OSQP).
 - **API:** `compute_torque(qpos, qvel) → τ`. No EKF; sim uses ground-truth state
   (decision D7 in the integration plan).
 
-Typical undisturbed numbers (from plant eval / README): sub-millimetre CoM
-error, sub-degree tilt, sub-millisecond solves vs a ~2 ms budget. The hard
-ceiling without stepping is the capture point; large pushes need a future
-reflex / step module (Phase C / stretch), not more LLM latency.
+Typical undisturbed *standing* numbers (from plant eval / README): sub-millimetre CoM
+error, sub-degree tilt, sub-millisecond solves vs a ~2 ms budget. Walking is
+documented in `docs/walking.md`; the 8 s and 30 s limit-cycle gates are now
+required tests, not `xfail`.
+The hard ceiling without stepping is the capture point; large pushes need a
+step, not more LLM latency.
 
 ### 4.2 Task / command surface (`Task_Targets`)
 
