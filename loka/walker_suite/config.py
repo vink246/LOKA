@@ -13,7 +13,7 @@ from loka.walker_suite.faults import FORBIDDEN_RAW_KEYS, PERTURBATION_KINDS
 DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "walker_suite.yaml"
 )
-VALID_BASELINES = ("loka", "fixed_mpc")
+VALID_BASELINES = ("loka", "fixed_mpc", "dr_rl")
 
 
 @dataclass
@@ -63,6 +63,11 @@ class SuiteConfig:
     record_width: int = 1920
     record_height: int = 1080
     log_hz: float = 100.0
+    num_trials: int = 1
+    seed: int = 0
+    init_noise: float = 0.005
+    dr_rl_checkpoint: str | None = None
+    dr_rl_config: str | None = None
     defaults: EpisodeDefaults = field(default_factory=EpisodeDefaults)
     baselines: list[str] = field(default_factory=lambda: ["loka", "fixed_mpc"])
     tests: list[TestCase] = field(default_factory=list)
@@ -71,6 +76,21 @@ class SuiteConfig:
         payload = asdict(self)
         payload["output_dir"] = str(self.output_dir)
         return payload
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{label} must be an integer")
+    return int(value)
 
 
 def _require_mapping(raw: Any, label: str) -> dict:
@@ -143,6 +163,13 @@ def parse_suite_dict(raw: dict[str, Any]) -> SuiteConfig:
             )
         )
 
+    num_trials = _as_int(raw.get("num_trials", raw.get("numtrials", 1)), "num_trials")
+    if num_trials < 1:
+        raise ValueError("num_trials must be >= 1")
+    init_noise = float(raw.get("init_noise", 0.005))
+    if init_noise < 0.0:
+        raise ValueError("init_noise must be >= 0")
+
     return SuiteConfig(
         output_dir=Path(raw.get("output_dir", "results/walker")),
         record=bool(raw.get("record", True)),
@@ -151,6 +178,11 @@ def parse_suite_dict(raw: dict[str, Any]) -> SuiteConfig:
         record_width=int(raw.get("record_width", 1920)),
         record_height=int(raw.get("record_height", 1080)),
         log_hz=float(raw.get("log_hz", 100.0)),
+        num_trials=num_trials,
+        seed=_as_int(raw.get("seed", 0), "seed"),
+        init_noise=init_noise,
+        dr_rl_checkpoint=_optional_str(raw.get("dr_rl_checkpoint")),
+        dr_rl_config=_optional_str(raw.get("dr_rl_config")),
         defaults=defaults,
         baselines=baselines,
         tests=tests,
@@ -216,6 +248,29 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
     elif getattr(args, "record", None) is True:
         record = True
 
+    num_trials = config.num_trials
+    if getattr(args, "num_trials", None) is not None:
+        num_trials = _as_int(args.num_trials, "--num-trials")
+        if num_trials < 1:
+            raise ValueError("--num-trials must be >= 1")
+
+    seed = config.seed
+    if getattr(args, "seed", None) is not None:
+        seed = _as_int(args.seed, "--seed")
+
+    init_noise = config.init_noise
+    if getattr(args, "init_noise", None) is not None:
+        init_noise = float(args.init_noise)
+        if init_noise < 0.0:
+            raise ValueError("--init-noise must be >= 0")
+
+    dr_rl_checkpoint = config.dr_rl_checkpoint
+    if getattr(args, "dr_rl_checkpoint", None):
+        dr_rl_checkpoint = _optional_str(args.dr_rl_checkpoint)
+    dr_rl_config = config.dr_rl_config
+    if getattr(args, "dr_rl_config", None):
+        dr_rl_config = _optional_str(args.dr_rl_config)
+
     return SuiteConfig(
         output_dir=output_dir,
         record=record,
@@ -224,6 +279,11 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
         record_width=config.record_width,
         record_height=config.record_height,
         log_hz=config.log_hz,
+        num_trials=num_trials,
+        seed=seed,
+        init_noise=init_noise,
+        dr_rl_checkpoint=dr_rl_checkpoint,
+        dr_rl_config=dr_rl_config,
         defaults=defaults,
         baselines=baselines,
         tests=tests,

@@ -227,7 +227,9 @@ def _format_directive_section(sections: TelemetrySections):
     lines = [
         "3. SYSTEM ORCHESTRATOR DIRECTIVE",
         f"Diagnose using the {source_text}. "
-        "Update the YAML scratchpad to rewrite MPC parameters and, if needed, Error_Tracking.\n",
+        "Update the YAML scratchpad to rewrite MPC parameters and, if the plant "
+        "or environment no longer matches the nominal model, Model_Mutations "
+        "(MPC belief: gear / friction / mass / com) and Error_Tracking.\n",
     ]
     return "\n".join(lines) + "\n"
 

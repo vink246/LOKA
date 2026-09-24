@@ -8,14 +8,9 @@
 \usepackage{xcolor}
 \usepackage{booktabs}
 
-\graphicspath{{figures/}}
-
-\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
-    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
-
 \begin{document}
 
-\title{LLM-Orchestrated Kinematic Adaptation (LOKA): An Immune System for Dynamic Humanoid Locomotion}
+\title{LLM-Orchestrated Kinematic Adaptation (LOKA): A Proactive Neuro-Symbolic Immune System for Dynamic Humanoid Locomotion}
 
 \author{\IEEEauthorblockN{Vineet Kulkarni}
 \IEEEauthorblockA{\textit{School of Interactive Computing} \\
@@ -29,7 +24,7 @@ vkulkarni46@gatech.edu}
 Atlanta, Georgia, USA \\
 nitishsontakke@gatech.edu}
 \and
-\IEEEauthorblockN{Dr.\ Sehoon Ha (Advisor)}
+\IEEEauthorblockN{Dr. Sehoon Ha (Advisor)}
 \IEEEauthorblockA{\textit{School of Interactive Computing} \\
 \textit{Georgia Institute of Technology}\\
 Atlanta, Georgia, USA \\
@@ -39,29 +34,139 @@ sehoonha@gatech.edu}
 \maketitle
 
 \begin{abstract}
-Translating the semantic reasoning capabilities of foundation models into the high-frequency control signals required for robotic systems remains a critical challenge.
-Existing paradigms face significant architectural barriers: monolithic Vision-Language-Action (VLA) models struggle to adapt to novel task combinations in long-horizon domains; offline Domain Randomization (DR) leaves a persistent deployment gap under unexpected physical alterations; and autoregressive Large Language Model (LLM) code-generation frameworks introduce latencies that are fatal to dynamic bipedal balancing.
-This paper introduces LLM-Orchestrated Kinematic Adaptation (LOKA), a hybrid neuro-symbolic control architecture for real-time humanoid stabilization and gait discovery.
-LOKA decouples low-frequency semantic reasoning from high-frequency physical optimization through an asynchronous dual-rate execution engine.
-An intermediate Telemetry Compressor monitors motor effort and mission criteria, filtering raw high-frequency data into dense semantic trend tags.
-Upon detecting internal or environmental anomalies or an operator language request, a language model acts as an online system-identification engine via a structured YAML scratchpad.
-Rather than generating high-latency policy code, the orchestrator mutates the objective landscape, task targets, success criteria, and kinematic assumptions referenced by an active Model Predictive Controller (MPC).
-By bridging qualitative inference with quantitative optimal control, LOKA targets zero-shot physical adaptation under structural degradation and extreme environmental transitions.
+Translating the semantic reasoning capabilities of foundation models into the high-frequency control signals required for underactuated humanoids remains a critical challenge. Existing paradigms face significant architectural barriers. Monolithic Vision-Language-Action (VLA) models lack compositional generalization and require costly inference at every timestep. Pure Domain Randomized (DR) Reinforcement Learning produces policies robust to expected perturbations but fundamentally lacks the semantic interface required for natural language command or zero-shot adaptation to unmodeled catastrophic faults. Alternatively, Agentic Skill Discovery frameworks rely on foundation models to select from a massive repository of pretrained discrete skills, resulting in exorbitant offline training overhead. 
+
+This thesis introduces LLM-Orchestrated Kinematic Adaptation (LOKA), a hybrid neuro-symbolic control architecture designed for real-time humanoid stabilization. LOKA treats physical disturbances as a bipartite problem. High-frequency dynamic impulses (e.g., sudden shoves) are absorbed by a fast-loop baseline controller combining Model Predictive Control (MPC) with Residual Reinforcement Learning. Concurrently, low-frequency morphological shifts (e.g., actuator degradation or asymmetrical payloads) are handled by an asynchronous Large Language Model (LLM). Triggered by an intermediate Telemetry Compressor that monitors control-effort anomalies, the orchestrator acts as an online system identification engine. Rather than selecting discrete skills or generating high-latency code, LOKA directly morphs the continuous objective landscape and kinematic assumptions of the active MPC via a structured YAML interface. This enables zero-shot physical adaptation with drastically reduced computational overhead compared to contemporary learning paradigms. Preliminary results on the Unitree G1 humanoid validate the framework's ability to autonomously adapt posture and maintain stability under unmodeled asymmetrical loading.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Vision-Language Models, Embodied AI, Kinematic Adaptation, Model Predictive Control, Humanoid Robotics
+Vision-Language Models, Embodied AI, Kinematic Adaptation, Model Predictive Control, Residual Reinforcement Learning, Humanoid Robotics
 \end{IEEEkeywords}
 
-\input{sections/01_introduction}
-\input{sections/02_related_work}
-\input{sections/03_method}
-\input{sections/04_experiments}
-\input{sections/05_discussion}
-\input{sections/06_conclusion}
+\section{Introduction}
+The pursuit of artificial general intelligence within the physical realm has catalyzed a transition from narrow control loops to broad generalist policies. At the forefront of this evolution is the integration of foundation models into robotic control architectures. Safely translating high-level cognitive reasoning into the continuous control signals required for dynamically balancing underactuated humanoids remains a formidable engineering challenge due to the latency inherent to Large Language Models (LLMs).
 
-\input{sections/A_appendix}
+Robotic systems deployed in the real world face two distinct classes of physical disturbances: high-frequency dynamic impulses (such as a sudden lateral shove or tripping over a curb) and low-frequency morphological shifts (such as a seized actuator, slipping on ice, or carrying an asymmetrical payload). Current paradigms attempting to address these disturbances exhibit severe operational trade-offs. 
 
-\input{sections/references}
+Monolithic Vision-Language-Action (VLA) models map perception directly to actions but struggle to generalize behavior compositionally, making them highly prone to compounding errors during long-horizon execution \cite{OpenVLA, ACT_VLA}. Furthermore, they require computationally expensive inference at every control tick. Conversely, traditional trajectory optimization and Model Predictive Control (MPC) yield precise execution over short horizons but are brittle to unmodeled structural modifications \cite{MPC_Rigidity}. 
+
+To handle out-of-distribution variations, modern systems rely heavily on Domain Randomization (DR) in Reinforcement Learning \cite{TobinDR}. While DR yields policies that easily absorb high-frequency impulses, it requires intense perturbation crafting and massive offline training sessions. More importantly, DR policies cannot be commanded zero-shot using natural language. To bridge language and control, recent Agentic Skill Discovery frameworks utilize foundation models to select from pre-compiled libraries of discrete RL skills \cite{ASD}. While robust, this approach requires training a separate building block for every possible operational mode, severely limiting online adaptability.
+
+To resolve these limitations, this thesis introduces LLM-Orchestrated Kinematic Adaptation (LOKA). LOKA opts for an architecture capable of morphing a few continuous control blocks on the fly rather than selecting from thousands of discrete pretrained skills. The key contributions of this proposed research are:
+\begin{itemize}
+\item \textbf{Neuro-Symbolic Fast-Slow Architecture:} A dual-rate paradigm isolating high-frequency impulse rejection (managed by a Residual RL-augmented MPC) from low-frequency morphological adaptation (managed by an asynchronous LLM).
+\item \textbf{Effort-Driven Telemetry Compression:} An intermediate middleware node that continuously monitors actuator torque deficits. It delta-masks nominal behavior and synthesizes physical anomalies into compressed semantic strings to trigger the cognitive model preemptively.
+\item \textbf{Continuous Parameter Malleability:} A structured YAML scratchpad interface granting the language model direct authority to tune objective costs, virtual amputations, and the physical self-awareness of the active controller without generating high-latency execution code.
+\end{itemize}
+
+\section{Related Work and Literature Review}
+To position LOKA within the current robotics landscape, we analyze related architectures across four primary research domains.
+
+\subsection{Agentic Skill Discovery versus Parameter Mutation}
+Bridging the semantic reasoning of LLMs with low-level robotic control is increasingly managed through hierarchical skill chaining. Frameworks such as Agentic Skill Discovery (ASD) utilize language models to autonomously generate tasks, reward functions, and success criteria to incrementally build a library of discrete robotic skills via reinforcement learning \cite{ASD}. During deployment, the LLM selects the appropriate pretrained skill to overcome environmental obstacles. While this guarantees the execution of robust behaviors, it requires an exhaustive offline training pipeline to populate the skill repository. LOKA eliminates the need for massive discrete skill libraries by utilizing continuous parameter mutation. Instead of swapping neural network weights for a new task, the orchestrator morphs the cost parameters and kinematic targets of a generalized optimal controller, synthesizing novel gaits zero-shot.
+
+\subsection{Residual Reinforcement Learning and MPC}
+Classical Model Predictive Control provides interpretable locomotion grounded in physical constraints but suffers under extreme model mismatch. To enhance the robustness of model-based controllers against high-frequency impulses, recent architectures have blended MPC with Reinforcement Learning. Frameworks such as RuN decompose humanoid control by pairing a natural motion prior with a lightweight residual RL policy to handle complex dynamical interactions \cite{RuN}. Similarly, Residual MPC architectures tightly integrate GPU-parallelized optimal control with RL at the torque level, allowing the residual policy to make targeted high-frequency corrections to the MPC output \cite{ResidualMPC}. LOKA adopts this hybrid approach for its fast loop, ensuring the humanoid can physically withstand sudden dynamic shoves while the asynchronous LLM computes necessary macro-level morphological adjustments.
+
+\subsection{Slow-Fast Orchestration and Online Fault Recovery}
+Decoupling symbolic cognitive reasoning from reactive physical stabilization has been explored across multiple domains. The AESOP framework utilizes a high-frequency anomaly classifier to trigger a slow generative LLM reasoner, relying on an MPC to preserve physical feasibility during the reasoning latency gap \cite{AESOP}. The REFLECT framework processes multisensory log data into a natural language summary to enable an LLM to explain manipulation failures \cite{REFLECT}. While structurally related, LOKA's Telemetry Compressor monitors high-frequency proprioceptive effort streams to execute preemptive online adjustments before a failure formally occurs. Online parameter modification has also been explored in wheeled robotics. The Hey Robot! framework uses an LLM to modulate objective cost weights based on human preferences for mobile navigation \cite{HeyRobot}. LOKA scales this authority from preferential wheeled navigation to mission-critical bipedal survival, allowing structural modifications to the solver's internal body model.
+
+\subsection{Language-to-Rewards and Code Generation}
+The dominant paradigm for online orchestration relies on generating executable Python code. The ASPIRE framework distills successful debugging sessions into a reusable text-based skill library using programmatic synthesis for manipulation tasks \cite{ASPIRE}. Similarly, the Language to Rewards (L2R) framework translates text descriptors into functional reward scripts optimized by an MPC \cite{Lang2Reward}. While expressive, these systems are fundamentally bounded by the autoregressive code generation bottleneck, exposing the system to syntax failures and unrecoverable latency during runtime anomalies. LOKA diverges by replacing code generation entirely with a strictly typed YAML parameter matrix.
+
+\section{Methodology: The LOKA Architecture}
+LOKA operates as a continuous cognitive system identification loop. The pipeline consists of four tightly coupled phases executed across an asynchronous multi-threaded architecture to handle both dynamic impulses and morphological shifts.
+
+\subsection{Phase 1: Preemptive Telemetry Compression}
+Traditional orchestrators trigger adaptation based on macro-tracking errors, which in bipedal locomotion indicates the robot is already falling. LOKA shifts the trigger mechanism to monitor control effort divergence. The low-level controller continually calculates an optimal control input vector. The Telemetry Compressor calculates the Effort Deviation Integral ($E_{dev}$) over a sliding temporal window of length $W$:
+\begin{equation}
+E_{dev} = \int_{t-W}^{t} \| u_{\text{actual}}(\tau) - u_{\text{nominal}}(\tau) \|^2 d\tau
+\label{eq:effort}
+\end{equation}
+When $E_{dev}$ violates a strict safety boundary, it indicates the robot is over-exerting its actuators to maintain the limit cycle due to an unmodeled physical change. The Compressor freezes the high-frequency telemetry buffer, delta-masks nominal state variables, and synthesizes the anomaly into clear semantic tags. A joint exhibiting maximum torque saturation but near-zero joint velocity is tagged as \texttt{[SATURATED\_SEIZED]}. High torque coupled with erratic velocity is tagged as \texttt{[SATURATED\_FLAILING]}.
+
+\subsection{Phase 2: Asynchronous Fast-Slow Execution}
+To resolve the latency-stability paradox, LOKA isolates execution threads. The main physics loop executes synchronously at 500 Hz. Within this fast loop, a Single Rigid Body Dynamics (SRBD) MPC calculates optimal ground reaction forces. To ensure the robot can survive sudden physical perturbations while waiting for LLM intervention, the MPC is augmented by a lightweight Residual RL policy operating at the torque level \cite{ResidualMPC}. This guarantees robust high-frequency impulse rejection.
+
+Concurrently, the slow cognitive loop operates on a background thread. When an anomaly is flagged, the worker constructs the semantic prompt and dispatches it to the LLM orchestrator. The physics simulation continues to execute the baseline tracking policy unhindered until the LLM completes inference and injects the updated parameter constraints into the shared memory state.
+
+\subsection{Phase 3: The YAML Scratchpad}
+The communication interface between the slow reasoning thread and the fast execution thread is mediated by a strictly typed YAML Scratchpad. The underlying MPC minimizes a quadratic objective function:
+\begin{equation}
+J = \sum_{k=0}^{N-1} \left( \| x_k - x_{\text{ref}} \|_Q^2 + \| u_k \|_R^2 \right) + \| x_N - x_{\text{ref}} \|_P^2
+\label{eq:mpc_obj}
+\end{equation}
+The LLM mutates this optimization landscape by returning a formatted block structured across three key sections. The \texttt{Semantic\_State} enforces chain-of-thought reasoning by requiring a diagnostic hypothesis. The \texttt{Controller\_Targets} map language goals directly to the diagonal weights of the $Q$ and $R$ matrices. Crucially, the \texttt{Model\_Mutations} section allows the LLM to rewrite physical properties, such as the \texttt{actuator\_gear} ratio or expected surface friction coefficients, updating the physical self-awareness of the active controller.
+
+\subsection{Phase 4: Low-Level Affordance Clamping}
+Before the LLM's targets are applied to the active MPC, they pass through a deterministic affordance filter. If the language model outputs a parameter that violates hard kinematic constraints, the filter clamps the target value to the nearest physical boundary. If a joint is mutated to a gear ratio of $0.0$ via a virtual amputation directive, the middleware calls a custom masking module to zero-out all subsequent control signals directed to that specific actuator, forcing the solver to discover alternative locomotion strategies using the remaining functional links.
+
+\section{Experimental Design and Evaluation}
+We evaluate the LOKA framework within the MuJoCo physics simulation environment utilizing the Unitree G1 humanoid robot. 
+
+\subsection{Preliminary Results}
+Initial proof-of-concept testing successfully validated the LOKA parameter mutation architecture. In a planar walker environment, LOKA demonstrated the ability to recover from a total actuator fault (0 torque) in seconds by successfully identifying the failing joint via telemetry and modifying the internal physics model, a scenario where traditional MPC completely collapses. Subsequently, the SRBD MPC combined with a Whole-Body Controller was successfully integrated with the Unitree G1. When asymmetrical weight was introduced during standing tests, the LLM orchestrator successfully diagnosed the effort divergence and adapted the robot's target posture, yielding significantly higher push resistance compared to the un-orchestrated baseline.
+
+\subsection{Evaluation Scenarios}
+To rigorously validate LOKA's ability to automate robust formulation across varying physical environments and high-frequency impulses, the system is subjected to the following experimental tasks:
+\begin{itemize}
+\item \textbf{Asymmetrical Weight and Push Recovery:} An unmodeled mass equivalent to 35\% of the robot's total weight is attached asymmetrically to the shoulder mid-stride. The system must adapt its center of mass to stabilize the load. Subsequently, a lateral 100N impulse is applied for 0.2 seconds to validate the fast-loop Residual RL's ability to prevent a fall under modified constraints.
+\item \textbf{Friction Shift:} The global surface friction coefficient is instantaneously stepped down from a nominal value of $1.0$ to $0.1$ to evaluate real-time environmental adaptation.
+\item \textbf{Hardware Failure:} A hard fault is programmatically injected into the right hip actuator, setting its physical torque capacity to zero to validate the virtual amputation pipeline and zero-shot recovery.
+\item \textbf{Semantic Terrain:} The robot is given a language instruction to navigate a corridor featuring a low overhanging ceiling followed by elevated rubble blocks, testing the translation of semantic goals into kinematic constraints.
+\end{itemize}
+
+\subsection{Quantitative Performance Metrics}
+The framework is evaluated using a comprehensive suite of metrics designed to capture both computational efficiency and physical robustness:
+\begin{itemize}
+\item \textbf{Effort Deviation Integral ($E_{dev}$):} As defined in Equation \ref{eq:effort}, this measures the accumulated wasted control effort. It serves to mathematically quantify the efficiency of the cognitive adaptation. A standard controller may survive a mass shift by maxing out motor torques, resulting in massive $E_{dev}$. Successful LOKA mutation re-aligns the physical assumptions, returning $E_{dev}$ to baseline and preventing motor burnout.
+\item \textbf{Task Success Rate (TSR):} The binary percentage of execution trials where the robot successfully recovers from a perturbation or reaches a spatial boundary without falling.
+\item \textbf{Time to Stabilization ($T_s$):} The duration in seconds between the initialization of an anomaly and the restoration of a steady-state gait cycle.
+\item \textbf{Maximum Push-Force Resistance:} The peak lateral impulse (in Newtons) the robot can withstand without a catastrophic fall while carrying asymmetrical loads.
+\item \textbf{Computational Overhead:} A comparative analysis of inference time, FLOPs, and memory allocation requirements between LOKA's parameter mutation engine and traditional VLA execution.
+\end{itemize}
+
+\subsection{Comparative Baseline Matrix}
+LOKA is benchmarked against implementations of baseline paradigms. The vanilla MPC provides a static baseline. The Agentic Skill Discovery baseline evaluates the latency and memory overhead of retrieving discrete pretrained RL skills for out-of-distribution faults \cite{ASD}. The pure Domain Randomized RL baseline demonstrates the limitation of relying solely on expected perturbations without structural awareness. The code-as-policy baseline replicates the synchronous programmatic synthesis approach to isolate compilation latency bottlenecks \cite{ASPIRE}. The expected performance breakdown is summarized in Table I.
+
+\begin{table}[h]
+\centering
+\caption{Baseline Performance Matrix across Evaluation Scenarios}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}llcccc@{}}
+\toprule
+\textbf{Architecture} & \textbf{Baseline Implementation} & \textbf{Load+Push} & \textbf{Ice} & \textbf{Seized Joint} & \textbf{Gauntlet} \\ \midrule
+Vanilla MPC & Reference-Tracking MPC & Fail & Fail & Fail & Fail \\
+DR RL & Pure Domain Randomized PPO & Partial & Partial & Fail & Fail \\
+Agentic Skills & Discrete Skill Selection \cite{ASD} & Pass* & Pass* & Fail & Pass \\
+Code-as-Policy & Programmatic Synthesis \cite{ASPIRE} & Fail & Fail & Fail & Pass \\
+\textbf{LOKA (Ours)} & \textbf{Asynchronous Mutation Engine} & \textbf{Pass} & \textbf{Pass} & \textbf{Pass} & \textbf{Pass} \\ \bottomrule
+\multicolumn{6}{l}{\footnotesize *Pass condition highly dependent on presence of exact skill in pretrained repository.}
+\end{tabular}%
+}
+\end{table}
+
+\section{Conclusion}
+LLM-Orchestrated Kinematic Adaptation provides a deterministic, neuro-symbolic bridge between high-level semantic reasoning and low-level optimal control. By isolating high-frequency impulse rejection from low-frequency morphological adaptation, LOKA drastically reduces computational overhead while enabling true zero-shot physical recovery for underactuated humanoids.
+
+\begin{thebibliography}{00}
+\bibitem{PhysionGap} Anonymous et al., ``Probing the physical dynamics of Vision-Language Models,'' \textit{arXiv preprint arXiv:2510.06251}, 2025.
+\bibitem{TobinDR} J. Tobin et al., ``Domain randomization for transferring deep neural networks from simulation to the real world,'' in \textit{IROS}, 2017.
+\bibitem{OpenVLA} M. Kim et al., ``OpenVLA: An Open-Source Vision-Language-Action Model,'' \textit{arXiv preprint arXiv:2406.09246}, 2024.
+\bibitem{ACT_VLA} Anonymous et al., ``Unleashing More Actions via Action Compositional Training for VLA Models,'' \textit{arXiv preprint arXiv:2607.00351}, 2026.
+\bibitem{ASD} X. Zhao et al., ``Agentic Skill Discovery,'' \textit{arXiv preprint arXiv:2405.15019}, 2024.
+\bibitem{RuN} Anonymous et al., ``RuN: A Decoupled Residual Learning Framework for Humanoid Locomotion,'' \textit{arXiv preprint arXiv:2509.20696}, 2025.
+\bibitem{ResidualMPC} Anonymous et al., ``Residual MPC: Blending Reinforcement Learning with GPU-Parallelized Model Predictive Control,'' \textit{IEEE Robotics and Automation Letters}, 2025.
+\bibitem{MPC_Rigidity} Anonymous et al., ``Analysis of Model Predictive Control in Changing Kinematic Environments,'' \textit{Placeholder Citation}, 2025.
+\bibitem{Lang2Reward} W. Yu et al., ``Language to Rewards for Robotic Skill Synthesis,'' in \textit{CoRL}, 2023.
+\bibitem{AESOP} Anonymous et al., ``Real-Time Anomaly Detection and Reactive Planning with LLMs (AESOP),'' in \textit{RSS}, 2024.
+\bibitem{REFLECT} Anonymous et al., ``REFLECT: Summarizing Robot Experiences for Failure Explanation and Correction,'' in \textit{CoRL}, 2023.
+\bibitem{RobotxR1} Anonymous et al., ``RobotxR1: Embodied Robotic Intelligence via Closed-Loop RL on LLMs,'' \textit{arXiv preprint arXiv:2505.03238}, 2025.
+\bibitem{Recover} Anonymous et al., ``Recover: A Neuro-Symbolic Framework for Failure Detection and Recovery,'' \textit{arXiv preprint arXiv:2404.00756}, 2024.
+\bibitem{AsyncDriver} Anonymous et al., ``AsyncDriver: Asynchronous LLM-Enhanced Planner for Autonomous Driving,'' in \textit{ECCV}, 2024.
+\bibitem{FiS-VLA} Anonymous et al., ``Fast-in-Slow (FiS-VLA): A Dual-System Foundation Model,'' \textit{arXiv preprint arXiv:2506.01953}, 2025.
+\bibitem{HeyRobot} Anonymous et al., ``Hey Robot! Personalizing Robot Navigation through MPC with an LLM,'' in \textit{ICRA}, 2025.
+\bibitem{ASPIRE} Anonymous et al., ``Agentic Skill Programming through Iterative Robot Exploration (ASPIRE),'' \textit{NVIDIA GEAR Lab}, 2026.
+\end{thebibliography}
 
 \end{document}

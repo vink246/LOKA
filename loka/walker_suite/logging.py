@@ -114,6 +114,7 @@ class EpisodeLogger:
         mpc_snapshots: list[dict[str, Any]],
         loka_turns: list[dict[str, Any]],
         obstacle_overlay: dict[str, Any] | None = None,
+        visual_overlay: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         meta_path = self.directory / "metadata.json"
         meta_path.write_text(
@@ -151,6 +152,7 @@ class EpisodeLogger:
                     times=times,
                     out_path=video_path,
                     obstacle=obstacle_overlay,
+                    visual=visual_overlay if visual_overlay is not None else obstacle_overlay,
                     camera=self.record_camera,
                     fps=self.record_fps,
                     width=self.record_width,

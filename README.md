@@ -104,12 +104,87 @@ MJPC weight API smoke test (needs `mujoco_mpc` installed):
 python tests/test_weights.py
 ```
 
+## Walker perturbation suite
+
+The suite walks the biped toward a distance goal under each configured plant perturbation, once per baseline. MuJoCo's integrator is deterministic, so trials would otherwise be copies of each other. Each trial draws a seeded initial state: `Uniform(-init_noise, init_noise)` on `qpos` and `qvel` after the nominal reset (`init_noise` defaults to `0.005`, the same half-width as DR-RL reset noise). Trial `k` uses `seed + k` for every baseline, so LOKA, fixed MJPC, and DR-RL start from the same pose on that trial and a different pose on the next one. Set `init_noise: 0` to freeze the spawn pose.
+
+`num_trials` defaults to `1`. The YAML key `numtrials` is accepted as an alias.
+
+```bash
+conda activate loka
+cd LOKA
+python -m loka.run_walker_suite \
+  --baselines loka,fixed_mpc,dr_rl \
+  --num-trials 5
+```
+
+A shorter slice:
+
+```bash
+python -m loka.run_walker_suite \
+  --tests nominal,ice \
+  --baselines fixed_mpc \
+  --num-trials 2 \
+  --timeout 12 \
+  --no-record
+```
+
+Other flags: `--tests`, `--baselines`, `--goal-distance`, `--perturbation-time`, `--timeout`, `--speed-goal`, `--seed`, `--init-noise`, `--dr-rl-checkpoint`, `--dr-rl-config`, `--output-dir`, `--no-record`. Config defaults live in `loka/config/walker_suite.yaml`.
+
+The `dr_rl` baseline reads `dr_rl_checkpoint` and `dr_rl_config` from that file. Either may be null. A checkpoint path is a zip or a directory containing one; the config path is the DR-RL training YAML, and it has to match that policy. When a field is null, `LOKA_DR_RL_CHECKPOINT` / `LOKA_DR_RL_CONFIG` still apply, then `loka/dr_rl/config.yaml`.
+
+```yaml
+dr_rl_checkpoint: results/dr_rl/checkpoints/ppo_walker_500000_steps.zip
+dr_rl_config: loka/dr_rl/config.yaml
+```
+
+Each run writes `results/walker/<timestamp>/`. Every trial is its own folder, including the video when recording is on:
+
+```text
+results/walker/<timestamp>/
+├── config.resolved.yaml
+├── summary.json
+├── summary.csv
+├── statistics.json
+├── statistics.csv
+├── plots/
+│   ├── ice_metrics.png
+│   └── ice_rms_over_time.png
+└── ice__loka/
+    ├── trial_00/
+    │   ├── episode.mp4
+    │   ├── timeseries.csv
+    │   ├── timeseries.npz
+    │   └── metadata.json
+    └── trial_01/
+```
+
+After the trials of one test and baseline finish, the runner prints that condition's averages. When the whole grid is done it writes `statistics.json` / `statistics.csv` and one pair of charts per perturbation:
+
+- **Bar chart** (`<test>_metrics.png`): success rate, task completion time, time to recovery, and RMS error. Baseline is on the x axis. Error bars are the sample standard deviation across trials. The RMS panel groups height, speed, and the combined residual.
+- **Line chart** (`<test>_rms_over_time.png`): 0.5 s rolling RMS of height error, speed error, and the combined residual. One line per baseline (mean across trials, band is the trial standard deviation).
+
+Definitions, all taken from the 100 Hz log:
+
+| Metric | Definition |
+|--------|------------|
+| Success rate | Fraction of trials that reach the distance goal. A fall does not end the episode. |
+| Task completion time | Mean `t_end` among successful trials. Timeouts are left out of this average. |
+| Height RMS | RMS of torso height minus the Height Goal (1.2 m). |
+| Pitch RMS | RMS of torso pitch minus upright (0 rad). |
+| Speed RMS | RMS of forward speed minus the speed goal (default 1 m/s). |
+| Combined RMS | `sqrt(mean(e_height² + e_pitch² + e_speed²))`. |
+| Time to recovery | Longest interval from a fail sample until the walker is nominal again. Nominal means not fallen and inside the tracking-error band, held for 0.5 s. Standing up without that hold does not end the interval, and a brief dip under the deadband does not either. The first second after spawn is ignored. If the episode ends before the hold, the open interval runs to the end of the log. A trial that never fails after the first second scores 0. |
+
 ## Project map
 
 | Path | Role |
 |------|------|
 | `main.py` | Sim loop, viewer, failure/operator dispatch |
 | `loka/` | Orchestrator, telemetry compression, sessions, model mutations |
+| `loka/dr_rl/` | Domain-randomized PPO walker baseline (Gymnasium + SB3, native MuJoCo) |
+| `loka/walker_suite/` | Perturbation suite: seeded trials, logs, videos, statistics, plots |
+| `loka/config/walker_suite.yaml` | Default tests, baselines, `num_trials`, seed, and recording |
 | `models/walker/` | Default Walker MJCF / task XML |
 | `system_prompt.txt` | LLM policy for YAML scratchpad edits |
 | `environment.yml` | Conda env for this project |

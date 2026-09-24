@@ -1,0 +1,122 @@
+# Domain-randomized PPO walker (native MuJoCo, same plant as LOKA).
+# Eval faults (dead hip gear=0, ice mu=0.2, backpack +25%) are intentionally
+# outside these ranges so the suite comparison stays out-of-distribution.
+
+xml_path: null  # default: models/walker/task.xml
+frame_skip: 4          # 0.0025 s physics * 4 = 0.01 s policy dt (MJPC agent_timestep)
+max_episode_steps: 1000
+speed_goal: 1.0
+reset_noise_scale: 0.005
+
+reward:
+  # Gymnasium Walker2d-v5 base (what SB3 Zoo / CleanRL actually train):
+  #   r = 1*vx + 1*alive - 1e-3 ||a||^2
+  # At 1 m/s that is ~2/step, ~2000/episode. Zoo checkpoints score 2300-4500
+  # because Gym does not cap speed. Overspeed is our extra so 2 m/s loses.
+  forward_weight: 1.0
+  overspeed_weight: 3.0     # r(1)=1, r(2)=2-3=-1
+  healthy_bonus: 1.0
+  healthy_min_speed: 0.0
+  ctrl_cost: 0.001          # Gym Walker2d
+  action_rate: 0.001
+  pitch_cost: 1.0
+  pitch_rate: 0.05
+  pitch_deadband: 0.25      # rad; suite pitch tol is 0.35
+  height_target: 1.2
+  height_cost: 4.0          # deadband does the shaping; 25 made every fall −40
+  height_deadband: 0.10     # free bob in [1.10, 1.30] m
+  vz_cost: 0.0
+  # Both feet off. Keep small so a stumble is not a −40 episode.
+  flight_cost: 0.25
+  # Isaac Lab H1: feet_slide weight 0.25. Dense anti-shuffle; stride is sparse.
+  slip_weight: 0.25
+  slip_deadband: 0.15       # m/s; ignore contact-point jitter
+  # Pay swing time on touchdown if the other foot supported the step. Cap so
+  # a late tap cannot jackpot; ignore contact chatter below min_stride.
+  # Do not wait for both feet — that delayed the only positive gait signal
+  # and made a first step worse than a dive.
+  stride_weight: 2.0
+  min_stride: 0.08
+  stride_cap: 0.40
+  # Unitree G1 foot_clearance_reward. Weight 0.5 (G1 uses 1.0 on a different
+  # scale). Planted feet with ~0 speed score ~1; a low sliding foot scores less.
+  clearance_weight: 0.5
+  clearance_target: 0.10    # m, foot body world z (planted is ~0.05)
+  clearance_std: 0.05
+  clearance_tanh: 2.0
+  # Unitree G1 feet_gait. Bonus for matching the contact clock, scaled by
+  # clip(vx / 1, 0, 1) so standing / marching in place cannot collect it.
+  # Period 0.8 s, offset 0.5, threshold 0.55 → walk (always ≥1 stance foot).
+  gait_weight: 0.5
+  gait_period: 0.8
+  gait_threshold: 0.55
+  gait_offsets: [0.0, 0.5]  # right, left
+  # Sine walk. Same clock as feet_gait. Pose/sym/lead/ROM are NOT vx-gated
+  # (0.20 * gated made the 500k compass ignore the sine). Gait bonus stays
+  # gated so marching in place cannot farm it. Do NOT add same-time |q_L-q_R|.
+  pose_weight: 2.0
+  sym_weight: 0.5
+  lead_weight: 1.0          # (mean hip_L - mean hip_R)^2 over the last period
+  hip_rom_weight: 1.0       # after one period; each hip must travel ~2*hip_amp
+  hip_bias: 0.35
+  hip_amp: 0.40
+  hip_rom_goal: 0.80
+  knee_stance: -0.15
+  knee_amp: 0.80
+  ankle_stance: 0.0
+  ankle_amp: 0.20
+  joint_limit: 0.5
+  joint_limit_margin: 0.1
+  contact_dist: 0.002
+
+healthy:
+  # Alive bonus only. Episode ends on suite fall (0.45 m / 1.2 rad), not
+  # these bounds — cutting at 0.85 m made every lunge a 0.75 s episode.
+  height_range: [0.8, 2.0]  # Gym Walker2d-v5
+  pitch_abs: 1.0
+
+observation:
+  include_last_action: true
+  include_gait_phase: true   # sin/cos of the walk clock; required with gait_weight
+  qpos_noise: 0.01
+  qvel_noise: 0.05
+
+domain_randomization:
+  enabled: true
+  friction: [0.45, 1.2]           # suite ice uses 0.2
+  mass_scale: [0.85, 1.15]        # suite backpack is +0.25 on torso
+  gear_scale: [0.70, 1.10]        # suite dead actuator sets gear to 0
+  damping_scale: [0.75, 1.25]
+  push_prob: 0.5
+  push_force_frac: [0.0, 0.35]    # suite shove uses 0.5 bodyweight
+  push_duration_s: [0.10, 0.30]
+  push_onset_s: [0.50, 4.00]
+
+ppo:
+  n_envs: 4
+  vec_env: dummy                  # dummy | subproc
+  n_timesteps: 1000000
+  # Walk on the clean plant first; DR starts after this many steps (0 = DR from reset).
+  nominal_warmup_steps: 250000
+  n_steps: 512
+  batch_size: 64
+  n_epochs: 20
+  learning_rate: 5.05e-5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.1
+  ent_coef: 0.005
+  vf_coef: 0.87
+  max_grad_norm: 1.0
+  net_arch: [256, 256]
+  log_std_init: -0.5              # std≈0.61; -1 collapsed to ~0.09 and froze the stand
+  normalize_obs: true
+  normalize_reward: true
+  eval_freq: 16384
+  n_eval_episodes: 5
+
+checkpoint:
+  dir: results/dr_rl
+  zip_name: ppo_walker.zip
+  vecnormalize_name: vecnormalize.pkl
+  best_dir: results/dr_rl/best

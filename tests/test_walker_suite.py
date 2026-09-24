@@ -19,7 +19,10 @@ from loka.walker_suite.config import (
 from loka.model_state import apply_loka_mutations
 from loka.walker_suite.faults import (
     PlantFaults,
+    assert_belief_isolated,
+    plant_friction_geom_ids,
     resolve_perturbation,
+    sanitize_belief_worldview,
     walker_gravity,
     walker_total_mass,
 )
@@ -77,6 +80,13 @@ def _load_walker():
     return mujoco, model, data
 
 
+def _obstacle_world_pos(model, geom_id):
+    body_id = int(model.geom_bodyid[geom_id])
+    if body_id > 0:
+        return model.body_pos[body_id]
+    return model.geom_pos[geom_id]
+
+
 class ConfigTests(unittest.TestCase):
     def test_parse_and_cli_override(self):
         config = parse_suite_dict(_minimal_suite_dict())
@@ -100,6 +110,68 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(merged.defaults.timeout_s, 12.0)
         self.assertEqual(merged.output_dir, Path("tmp/out"))
         self.assertFalse(merged.record)
+        self.assertEqual(merged.num_trials, 1)
+        self.assertEqual(merged.seed, 0)
+        self.assertAlmostEqual(merged.init_noise, 0.005)
+
+    def test_num_trials_cli_and_alias(self):
+        config = parse_suite_dict(_minimal_suite_dict(numtrials=4, seed=7, init_noise=0.01))
+        self.assertEqual(config.num_trials, 4)
+        self.assertEqual(config.seed, 7)
+        args = Namespace(
+            tests=None,
+            baselines=None,
+            goal_distance=None,
+            perturbation_time=None,
+            timeout=None,
+            speed_goal=None,
+            output_dir=None,
+            no_record=False,
+            record=None,
+            num_trials=5,
+            seed=3,
+            init_noise=0.0,
+        )
+        merged = apply_cli_overrides(config, args)
+        self.assertEqual(merged.num_trials, 5)
+        self.assertEqual(merged.seed, 3)
+        self.assertEqual(merged.init_noise, 0.0)
+        with self.assertRaises(ValueError):
+            parse_suite_dict(_minimal_suite_dict(num_trials=0))
+
+    def test_dr_rl_paths_from_yaml_and_cli(self):
+        config = parse_suite_dict(
+            _minimal_suite_dict(
+                dr_rl_checkpoint="results/dr_rl/best",
+                dr_rl_config="loka/dr_rl/config_gym.yaml",
+            )
+        )
+        self.assertEqual(config.dr_rl_checkpoint, "results/dr_rl/best")
+        self.assertEqual(config.dr_rl_config, "loka/dr_rl/config_gym.yaml")
+        blank = parse_suite_dict(
+            _minimal_suite_dict(dr_rl_checkpoint=None, dr_rl_config="  ")
+        )
+        self.assertIsNone(blank.dr_rl_checkpoint)
+        self.assertIsNone(blank.dr_rl_config)
+        args = Namespace(
+            tests=None,
+            baselines=None,
+            goal_distance=None,
+            perturbation_time=None,
+            timeout=None,
+            speed_goal=None,
+            output_dir=None,
+            no_record=False,
+            record=None,
+            num_trials=None,
+            seed=None,
+            init_noise=None,
+            dr_rl_checkpoint="results/dr_rl/ppo_walker.zip",
+            dr_rl_config=None,
+        )
+        merged = apply_cli_overrides(config, args)
+        self.assertEqual(merged.dr_rl_checkpoint, "results/dr_rl/ppo_walker.zip")
+        self.assertEqual(merged.dr_rl_config, "loka/dr_rl/config_gym.yaml")
 
     def test_rejects_raw_mass_and_force(self):
         with self.assertRaises(ValueError):
@@ -137,11 +209,21 @@ class ConfigTests(unittest.TestCase):
             / "walker_suite.yaml"
         )
         names = [t.name for t in config.tests]
+        self.assertIn("nominal", names)
         self.assertIn("dead_right_hip", names)
         self.assertIn("box", names)
         backpack = next(t for t in config.tests if t.name == "backpack")
-        self.assertEqual(backpack.perturbation["mass_frac"], 0.25)
+        self.assertEqual(backpack.perturbation["mass_frac"], 1.5)
+        self.assertEqual(config.num_trials, 1)
+        self.assertEqual(config.seed, 0)
+        self.assertAlmostEqual(config.init_noise, 0.005)
+        self.assertIsNone(config.dr_rl_checkpoint)
+        self.assertIsNone(config.dr_rl_config)
         self.assertNotIn("delta_kg", backpack.perturbation)
+        ice = next(t for t in config.tests if t.name == "ice")
+        self.assertLessEqual(ice.perturbation["mu"], 0.01)
+        box = next(t for t in config.tests if t.name == "box")
+        self.assertAlmostEqual(box.perturbation["size"][2], 0.30)
 
 
 class OutcomeTests(unittest.TestCase):
@@ -231,6 +313,12 @@ class FaultTests(unittest.TestCase):
         plant = PlantFaults(model, data)
         snap = plant.snapshot
 
+        none = resolve_perturbation({"kind": "none"}, model)
+        plant.activate(none, 1.0)
+        np.testing.assert_array_equal(model.actuator_gear[:, 0], snap.actuator_gear)
+        np.testing.assert_array_equal(model.geom_friction, snap.geom_friction)
+        plant.clear()
+
         hip = resolve_perturbation(
             {"kind": "actuator_dead", "actuator": "right_hip"}, model
         )
@@ -245,6 +333,8 @@ class FaultTests(unittest.TestCase):
         ice = resolve_perturbation({"kind": "friction", "mu": 0.2}, model)
         plant.activate(ice, 1.0)
         self.assertAlmostEqual(model.geom_friction[ice.floor_id, 0], 0.2)
+        for geom_id in ice.friction_geom_ids:
+            self.assertAlmostEqual(model.geom_friction[geom_id, 0], 0.2)
         plant.clear()
         self.assertAlmostEqual(
             model.geom_friction[ice.floor_id, 0], snap.geom_friction[ice.floor_id, 0]
@@ -254,22 +344,29 @@ class FaultTests(unittest.TestCase):
             {"kind": "mass", "mass_frac": 0.25, "body": "torso"}, model
         )
         nominal = float(snap.body_mass[backpack.body_id])
+        pack_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "backpack")
+        self.assertGreaterEqual(pack_id, 0)
+        self.assertAlmostEqual(float(model.geom_rgba[pack_id, 3]), 0.0)
         plant.activate(backpack, 1.0)
         self.assertAlmostEqual(
             float(model.body_mass[backpack.body_id]),
             nominal + backpack.delta_kg,
         )
+        self.assertGreater(float(model.geom_rgba[pack_id, 3]), 0.9)
         plant.clear()
         self.assertAlmostEqual(float(model.body_mass[backpack.body_id]), nominal)
+        np.testing.assert_allclose(model.body_inertia, snap.body_inertia)
+        self.assertAlmostEqual(float(model.geom_rgba[pack_id, 3]), 0.0)
 
         box = resolve_perturbation(
-            {"kind": "obstacle", "size": [0.15, 0.4, 0.1], "x": 4.0}, model
+            {"kind": "obstacle", "size": [0.25, 0.5, 0.5], "x": 4.0}, model
         )
         plant.activate(box, 3.0)
-        self.assertAlmostEqual(model.geom_pos[box.obstacle_id, 0], 4.0)
+        self.assertAlmostEqual(float(_obstacle_world_pos(model, box.obstacle_id)[0]), 4.0)
+        self.assertEqual(int(model.geom_contype[box.obstacle_id]), 1)
         self.assertEqual(int(model.geom_conaffinity[box.obstacle_id]), 1)
         plant.clear()
-        self.assertEqual(int(model.geom_conaffinity[box.obstacle_id]), 0)
+        self.assertAlmostEqual(float(_obstacle_world_pos(model, box.obstacle_id)[2]), -5.0)
 
     def test_dead_actuator_zeros_torque_not_mpc_command(self):
         mujoco, model, data = _load_walker()
@@ -304,6 +401,7 @@ class FaultTests(unittest.TestCase):
         belief_gear = belief_model.actuator_gear[:, 0].copy()
         belief_mu = belief_model.geom_friction.copy()
         belief_mass = belief_model.body_mass.copy()
+        belief_inertia = belief_model.body_inertia.copy()
 
         plant.activate(hip, 1.0)
         self.assertEqual(plant_model.actuator_gear[hip.actuator_id, 0], 0.0)
@@ -313,10 +411,29 @@ class FaultTests(unittest.TestCase):
         plant.activate(ice, 1.0)
         self.assertAlmostEqual(plant_model.geom_friction[ice.floor_id, 0], 0.2)
         np.testing.assert_array_equal(belief_model.geom_friction, belief_mu)
+        for geom_id in ice.friction_geom_ids:
+            self.assertAlmostEqual(plant_model.geom_friction[geom_id, 0], 0.2)
+            self.assertAlmostEqual(
+                float(belief_model.geom_friction[geom_id, 0]),
+                float(belief_mu[geom_id, 0]),
+            )
+        loka_state = {
+            "mutations": [],
+            "nominal_gears": belief_gear,
+            "nominal_friction": belief_mu,
+            "nominal_mass": belief_mass,
+            "nominal_inertia": belief_inertia,
+        }
+        assert_belief_isolated(belief_model, loka_state)
+        self.assertGreater(len(plant_friction_geom_ids(plant_model, ice.floor_id)), 1)
 
         plant.clear()
         plant.activate(backpack, 1.0)
         np.testing.assert_array_equal(belief_model.body_mass, belief_mass)
+        np.testing.assert_array_equal(belief_model.body_inertia, belief_inertia)
+        pack_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_GEOM, "backpack")
+        self.assertAlmostEqual(float(belief_model.geom_rgba[pack_id, 3]), 0.0)
+        self.assertGreater(float(plant_model.geom_rgba[pack_id, 3]), 0.9)
 
     def test_loka_mutations_change_belief_not_plant(self):
         mujoco, plant_model, _data = _load_walker()
@@ -346,6 +463,7 @@ class FaultTests(unittest.TestCase):
             "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
             "nominal_friction": belief_model.geom_friction.copy(),
             "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
         }
         apply_loka_mutations(belief_model, loka_state)
 
@@ -353,6 +471,161 @@ class FaultTests(unittest.TestCase):
         self.assertAlmostEqual(belief_model.geom_friction[floor_id, 0], 0.2)
         np.testing.assert_array_equal(plant_model.actuator_gear[:, 0], plant_gear)
         np.testing.assert_array_equal(plant_model.geom_friction, plant_mu)
+        assert_belief_isolated(belief_model, loka_state)
+
+    def test_loka_floor_friction_reaches_contact_mu(self):
+        """A floor-only write must also drop the feet or contact μ stays 0.7."""
+        mujoco, plant_model, data = _load_walker()
+        belief_model = mujoco.MjModel.from_xml_path(str(WALKER_XML))
+        floor_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        foot_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_GEOM, "right_foot")
+        contact_ids = plant_friction_geom_ids(belief_model, floor_id)
+        loka_state = {
+            "mutations": [
+                {
+                    "type": "geom",
+                    "id": floor_id,
+                    "attr": "friction",
+                    "val": 0.0001,
+                    "name": "floor",
+                }
+            ],
+            "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief_model.geom_friction.copy(),
+            "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
+            "floor_geom_id": floor_id,
+            "friction_contact_ids": contact_ids,
+        }
+        apply_loka_mutations(belief_model, loka_state)
+        self.assertAlmostEqual(float(belief_model.geom_friction[floor_id, 0]), 0.0001)
+        self.assertAlmostEqual(float(belief_model.geom_friction[foot_id, 0]), 0.0001)
+        for gid in contact_ids:
+            self.assertAlmostEqual(float(belief_model.geom_friction[gid, 0]), 0.0001)
+        np.testing.assert_array_equal(
+            plant_model.geom_friction, loka_state["nominal_friction"]
+        )
+        for _ in range(40):
+            mujoco.mj_step(plant_model, data)
+        belief_data = mujoco.MjData(belief_model)
+        belief_data.qpos[:] = data.qpos
+        belief_data.qvel[:] = 0
+        mujoco.mj_forward(belief_model, belief_data)
+        self.assertGreater(int(belief_data.ncon), 0)
+        for i in range(belief_data.ncon):
+            self.assertAlmostEqual(float(belief_data.contact[i].friction[0]), 0.0001)
+        assert_belief_isolated(belief_model, loka_state)
+
+    def test_loka_mass_mutation_is_belief_only(self):
+        mujoco, plant_model, _data = _load_walker()
+        belief_model = mujoco.MjModel.from_xml_path(str(WALKER_XML))
+        torso_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        plant_mass = plant_model.body_mass.copy()
+        nominal = float(belief_model.body_mass[torso_id])
+        loka_state = {
+            "mutations": [
+                {
+                    "type": "body",
+                    "id": torso_id,
+                    "attr": "mass",
+                    "val": nominal + 4.0,
+                    "name": "torso",
+                }
+            ],
+            "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief_model.geom_friction.copy(),
+            "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
+        }
+        apply_loka_mutations(belief_model, loka_state)
+        self.assertAlmostEqual(float(belief_model.body_mass[torso_id]), nominal + 4.0)
+        np.testing.assert_array_equal(plant_model.body_mass, plant_mass)
+        assert_belief_isolated(belief_model, loka_state)
+
+    def test_loka_com_mutation_is_belief_only(self):
+        mujoco, plant_model, _data = _load_walker()
+        belief_model = mujoco.MjModel.from_xml_path(str(WALKER_XML))
+        torso_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        plant_ipos = plant_model.body_ipos.copy()
+        shifted = [-0.08, 0.0, 0.02]
+        loka_state = {
+            "mutations": [
+                {
+                    "type": "body",
+                    "id": torso_id,
+                    "attr": "com",
+                    "val": shifted,
+                    "name": "torso",
+                }
+            ],
+            "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief_model.geom_friction.copy(),
+            "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
+            "nominal_ipos": belief_model.body_ipos.copy(),
+        }
+        apply_loka_mutations(belief_model, loka_state)
+        np.testing.assert_allclose(belief_model.body_ipos[torso_id], shifted, atol=1e-9)
+        np.testing.assert_array_equal(plant_model.body_ipos, plant_ipos)
+        assert_belief_isolated(belief_model, loka_state)
+
+    def test_leaked_ice_on_belief_is_rejected(self):
+        mujoco, belief_model, _data = _load_walker()
+        floor_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        loka_state = {
+            "mutations": [],
+            "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief_model.geom_friction.copy(),
+            "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
+        }
+        assert_belief_isolated(belief_model, loka_state)
+        belief_model.geom_friction[floor_id, 0] = 0.2
+        with self.assertRaises(RuntimeError):
+            assert_belief_isolated(belief_model, loka_state)
+
+    def test_leaked_backpack_mass_on_belief_is_rejected(self):
+        mujoco, belief_model, _data = _load_walker()
+        torso_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        loka_state = {
+            "mutations": [],
+            "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief_model.geom_friction.copy(),
+            "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
+        }
+        assert_belief_isolated(belief_model, loka_state)
+        belief_model.body_mass[torso_id] += 5.0
+        with self.assertRaises(RuntimeError):
+            assert_belief_isolated(belief_model, loka_state)
+
+    def test_leaked_com_on_belief_is_rejected(self):
+        mujoco, belief_model, _data = _load_walker()
+        torso_id = mujoco.mj_name2id(belief_model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        loka_state = {
+            "mutations": [],
+            "nominal_gears": belief_model.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief_model.geom_friction.copy(),
+            "nominal_mass": belief_model.body_mass.copy(),
+            "nominal_inertia": belief_model.body_inertia.copy(),
+            "nominal_ipos": belief_model.body_ipos.copy(),
+        }
+        assert_belief_isolated(belief_model, loka_state)
+        belief_model.body_ipos[torso_id, 0] -= 0.05
+        with self.assertRaises(RuntimeError):
+            assert_belief_isolated(belief_model, loka_state)
+
+    def test_sanitize_belief_hides_backpack_and_disables_box(self):
+        mujoco, model, _data = _load_walker()
+        pack = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "backpack")
+        box = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "obstacle")
+        model.geom_rgba[pack, 3] = 1.0
+        model.geom_contype[box] = 1
+        model.geom_conaffinity[box] = 1
+        sanitize_belief_worldview(model)
+        self.assertAlmostEqual(float(model.geom_rgba[pack, 3]), 0.0)
+        self.assertEqual(int(model.geom_contype[box]), 0)
+        self.assertEqual(int(model.geom_conaffinity[box]), 0)
 
     def test_force_xfrc_and_duration(self):
         mujoco, model, data = _load_walker()
@@ -371,6 +644,99 @@ class FaultTests(unittest.TestCase):
         self.assertAlmostEqual(data.xfrc_applied[shove.body_id, 0], shove.force_n)
         plant.apply_physics(1.25)
         self.assertAlmostEqual(data.xfrc_applied[shove.body_id, 0], 0.0)
+
+    def test_backpack_does_not_teleport_qpos(self):
+        """mj_setConst on live MjData used to write qpos0 every backpack step."""
+        mujoco, model, data = _load_walker()
+        plant = PlantFaults(model, data)
+        data.qpos[1] = 0.5
+        data.qvel[1] = 1.2
+        mujoco.mj_forward(model, data)
+        x0 = float(data.qpos[1])
+        backpack = resolve_perturbation(
+            {"kind": "mass", "mass_frac": 0.25, "body": "torso"}, model
+        )
+        plant.activate(backpack, 0.0)
+        self.assertAlmostEqual(float(data.qpos[1]), x0)
+        self.assertAlmostEqual(float(data.qvel[1]), 1.2)
+        bid = backpack.body_id
+        old = float(plant.snapshot.body_mass[bid])
+        new = old + backpack.delta_kg
+        self.assertAlmostEqual(float(model.body_mass[bid]), new)
+        np.testing.assert_allclose(
+            model.body_inertia[bid],
+            plant.snapshot.body_inertia[bid] * (new / old),
+        )
+        self.assertAlmostEqual(
+            float(model.body_subtreemass[bid]),
+            float(plant.snapshot.body_mass[1:].sum()) + backpack.delta_kg,
+            places=5,
+        )
+        for _ in range(20):
+            plant.apply_physics(float(data.time))
+            mujoco.mj_step(model, data)
+        self.assertGreater(float(data.qpos[1]), x0 + 0.01)
+        self.assertTrue(np.isfinite(data.qpos).all())
+
+    def test_obstacle_blocks_the_walker(self):
+        """A 1 m wall on its own body must stop a walker shoved into it."""
+        mujoco, model, data = _load_walker()
+        plant = PlantFaults(model, data)
+        box = resolve_perturbation(
+            {"kind": "obstacle", "size": [0.25, 0.5, 0.5], "x": 4.0}, model
+        )
+        plant.activate(box, 0.0)
+        data.qpos[:] = 0.0
+        data.qpos[1] = 3.4
+        data.qvel[1] = 3.0
+        hits = 0
+        for _ in range(250):
+            plant.apply_physics(float(data.time))
+            mujoco.mj_step(model, data)
+        for i in range(int(data.ncon)):
+            names = (
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom1),
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom2),
+            )
+            if "obstacle" in names:
+                hits += 1
+        self.assertGreater(hits, 0, "walker should be in contact with the box")
+        self.assertLess(float(data.qpos[1]), 4.05, "walker walked through the wall")
+
+        belief = mujoco.MjModel.from_xml_path(str(WALKER_XML))
+        self.assertAlmostEqual(
+            float(_obstacle_world_pos(belief, box.obstacle_id)[2]), -5.0
+        )
+        self.assertFalse(
+            np.allclose(
+                _obstacle_world_pos(belief, box.obstacle_id),
+                _obstacle_world_pos(model, box.obstacle_id),
+            )
+        )
+
+    def test_ice_lowers_contact_friction(self):
+        mujoco, model, data = _load_walker()
+        plant = PlantFaults(model, data)
+        for _ in range(40):
+            mujoco.mj_step(model, data)
+        self.assertGreater(int(data.ncon), 0)
+        before = [float(data.contact[i].friction[0]) for i in range(data.ncon)]
+        self.assertTrue(all(abs(mu - 0.7) < 1e-6 for mu in before))
+        for mu in (0.2, 0.0001):
+            ice = resolve_perturbation({"kind": "friction", "mu": mu}, model)
+            plant.activate(ice, float(data.time))
+            mujoco.mj_forward(model, data)
+            after = [float(data.contact[i].friction[0]) for i in range(data.ncon)]
+            self.assertTrue(after, "ice should still have foot/floor contacts")
+            self.assertTrue(
+                all(abs(cmu - mu) < 1e-9 for cmu in after),
+                f"contact μ {after} != {mu}",
+            )
+            foot_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "right_foot")
+            self.assertAlmostEqual(float(model.geom_friction[ice.floor_id, 0]), mu)
+            self.assertAlmostEqual(float(model.geom_friction[foot_id, 0]), mu)
+            plant.clear()
+            mujoco.mj_forward(model, data)
 
 
 class ResultsWriterTests(unittest.TestCase):
@@ -410,6 +776,56 @@ class ResultsWriterTests(unittest.TestCase):
             self.assertTrue((directory / "mpc_params.jsonl").is_file())
             self.assertTrue((directory / "loka_turns.jsonl").is_file())
             self.assertFalse((directory / "episode.mp4").exists())
+
+
+def _has_mjpc():
+    try:
+        from mujoco_mpc import agent as _mpc_agent  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_has_mjpc(), "mujoco_mpc not installed")
+class WalkerRuntimeBeliefIsolationTests(unittest.TestCase):
+    def test_backpack_does_not_enter_planner(self):
+        import mujoco
+
+        from loka.walker_runtime import WalkerRuntime
+
+        runtime = WalkerRuntime(enable_llm=False, speed_goal=1.0)
+        try:
+            runtime.reset()
+            torso = mujoco.mj_name2id(runtime.model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+            pack = mujoco.mj_name2id(
+                runtime.belief_model, mujoco.mjtObj.mjOBJ_GEOM, "backpack"
+            )
+            belief_mass = runtime.belief_model.body_mass.copy()
+            belief_inertia = runtime.belief_model.body_inertia.copy()
+            agent_mass = runtime.agent.model.body_mass.copy()
+            rgba = runtime.belief_model.geom_rgba[pack].copy()
+
+            runtime.activate_fault(
+                {"kind": "mass", "mass_frac": 0.25, "body": "torso"}, 0.0
+            )
+            for _ in range(8):
+                runtime.step()
+
+            np.testing.assert_array_equal(runtime.belief_model.body_mass, belief_mass)
+            np.testing.assert_array_equal(
+                runtime.belief_model.body_inertia, belief_inertia
+            )
+            np.testing.assert_array_equal(runtime.agent.model.body_mass, agent_mass)
+            np.testing.assert_allclose(runtime.belief_model.geom_rgba[pack], rgba)
+            self.assertAlmostEqual(float(runtime.belief_model.geom_rgba[pack, 3]), 0.0)
+            self.assertGreater(
+                float(runtime.model.body_mass[torso]), float(belief_mass[torso]) + 1.0
+            )
+            self.assertGreater(float(runtime.model.geom_rgba[pack, 3]), 0.9)
+            runtime.assert_mpc_unaware_of_plant()
+        finally:
+            runtime.close()
 
 
 class DefaultYamlRoundTrip(unittest.TestCase):

@@ -12,6 +12,7 @@ def _format_context_sections(
     telemetry_header: str,
     telemetry: str,
     error_tracking: str | None = None,
+    model_parameters: str | None = None,
 ) -> str:
     parts = [
         "## CURRENT MPC CONFIGURATION\n"
@@ -19,12 +20,13 @@ def _format_context_sections(
     ]
     if error_tracking:
         parts.append(f"\n## CURRENT ERROR TRACKING\n{error_tracking}\n")
-    parts.append(
-        f"\n## CURRENT MODEL BELIEF\n"
-        f"{belief}\n\n"
-        f"{telemetry_header}\n"
-        f"{telemetry}"
-    )
+    parts.append(f"\n## CURRENT MODEL BELIEF\n{belief}\n")
+    if model_parameters:
+        parts.append(
+            "\n## CURRENT MODEL PARAMETERS (MPC belief)\n"
+            f"{model_parameters}\n"
+        )
+    parts.append(f"\n{telemetry_header}\n{telemetry}")
     return "".join(parts)
 
 
@@ -119,7 +121,12 @@ class FailureEpisode(ConversationMixin):
         )
 
     def build_user_turn(
-        self, telemetry: str, loka_state: dict, sim_time: float, mpc_config: str
+        self,
+        telemetry: str,
+        loka_state: dict,
+        sim_time: float,
+        mpc_config: str,
+        model_parameters: str | None = None,
     ) -> str:
         belief = format_current_model_belief(loka_state)
         objective = loka_state.get("primary_objective", "")
@@ -138,11 +145,17 @@ class FailureEpisode(ConversationMixin):
                 "## NEW TELEMETRY",
                 telemetry,
                 error_tracking=_error_tracking_text(loka_state),
+                model_parameters=model_parameters,
             )
         )
 
     def build_initial_user_turn(
-        self, telemetry: str, loka_state: dict, sim_time: float, mpc_config: str
+        self,
+        telemetry: str,
+        loka_state: dict,
+        sim_time: float,
+        mpc_config: str,
+        model_parameters: str | None = None,
     ) -> str:
         belief = format_current_model_belief(loka_state)
         objective = loka_state.get("primary_objective", "")
@@ -160,6 +173,7 @@ class FailureEpisode(ConversationMixin):
                 "## NEW TELEMETRY",
                 telemetry,
                 error_tracking=_error_tracking_text(loka_state),
+                model_parameters=model_parameters,
             )
         )
 
@@ -180,6 +194,7 @@ class OperatorSession(ConversationMixin):
         loka_state: dict,
         sim_time: float,
         mpc_config: str,
+        model_parameters: str | None = None,
     ) -> str:
         belief = format_current_model_belief(loka_state)
         return (
@@ -199,5 +214,6 @@ class OperatorSession(ConversationMixin):
                 "## CURRENT TELEMETRY SNAPSHOT",
                 telemetry,
                 error_tracking=_error_tracking_text(loka_state),
+                model_parameters=model_parameters,
             )
         )

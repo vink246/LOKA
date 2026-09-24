@@ -1,0 +1,96 @@
+# Experimental Gym / Isaac-style PPO walker. No gait clock, sine, lead, or ROM.
+# Same plant, DR, and height / pitch / speed constraints as config.yaml.
+# Writes ONLY under results/dr_rl_gym/ — does not overwrite results/dr_rl/.
+
+xml_path: null
+frame_skip: 4
+max_episode_steps: 1000
+speed_goal: 1.0
+reset_noise_scale: 0.005
+
+reward:
+  # Gymnasium Walker2d-v5 / SB3 Zoo / Isaac locomotion core:
+  #   r = 1*vx + 1*alive - 1e-3 ||a||^2
+  # plus the same upright / speed caps as the gait harness.
+  forward_weight: 1.0
+  overspeed_weight: 3.0
+  healthy_bonus: 1.0
+  healthy_min_speed: 0.0
+  ctrl_cost: 0.001
+  action_rate: 0.001
+  pitch_cost: 1.0
+  pitch_rate: 0.05
+  pitch_deadband: 0.25
+  height_target: 1.2
+  height_cost: 12.0         # 4 left a 1.7 s dive cheap until z hit 0.45
+  height_deadband: 0.10
+  vz_cost: 0.0
+  flight_cost: 0.25
+  joint_limit: 0.5
+  joint_limit_margin: 0.1
+  contact_dist: 0.002
+  # Gait-style terms off.
+  slip_weight: 0.0
+  stride_weight: 0.0
+  clearance_weight: 0.0
+  gait_weight: 0.0
+  pose_weight: 0.0
+  sym_weight: 0.0
+  lead_weight: 0.0
+  hip_rom_weight: 0.0
+
+healthy:
+  # Gym Walker2d-v5: episode ends when z or pitch leaves the alive band.
+  # Without this the gym harness farmed a 1.7 s lunge down to suite fall (0.45 m).
+  height_range: [0.8, 2.0]
+  pitch_abs: 1.0
+  terminate_when_unhealthy: true
+
+observation:
+  include_last_action: true
+  include_gait_phase: false
+  qpos_noise: 0.01
+  qvel_noise: 0.05
+
+domain_randomization:
+  enabled: true
+  friction: [0.45, 1.2]
+  mass_scale: [0.85, 1.15]
+  gear_scale: [0.70, 1.10]
+  damping_scale: [0.75, 1.25]
+  push_prob: 0.5
+  push_force_frac: [0.0, 0.35]
+  push_duration_s: [0.10, 0.30]
+  push_onset_s: [0.50, 4.00]
+
+ppo:
+  n_envs: 4
+  vec_env: dummy
+  n_timesteps: 1000000
+  nominal_warmup_steps: 250000
+  n_steps: 512
+  batch_size: 64
+  n_epochs: 20
+  learning_rate: 5.05e-5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.1
+  # Entropy bonus: SB3 adds ent_coef * H(π) to the loss. 0.005 was too timid
+  # for this plant (policy collapsed into a 1.7 s dive). 0.01 is the usual
+  # Isaac / RSL-RL locomotion value. Do not jump to 0.05 — that never exploits.
+  ent_coef: 0.01
+  vf_coef: 0.87
+  max_grad_norm: 1.0
+  net_arch: [256, 256]
+  log_std_init: -0.3              # std≈0.74 at start; -0.5 was ≈0.61
+  normalize_obs: true
+  normalize_reward: true
+  eval_freq: 16384
+  n_eval_episodes: 5
+
+checkpoint:
+  dir: results/dr_rl_gym
+  zip_name: ppo_walker_gym.zip
+  vecnormalize_name: vecnormalize.pkl
+  best_dir: results/dr_rl_gym/best
+  name_prefix: ppo_walker_gym

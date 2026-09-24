@@ -6,11 +6,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from loka.walker_runtime import WalkerRuntime, distance_objective
 from loka.walker_suite.config import EpisodeDefaults, SuiteConfig, TestCase
 from loka.walker_suite.faults import perturbation_metadata, resolve_perturbation
 from loka.walker_suite.logging import EpisodeLogger
 from loka.walker_suite.outcomes import classify_outcome, has_fallen, pos_x, world_height
+from loka.walker_suite.statistics import metrics_from_log
+from loka.walker_suite.stochastic import trial_seed
 
 
 def run_episode(
@@ -18,17 +19,36 @@ def run_episode(
     baseline: str,
     suite: SuiteConfig,
     out_dir: Path,
+    *,
+    trial: int = 0,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     params: EpisodeDefaults = test.episode_params(suite.defaults)
     enable_llm = baseline == "loka"
-    objective = distance_objective(params.goal_distance_m)
+    if seed is None:
+        seed = trial_seed(suite.seed, trial)
+    tag = f"{test.name}/{baseline}/trial{trial}"
 
-    runtime = WalkerRuntime(
-        objective=objective,
-        enable_llm=enable_llm,
-        speed_goal=params.speed_goal,
-    )
-    runtime.reset()
+    if baseline == "dr_rl":
+        from loka.dr_rl.config import load_dr_config
+        from loka.dr_rl.runtime import DrRlRuntime
+
+        dr_config = load_dr_config(suite.dr_rl_config) if suite.dr_rl_config else None
+        runtime = DrRlRuntime(
+            speed_goal=params.speed_goal,
+            checkpoint=suite.dr_rl_checkpoint,
+            config=dr_config,
+        )
+        runtime.reset(seed=seed, init_noise=suite.init_noise)
+    else:
+        from loka.walker_runtime import WalkerRuntime, distance_objective
+
+        runtime = WalkerRuntime(
+            objective=distance_objective(params.goal_distance_m),
+            enable_llm=enable_llm,
+            speed_goal=params.speed_goal,
+        )
+        runtime.reset(seed=seed, init_noise=suite.init_noise)
     resolved = resolve_perturbation(test.perturbation, runtime.model)
 
     logger = EpisodeLogger(
@@ -52,13 +72,18 @@ def run_episode(
     try:
         while True:
             t = float(runtime.data.time)
-            if not injected and t + 1e-9 >= params.perturbation_time_s:
+            if (
+                not injected
+                and resolved.kind != "none"
+                and t + 1e-9 >= params.perturbation_time_s
+            ):
                 runtime.activate_fault(resolved, t)
                 injected = True
                 print(
-                    f"  [{test.name}/{baseline}] perturbation {resolved.kind} "
-                    f"at t={t:.2f}s"
+                    f"  [{tag}] perturbation {resolved.kind} at t={t:.2f}s"
                 )
+            elif not injected and resolved.kind == "none" and t + 1e-9 >= params.perturbation_time_s:
+                injected = True
 
             step = runtime.step()
             logger.maybe_log(runtime, step)
@@ -70,7 +95,7 @@ def run_episode(
             if t - last_print >= 0.5:
                 fallen_tag = " [FALLEN]" if has_fallen(runtime.data) else ""
                 print(
-                    f"\r  [{test.name}/{baseline}] t={step.time:.2f}s "
+                    f"\r  [{tag}] t={step.time:.2f}s "
                     f"x={pos_x(runtime.data):.2f}m err={step.error:.3f} "
                     f"{step.status}{fallen_tag} ",
                     end="",
@@ -88,9 +113,14 @@ def run_episode(
     finally:
         print()
         wall = time.perf_counter() - wall0
+        log_metrics = metrics_from_log(logger.rows, speed_goal=params.speed_goal)
         metadata = {
             "test": test.name,
             "baseline": baseline,
+            "trial": int(trial),
+            "seed": int(seed),
+            "init_noise": float(suite.init_noise),
+            "episode_dir": str(out_dir),
             "enable_llm": enable_llm,
             "goal_distance_m": params.goal_distance_m,
             "perturbation_time_s": params.perturbation_time_s,
@@ -107,17 +137,30 @@ def run_episode(
             "llm_turn_count": len(runtime.loka_turns),
             "wall_s": wall,
             "fault_injected": injected,
+            **log_metrics,
+            "dr_rl_policy_path": (
+                str(runtime.policy.policy_path) if baseline == "dr_rl" else None
+            ),
+            "dr_rl_config_path": (
+                runtime.config.get("_config_path") if baseline == "dr_rl" else None
+            ),
+            "belief_isolation": (
+                runtime.belief_isolation_report()
+                if hasattr(runtime, "belief_isolation_report")
+                else None
+            ),
         }
         logger.write(
             metadata=metadata,
             mpc_snapshots=runtime.mpc_snapshots,
             loka_turns=runtime.loka_turns,
             obstacle_overlay=runtime.plant.obstacle_overlay(),
+            visual_overlay=runtime.plant.visual_overlay(),
         )
         runtime.close()
 
     print(
-        f"  [{test.name}/{baseline}] {metadata['outcome']} "
+        f"  [{tag}] {metadata['outcome']} "
         f"t={metadata['t_end']:.2f}s x={metadata['pos_x_final']:.2f}m "
         f"turns={metadata['llm_turn_count']}"
         f"{' fell@' + f'{t_first_fall:.2f}s' if t_first_fall is not None else ''}"

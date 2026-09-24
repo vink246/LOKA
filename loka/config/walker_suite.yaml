@@ -9,22 +9,38 @@ record_width: 1920
 record_height: 1080
 log_hz: 100
 
+# Repeat every test for every baseline this many times (CLI: --num-trials).
+num_trials: 1
+# Trial k uses seed+k for every baseline, so they share an initial state.
+seed: 0
+# MuJoCo mj_step is deterministic. This half-width is added to qpos and qvel
+# at reset (meters, radians, m/s, rad/s). 0 keeps the nominal spawn pose.
+init_noise: 0.005
+
+# DR-RL baseline only. Null falls through to LOKA_DR_RL_CHECKPOINT / LOKA_DR_RL_CONFIG,
+# then loka/dr_rl/config.yaml. Checkpoint may be a zip or a directory that contains one.
+# The config YAML must match the checkpoint (observation size and normalization).
+dr_rl_checkpoint: results/dr_rl/checkpoints/ppo_walker_750000_steps.zip
+dr_rl_config: loka/dr_rl/config.yaml
+
 defaults:
   goal_distance_m: 10.0
   perturbation_time_s: 2.0
   timeout_s: 60.0
   speed_goal: 1.0
 
-baselines: [loka, fixed_mpc]
+baselines: [loka, fixed_mpc, dr_rl]
 
 tests:
+  - name: nominal
+    perturbation: {kind: none}
   - name: dead_right_hip
     perturbation: {kind: actuator_dead, actuator: right_hip}
   - name: ice
-    perturbation: {kind: friction, mu: 0.2}
+    perturbation: {kind: friction, mu: 0.001}
   - name: backpack
-    perturbation: {kind: mass, mass_frac: 0.25, body: torso}
+    perturbation: {kind: mass, mass_frac: 1.5, body: torso}
   - name: shove_back
     perturbation: {kind: force, force_frac: 0.5, direction: backward, duration_s: 0.2}
   - name: box
-    perturbation: {kind: obstacle, size: [0.15, 0.40, 0.10], x: 4.0}
+    perturbation: {kind: obstacle, size: [0.25, 0.50, 0.30], x: 4.0}

@@ -120,18 +120,52 @@ class QposClipSampler:
 
 
 def _apply_obstacle_overlay(mujoco, model, visible: bool, pos, size) -> None:
-    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "obstacle")
+    from loka.walker_suite.faults import place_obstacle_on_model
+
+    place_obstacle_on_model(model, visible=visible, pos=pos, size=size)
+
+
+def _apply_backpack_overlay(mujoco, model, visible: bool, rgba) -> None:
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "backpack")
     if geom_id < 0:
         return
     if visible:
-        model.geom_pos[geom_id] = np.asarray(pos, dtype=float)
-        model.geom_size[geom_id] = np.asarray(size, dtype=float)
-        model.geom_contype[geom_id] = 0
-        model.geom_conaffinity[geom_id] = 1
+        model.geom_rgba[geom_id] = np.asarray(rgba, dtype=float)
     else:
-        model.geom_pos[geom_id] = np.array([0.0, 0.0, -5.0])
-        model.geom_contype[geom_id] = 0
-        model.geom_conaffinity[geom_id] = 0
+        model.geom_rgba[geom_id, 3] = 0.0
+
+
+def _apply_ice_overlay(mujoco, model, visible: bool, floor_rgba) -> None:
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    if geom_id < 0:
+        return
+    if visible:
+        model.geom_matid[geom_id] = -1
+        model.geom_rgba[geom_id] = np.asarray(floor_rgba, dtype=float)
+    else:
+        # Reloaded XML already has the grid material; leave it until first show.
+        pass
+
+
+def _apply_visual_overlay(mujoco, model, overlay: dict | None, sim_time: float) -> None:
+    if not overlay:
+        return
+    # Legacy suite videos passed {visible_from, pos, size} for the box.
+    if "pos" in overlay and "size" in overlay and "obstacle" not in overlay:
+        visible_from = float(overlay.get("visible_from") or 0.0)
+        _apply_obstacle_overlay(
+            mujoco, model, sim_time + 1e-9 >= visible_from, overlay["pos"], overlay["size"]
+        )
+        return
+    visible_from = float(overlay.get("visible_from") or 0.0)
+    visible = sim_time + 1e-9 >= visible_from
+    if "obstacle" in overlay:
+        spec = overlay["obstacle"]
+        _apply_obstacle_overlay(mujoco, model, visible, spec["pos"], spec["size"])
+    if "backpack" in overlay:
+        _apply_backpack_overlay(mujoco, model, visible, overlay["backpack"]["rgba"])
+    if "ice" in overlay:
+        _apply_ice_overlay(mujoco, model, visible, overlay["ice"]["floor_rgba"])
 
 
 def _render_clip_worker(job: dict) -> None:
@@ -150,7 +184,7 @@ def _render_clip_worker(job: dict) -> None:
     width = int(job["width"])
     height = int(job["height"])
     out_path = job["out_path"]
-    obstacle = job.get("obstacle")
+    visual = job.get("visual") or job.get("obstacle")
 
     cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
     if cam_id < 0:
@@ -166,13 +200,10 @@ def _render_clip_worker(job: dict) -> None:
     try:
         with media_worker.VideoWriter(out_path, shape=(height, width), fps=fps) as writer:
             for i, qpos in enumerate(qpos_frames):
-                if obstacle is not None:
-                    visible_from = float(obstacle.get("visible_from") or 0.0)
+                if visual is not None:
+                    visible_from = float(visual.get("visible_from") or 0.0)
                     t = float(times[i]) if times is not None else visible_from
-                    visible = t + 1e-9 >= visible_from
-                    _apply_obstacle_overlay(
-                        mujoco, model, visible, obstacle["pos"], obstacle["size"]
-                    )
+                    _apply_visual_overlay(mujoco, model, visual, t)
                 data.qpos[:] = qpos
                 mujoco.mj_forward(model, data)
                 renderer.update_scene(data, camera=camera)
@@ -192,6 +223,7 @@ def render_qpos_clip(
     out_path: str | Path,
     times: np.ndarray | None = None,
     obstacle: dict | None = None,
+    visual: dict | None = None,
     camera: str = DEFAULT_RECORD_CAMERA,
     fps: float = DEFAULT_RECORD_FPS,
     width: int = SUITE_RECORD_WIDTH,
@@ -220,6 +252,7 @@ def render_qpos_clip(
         "width": int(width),
         "height": int(height),
         "obstacle": obstacle,
+        "visual": visual if visual is not None else obstacle,
     }
     ctx = mp.get_context("spawn")
     proc = ctx.Process(target=_render_clip_worker, args=(job,))

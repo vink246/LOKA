@@ -19,3 +19,8 @@ dependencies:
       - protobuf>=4.25
       - matplotlib>=3.8
       - mediapy>=1.2
+      # Domain-randomized PPO baseline (native MuJoCo Gymnasium env)
+      - gymnasium>=0.29.1
+      - stable-baselines3>=2.3.0
+      # CPU wheel is enough for this 6-DoF MLP; CUDA torch also works.
+      - torch

@@ -70,16 +70,29 @@ def _snapshot_agent_params(agent):
     return weights, tasks
 
 
-def reinit_agent_from_belief(model, agent, task_id):
+def make_planner_agent(task_id, belief_model, *, plant_model=None):
+    """Start MJPC from the belief MjModel only (nominal XML + LOKA edits).
+
+    The C++ server serializes this model at Init. Passing the plant would leak
+    hidden suite faults (backpack mass, ice, dead hip, raised box) into plans.
+    """
+    if plant_model is not None and belief_model is plant_model:
+        raise RuntimeError("Refusing to initialize MJPC from the plant model")
+    return mpc_agent.Agent(task_id=task_id, model=belief_model)
+
+
+def reinit_agent_from_belief(model, agent, task_id, *, plant_model=None):
     """Rebuild the MJPC server from the *belief* model only.
 
     The C++ agent holds a serialized copy of whatever MjModel we pass to Init.
     That copy must be nominal hardware plus LOKA Model_Mutations — never the
     hidden plant. Cost weights and task parameters are restored after Init.
     """
+    if plant_model is not None and model is plant_model:
+        raise RuntimeError("Refusing to rebuild MJPC from the plant model")
     weights, tasks = _snapshot_agent_params(agent)
     agent.close()
-    agent = mpc_agent.Agent(task_id=task_id, model=model)
+    agent = make_planner_agent(task_id, model, plant_model=plant_model)
     if weights:
         try:
             agent.set_cost_weights(weights)
@@ -96,7 +109,9 @@ def reinit_agent_from_belief(model, agent, task_id):
     return agent
 
 
-def recreate_agent_with_planner_settings(model, agent, settings, task_id):
+def recreate_agent_with_planner_settings(
+    model, agent, settings, task_id, *, plant_model=None
+):
     """Apply planner settings on the belief model and recreate the MPC agent."""
     applied = {}
     for name, value in settings.items():
@@ -108,7 +123,7 @@ def recreate_agent_with_planner_settings(model, agent, settings, task_id):
     if not applied:
         return agent
 
-    return reinit_agent_from_belief(model, agent, task_id)
+    return reinit_agent_from_belief(model, agent, task_id, plant_model=plant_model)
 
 
 def _live_task_parameter_names(agent) -> set[str]:
@@ -146,7 +161,7 @@ def llm_worker(api_messages, result_queue):
         response = client.chat.completions.create(
             model="gpt-5.4-mini",
             messages=api_messages,
-            temperature=0.1,
+            # temperature=0.1,
         )
         yaml_text = response.choices[0].message.content
         yaml_text = yaml_text.replace("```yaml", "").replace("```", "").strip()
@@ -165,6 +180,7 @@ def apply_scratchpad(
     episode=None,
     data=None,
     task_id="Walker",
+    plant_model=None,
 ):
     """Parses the LLM's YAML and safely applies it to the running MPC and loka_state."""
     if not scratchpad or "Semantic_State" not in scratchpad:
@@ -240,7 +256,7 @@ def apply_scratchpad(
         print("  -> Planner Metaparameters Updated:")
         try:
             agent = recreate_agent_with_planner_settings(
-                model, agent, planner_targets, task_id
+                model, agent, planner_targets, task_id, plant_model=plant_model
             )
             for param_name, new_value in planner_targets.items():
                 if param_name in SUPPORTED_PLANNER_NUMERICS:
@@ -258,7 +274,9 @@ def apply_scratchpad(
             print(f"     * Failed to apply planner settings: {e}")
     elif queued_mutations:
         try:
-            agent = reinit_agent_from_belief(model, agent, task_id)
+            agent = reinit_agent_from_belief(
+                model, agent, task_id, plant_model=plant_model
+            )
             if data is not None:
                 agent.set_state(
                     time=data.time,

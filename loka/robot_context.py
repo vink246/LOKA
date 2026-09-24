@@ -63,6 +63,8 @@ def capture_nominal_params(model):
     actuators = {}
     for actuator_id in range(model.nu):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
+        if not name:
+            continue
         actuators[name] = {"gear": float(model.actuator_gear[actuator_id, 0])}
 
     geoms = {}
@@ -75,7 +77,12 @@ def capture_nominal_params(model):
     bodies = {}
     for body_id in range(1, model.nbody):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-        bodies[name] = {"mass": float(model.body_mass[body_id])}
+        if not name:
+            continue
+        bodies[name] = {
+            "mass": float(model.body_mass[body_id]),
+            "com": model.body_ipos[body_id].tolist(),
+        }
 
     return {"actuators": actuators, "geoms": geoms, "bodies": bodies}
 
@@ -152,13 +159,50 @@ def format_current_error_tracking(error_spec: ErrorSpec) -> str:
     )
 
 
+_NOMINAL_BUCKETS = {
+    "actuator": "actuators",
+    "actuators": "actuators",
+    "geom": "geoms",
+    "geoms": "geoms",
+    "body": "bodies",
+    "bodies": "bodies",
+}
+
+
+def _format_nominal_value(value):
+    if isinstance(value, float):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        return [float(v) for v in value]
+    return value
+
+
 def _lookup_nominal(nominal_params, mutation):
-    obj_type = mutation["type"]
-    name = mutation["name"]
-    attr = mutation["attr"]
-    bucket = nominal_params.get(f"{obj_type}s", {})
-    obj = bucket.get(name, {})
-    return obj.get(attr, "unknown")
+    """Resolve a mutation against the captured nominal MJCF snapshot.
+
+    Object types map to the snapshot keys ``actuators`` / ``geoms`` / ``bodies``
+    (not a naive ``f"{type}s"``, which turned ``body`` into ``bodys``).
+    """
+    obj_type = str(mutation.get("type") or "").strip().lower()
+    name = str(mutation.get("name") or "").strip()
+    attr = str(mutation.get("attr") or "").strip().lower()
+    bucket_name = _NOMINAL_BUCKETS.get(obj_type)
+    if not bucket_name or not name or not attr:
+        return "unknown"
+
+    bucket = nominal_params.get(bucket_name) or {}
+    obj = bucket.get(name)
+    if obj is None:
+        lowered = name.lower()
+        obj = next(
+            (entry for key, entry in bucket.items() if str(key).lower() == lowered),
+            None,
+        )
+    if not isinstance(obj, dict):
+        return "unknown"
+    if attr not in obj:
+        return "unknown"
+    return _format_nominal_value(obj[attr])
 
 
 def format_current_model_belief(loka_state):
@@ -183,6 +227,81 @@ def format_current_model_belief(loka_state):
             f"  - {mutation['type']} '{mutation['name']}'.{mutation['attr']}: "
             f"{mutation['val']} (nominal: {nominal_val}{time_note})"
         )
+
+    return "\n".join(lines)
+
+
+def _fmt_scalar(value) -> str:
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(f"{float(v):.4g}" for v in value) + "]"
+    return f"{float(value):.4g}"
+
+
+def _param_line(name: str, current, nominal) -> str:
+    edited = ""
+    if nominal is not None:
+        if isinstance(current, (list, tuple)):
+            cur = [float(v) for v in current]
+            nom = [float(v) for v in nominal]
+            changed = cur != nom
+        else:
+            changed = abs(float(current) - float(nominal)) > 1e-9
+        if changed:
+            edited = "  [edited]"
+        return (
+            f"  - {name}: {_fmt_scalar(current)} "
+            f"(nominal {_fmt_scalar(nominal)}){edited}"
+        )
+    return f"  - {name}: {_fmt_scalar(current)}"
+
+
+def format_live_model_parameters(model, loka_state=None) -> str:
+    """Dump live MPC-belief gears, friction, masses, and COM (not the hidden plant)."""
+    nominal = (loka_state or {}).get("nominal_params") or {}
+    nom_act = nominal.get("actuators") or {}
+    nom_geom = nominal.get("geoms") or {}
+    nom_body = nominal.get("bodies") or {}
+
+    lines = [
+        "Live values in the planner belief model. These are what MJPC plans with.",
+        "Suite plant faults (backpack mass, ice, dead hip) are not listed here.",
+        "",
+        "Actuator gear:",
+    ]
+    for actuator_id in range(model.nu):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
+        if not name:
+            continue
+        current = float(model.actuator_gear[actuator_id, 0])
+        nom = (nom_act.get(name) or {}).get("gear")
+        lines.append(_param_line(name, current, nom))
+
+    lines.extend(["", "Body mass (kg):"])
+    for body_id in range(1, model.nbody):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+        if not name:
+            continue
+        current = float(model.body_mass[body_id])
+        nom = (nom_body.get(name) or {}).get("mass")
+        lines.append(_param_line(name, current, nom))
+
+    lines.extend(["", "Body COM / inertial pos [x, y, z] in the body frame (m):"])
+    for body_id in range(1, model.nbody):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+        if not name:
+            continue
+        current = model.body_ipos[body_id].tolist()
+        nom = (nom_body.get(name) or {}).get("com")
+        lines.append(_param_line(name, current, nom))
+
+    lines.extend(["", "Geom friction [slide, spin, roll]:"])
+    for geom_id in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        if not name:
+            continue
+        current = model.geom_friction[geom_id].tolist()
+        nom = (nom_geom.get(name) or {}).get("friction")
+        lines.append(_param_line(name, current, nom))
 
     return "\n".join(lines)
 
@@ -233,8 +352,12 @@ def build_robot_model_context(model, xml_path):
         parent_id = model.body_parentid[body_id]
         parent_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, parent_id) or "world"
         body_pos = model.body_pos[body_id]
+        com = model.body_ipos[body_id]
+        mass = float(model.body_mass[body_id])
         lines.append(
             f"  - {body_name} (parent: {parent_name}, "
+            f"mass={mass:.4g} kg, "
+            f"com=[{com[0]:.3g}, {com[1]:.3g}, {com[2]:.3g}], "
             f"mjcf_pos=[{body_pos[0]:.3g}, {body_pos[1]:.3g}, {body_pos[2]:.3g}])"
         )
 
@@ -284,7 +407,7 @@ def build_robot_model_context(model, xml_path):
         "Mutable object attributes:",
         "  - actuators: gear",
         "  - geoms: friction",
-        "  - bodies: mass",
+        "  - bodies: mass, com  (com is [x, y, z] meters in the body frame)",
     ])
 
     mjcf = load_kinematics_mjcf(xml_path)
