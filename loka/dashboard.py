@@ -370,7 +370,7 @@ class Dashboard:
             self.sim.step()
         row = self.sim.history[-1]
         telemetry = self.sim.controller.telemetry
-        forward, left = heading_frame(float(self.sim.controller.gait.config.heading))
+        forward, left = heading_frame(float(telemetry.yaw_ref))
 
         self.trace["t"].append(row["t"])
         self.trace["com_error"].append(row["com_error"] * 1e3)
@@ -425,7 +425,7 @@ class Dashboard:
             f"   |   QP fallbacks  wbc {controller.wbc._qp.failures}"
             f"  mpc {controller.mpc._qp.failures}",
         )
-        forward, _ = heading_frame(float(controller.gait.config.heading))
+        forward, _ = heading_frame(float(telemetry.yaw_ref))
         travel = float((np.asarray(self.sim.data.qpos[:2]) - self._origin) @ forward)
         dpg.set_value(
             "status3",

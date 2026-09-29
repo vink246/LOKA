@@ -1,6 +1,6 @@
 # Phase B: the walking plant
 
-Status: **8 s at 0.10–0.30 m/s and 30 s at 0.10/0.20/0.35/0.50 m/s hold**
+Status: **8 s at 0.10–0.30 m/s holds. 30 s at 0.10 m/s holds; 30 s at 0.20 m/s stays up but drifts about 0.56 m sideways, so that limit-cycle bound fails.**
 with the speed-scheduled high-DS gait (`gait_schedule_for_speed`, duty
 ~0.82 crawl → ~0.74 at 0.50 m/s). Isolation duty 0.65 still pitches over
 at ~3 s — do not pin the yaml 0.65 default when asking for a walk. CoP
@@ -115,6 +115,14 @@ in different clothing.
   previous foot, so any lateral bias compounded: successive left footholds went
   +0.117, +0.178, +0.207, +0.217 m. A constraint must subtract only its own
   violation, never re-anchor.
+- **The foothold correction was measured against a goal it had just moved.**
+  `_refresh_plan` chains the tail off the corrected foothold, so the
+  end-of-step DCM that the correction was compared with already included the
+  previous tick's correction. Each tick computed `c = k (e − c_prev)` and
+  settled at `k/(1+k)` of the error (0.375 at the old default 0.6). At
+  `k ≥ 1` it oscillated and straight walking fell. The error is now the DCM
+  offset past the target foothold, which that chain shift does not move, and
+  `capture_gain` is the fraction of full placement (default 0.7).
 - **The foothold correction was discarded at touchdown.** `_refresh_plan`
   rewrites `pos = nominal` every tick, and the freeze branch returned before
   re-applying the correction. The foot tracked the capture point for 70% of
@@ -210,6 +218,68 @@ Ruled out by experiment, so as not to be re-litigated:
    standing is unchanged and single support is allowed to sit rather than
    vault. No crouch offset.
 
+## Turning and transitions
+
+`gait.heading` is a goal, not an instantaneous travel frame. The footstep
+chain is a centre line that yaws by at most `TURN_CAP_*` (0.12 rad) per step
+toward that goal, and forward speed is cut to 0.10 m/s while the heading
+error is large. Once that cut has engaged (`TURN_SETTLE`), it stays on until
+the foot-yaw error has been under 0.10 rad for two step boundaries and the
+measured speed is back near the crawl. The stride is still the commanded
+speed; the measurement only delays the return to it. Step period, duty,
+stance width and swing height are latched
+and slewed only at step boundaries. `gait.mode=stand` finishes the airborne
+step instead of resetting mid-swing. Tread marches in place; limp is a
+conservative cadence preset, not an asymmetric gait.
+
+`python -m loka.walk_bench` is the pass/fail matrix. On the yaw-aware plant:
+
+| Scenario | Result |
+| --- | --- |
+| T1 heading +0.3 rad at 0.20 m/s | pass |
+| T2 90° at 0.20 m/s | pass (was a fall at 12.3 s, after the heading was already met) |
+| T3 180° at 0.20 m/s | pass |
+| T4 90° at 0.40 m/s | stays up; speed 0.20 m/s misses the 0.24 bar |
+| T5 turn-in-place, T6 ramp | T5 passes. T6 stays up and misses the heading deadline |
+| G2 cadence / width / swing height mid-walk | pass |
+| G3 stop mid-swing, then walk again | pass |
+| G4 crouch while walking | pass |
+| G5b limp | pass |
+| G1 speed step 0.10→0.50, G6 combined turn+speed | G1 passes. G6 stays up; speed 0.21 m/s misses the 0.24 bar |
+| G5 tread | stays up (was a fall at ~4.3 s) but the later walk ends at −0.19 m/s |
+| S0 straight 0.20 m/s for 30 s | bench passes (no fall, speed holds). The pytest limit cycle also bounds lateral travel, and this walk drifts ~0.56 m |
+| P1/P2 pushes while walking or turning | no falls. The misses are backward pushes: 8 N·s late in swing, and 10–12 N·s, which do not get back to 0.12 m/s. The old swing-clock speed-up never runs: scheduled swing time stays under 0.16 s, and the speed-up requires 0.20 s |
+
+Ruled out while getting here: a 0.25 rad/step cap (T2 fell earlier, roll
+~4°), and duty 0.65 on a turn-in-place (the crawl schedule has to apply at
+zero speed). Slowing the cap to 0.08 rad/step lets a 90° turn reach the
+heading and then fall as speed recovers. That is a balance problem, not a
+missing yaw reference. `TURN_SETTLE` is the hold that stops that recovery
+from starting until the feet have caught the heading.
+
+Also ruled out, from a pass at [wb_humanoid_mpc](https://github.com/manumerous/wb_humanoid_mpc) (ideas only):
+
+| Idea | Result |
+| --- | --- |
+| Pelvis yaw only during double support (`YAW_IN_DS_ONLY`) | T1 fell at 6.3 s. The swing foot still yaws through single support, so freezing the pelvis fights it. Flag left off. |
+| Schedule cadence from measured speed (`SPEED_HYSTERESIS`) | G1 already passes without it. Not what made T2 pass. Flag left off. |
+| Freeze the speed ramp while the body lags (`RAMP_FREEZE`) | Same. Flag left off. The ramp is never pulled down by a measurement. |
+| Soft spline touchdown (`SWING_PROFILE = "spline"`) | T5 touchdowns are already ~2 mm and ~2°. The falls are not impacts. Sine stays. |
+| Yaw-moment penalty in the force QP | Stance-foot yaw rate on T5 has median 0.005 rad/s. The foot is not spinning. Not added. |
+| Step-timing QP (`STEP_TIMING`) | Weights 0.02, 0.1 and 0.5 all walked S0 backwards (~−0.3 m/s) and turned survived pushes into falls. Flag left off. The foothold law alone is what cleared the falls. |
+| `TURN_CAP_*` = 0.16 rad/step | Turn-in-place (T5) fell at 6.3 s. 0.12 did not, and it is the cap now. 0.25 was already ruled out. |
+
+### Residual RL, scoped and not trained
+
+A joint-torque residual is not justified. The failures that remain are
+turn-in-place, tread, and the speed check on a turn whose crawl outlasts the
+bench window. A 90° turn at 0.20 m/s now holds. If a later pass at
+the CoP margin and the post-turn speed recovery does not clear them, the
+cheap experiment is a per-step residual on the gait layer only: foothold xy
+offset, a swing-clock scale, and optionally a yaw offset, bounded and added
+to the capture correction, trained on the failing `walk_bench` scenarios.
+`results/dr_rl*` is a different stack and is not a reason to skip that.
+
 ## Tools for the next attempt
 
 `python -m loka.diagnose_walk` records a 125 Hz trace (CoM vs plan in the
@@ -228,5 +298,8 @@ first after touching `gait.py` — then sweeps the closed loop.
 
 `tests/test_gait.py` holds the planner invariants plus
 `test_closed_loop_walk_stays_up` (8 s, 0.10/0.20/0.30) and
-`test_closed_loop_walk_is_a_limit_cycle` (30 s, 0.10/0.20/0.35/0.50, `--slow`).
-Pelvis-z alone is not a pass.
+`test_closed_loop_walk_is_a_limit_cycle` (30 s, 0.10/0.20/0.35/0.50, marker
+`slow`). The 0.35 and 0.50 rows are the same run: `gait.speed` clamps at
+0.30, and that walk averages 0.20 m/s over 30 s, so both miss `0.6 ×` the
+requested speed. That miss is unchanged with `TURN_SETTLE` off. Pelvis-z
+alone is not a pass.

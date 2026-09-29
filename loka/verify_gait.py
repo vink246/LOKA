@@ -37,7 +37,7 @@ def plan_only(speed: float, *, ticks: int = 3000, dt: float = 0.002, **overrides
         step_period=0.70,
         duty_factor=0.65,
         stance_width=0.24,
-        capture_gain=1.0,
+        capture_gain=0.5,  # old law's fixed point; 1.0 is now full placement
         walk_accel=50.0,
     )
     cfg.update(overrides)
@@ -103,12 +103,17 @@ def walk(speed: float, duration: float, **gait) -> dict:
 
     travel = np.array(sim.data.qpos[:2]) - start
     elapsed = float(sim.data.time)
+    # Along the yaw the robot actually settled on, so a turn is not "lateral".
+    from loka.control.gait import heading_frame
+    from loka.control.robot import quat_to_rpy
+
+    forward, left = heading_frame(float(quat_to_rpy(sim.data.qpos[3:7])[2]))
     return dict(
         elapsed=elapsed,
         fell=bool(sim.fell),
-        forward=float(travel[0]),
-        lateral=float(travel[1]),
-        speed=float(travel[0]) / max(elapsed, 1e-9),
+        forward=float(travel @ forward),
+        lateral=float(travel @ left),
+        speed=float(travel @ forward) / max(elapsed, 1e-9),
         steps=steps,
         clearance=clearance,
         swing_err=swing_err,

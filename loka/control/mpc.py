@@ -89,6 +89,7 @@ class CentroidalState:
 class CentroidalReference:
     com: np.ndarray
     yaw: float = 0.0
+    yaw_rate: float = 0.0
     com_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 
@@ -280,6 +281,7 @@ class ConvexMPC:
         self,
         positions: np.ndarray,
         yaw: float,
+        foot_yaw_seq: np.ndarray | None = None,
     ) -> None:
         """Write per-foot CoP-in-sole inequalities into the constraint block.
 
@@ -290,15 +292,17 @@ class ConvexMPC:
         *reference*; this box is the physical sole (Sleiman).
         """
         cfg = self.config
-        c, s = np.cos(yaw), np.sin(yaw)
-        # Columns are world (x, y); rows are (forward, left).
-        rotate = np.array([[c, s], [-s, c]])
         half_f = SOLE_HALF_LENGTH
         half_l = max(1e-3, SOLE_HALF_WIDTH - float(cfg.cop_margin))
         n_fric = self._n_friction
         self._constraint[n_fric:] = 0.0
+        yaws = None if foot_yaw_seq is None else np.asarray(foot_yaw_seq, dtype=float)
         for k in range(cfg.horizon):
             for foot in range(self.num_feet):
+                foot_yaw = float(yaw if yaws is None else yaws[k, foot])
+                c, s = np.cos(foot_yaw), np.sin(foot_yaw)
+                # Columns are world (x, y); rows are (forward, left).
+                rotate = np.array([[c, s], [-s, c]])
                 sl = slice(foot * SITES_PER_FOOT, (foot + 1) * SITES_PER_FOOT)
                 pts = np.asarray(positions[k, sl, :2], dtype=float)
                 center = pts.mean(axis=0)
@@ -350,6 +354,7 @@ class ConvexMPC:
         contact_mask: np.ndarray | None = None,
         schedule: np.ndarray | None = None,
         contact_pos_seq: np.ndarray | None = None,
+        foot_yaw_seq: np.ndarray | None = None,
     ) -> np.ndarray:
         """Return the desired contact forces now, shape ``(nc, 3)``.
 
@@ -379,13 +384,18 @@ class ConvexMPC:
         # wins, which is how the MPC ended up braking every step.
         velocity = np.asarray(reference.com_velocity, dtype=float)
         com_ref = np.asarray(reference.com, dtype=float)
+        # Wrap so a heading near ±π is a small error, not a 2π jump.
+        yaw_err = (float(reference.yaw) - float(state.rpy[2]) + np.pi) % (2.0 * np.pi) - np.pi
+        yaw0 = float(state.rpy[2]) + yaw_err
+        yaw_rate = float(reference.yaw_rate)
+        omega_ref = np.array([0.0, 0.0, yaw_rate])
         x_ref = np.concatenate(
             [
                 np.concatenate(
                     [
-                        [0.0, 0.0, reference.yaw],
+                        [0.0, 0.0, yaw0 + yaw_rate * (k + 1) * cfg.dt],
                         com_ref + velocity * (k + 1) * cfg.dt,
-                        np.zeros(3),
+                        omega_ref,
                         velocity,
                         [-GRAVITY],
                     ]
@@ -406,7 +416,7 @@ class ConvexMPC:
         b_seq = [
             self._input_matrix(positions[k], com_seq[k], inertia_inv) for k in range(n)
         ]
-        self._fill_cop(positions, float(state.rpy[2]))
+        self._fill_cop(positions, float(state.rpy[2]), foot_yaw_seq)
         a_qp, b_qp = self._condense(a_d, b_seq)
 
         state_w = np.tile(cfg.state_weights(), n)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from loka.agent.directives import format_listeners, format_mission_directives
 from loka.agent.error_spec import format_error_spec
 from loka.agent.robot_context import format_current_model_belief
 
@@ -11,9 +12,14 @@ def _format_context_sections(
     belief: str,
     telemetry_header: str,
     telemetry: str,
+    loka_state: dict,
     error_tracking: str | None = None,
 ) -> str:
     parts = [
+        "## LOCKED MISSION DIRECTIVES\n"
+        f"{format_mission_directives(loka_state)}\n\n"
+        "## ACTIVE LISTENERS\n"
+        f"{format_listeners(loka_state)}\n\n"
         "## CURRENT MPC CONFIGURATION\n"
         f"{mpc_config}\n"
     ]
@@ -141,6 +147,7 @@ class FailureEpisode(ConversationMixin):
                 belief,
                 "## NEW TELEMETRY",
                 telemetry,
+                loka_state,
                 error_tracking=_error_tracking_text(loka_state),
             )
         )
@@ -163,6 +170,7 @@ class FailureEpisode(ConversationMixin):
                 belief,
                 "## NEW TELEMETRY",
                 telemetry,
+                loka_state,
                 error_tracking=_error_tracking_text(loka_state),
             )
         )
@@ -187,14 +195,12 @@ class OperatorSession(ConversationMixin):
     ) -> str:
         belief = format_current_model_belief(loka_state)
         return (
-            f"--- OPERATOR REQUEST (t={sim_time:.2f}s) ---\n"
+            f"--- OPERATOR DIRECTIVE (t={sim_time:.2f}s) ---\n"
             f"{request.strip()}\n\n"
-            "The operator is requesting a deliberate strategy or objective change. "
-            "Adjust MPC cost weights, planner metaparameters, task parameters, and "
-            "internal model beliefs to explore this request. "
-            "Because the overarching objective is changing, you MUST include an "
-            "updated Error_Tracking block so success/failure criteria match the new "
-            "mission. Do not assume hardware failure unless telemetry supports it.\n\n"
+            "This sentence is now a locked mission directive. You cannot change it. "
+            "Drive the robot with Task_Targets (including gait.*), Error_Tracking, "
+            "and Listeners. Include Error_Tracking so success and failure match the "
+            "directive. Do not assume hardware failure unless telemetry supports it.\n\n"
             "## PRIOR INTERVENTIONS THIS SESSION\n"
             f"{self.format_prior_interventions()}\n\n"
             + _format_context_sections(
@@ -202,6 +208,60 @@ class OperatorSession(ConversationMixin):
                 belief,
                 "## CURRENT TELEMETRY SNAPSHOT",
                 telemetry,
+                loka_state,
+                error_tracking=_error_tracking_text(loka_state),
+            )
+        )
+
+    def build_listener_turn(
+        self,
+        messages: list[str],
+        telemetry: str,
+        loka_state: dict,
+        sim_time: float,
+        mpc_config: str,
+    ) -> str:
+        belief = format_current_model_belief(loka_state)
+        body = "\n".join(f"- {m}" for m in messages)
+        return (
+            f"--- LISTENER (t={sim_time:.2f}s) ---\n"
+            "A condition you armed is now true. The telemetry snapshot is current.\n"
+            f"{body}\n\n"
+            "Act on the message. Keep pursuing every locked directive. "
+            "Arm the next listener if the directive is not finished, or clear "
+            "listeners with an empty list when it is.\n\n"
+            + _format_context_sections(
+                mpc_config,
+                belief,
+                "## CURRENT TELEMETRY SNAPSHOT",
+                telemetry,
+                loka_state,
+                error_tracking=_error_tracking_text(loka_state),
+            )
+        )
+
+    def build_heartbeat_turn(
+        self,
+        telemetry: str,
+        loka_state: dict,
+        sim_time: float,
+        mpc_config: str,
+        *,
+        period_s: float,
+    ) -> str:
+        belief = format_current_model_belief(loka_state)
+        return (
+            f"--- PERIODIC CHECK (t={sim_time:.2f}s, every {period_s:.0f}s) ---\n"
+            "No listener invoked you in this interval. Recheck the locked "
+            "directives against the telemetry. Correct gait, task targets, "
+            "Error_Tracking, or model belief if the robot has drifted off the "
+            "plan. Leave listeners armed if they are still the right wake-up.\n\n"
+            + _format_context_sections(
+                mpc_config,
+                belief,
+                "## CURRENT TELEMETRY SNAPSHOT",
+                telemetry,
+                loka_state,
                 error_tracking=_error_tracking_text(loka_state),
             )
         )

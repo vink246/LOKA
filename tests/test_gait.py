@@ -21,7 +21,12 @@ import numpy as np
 import pytest
 
 from loka.control.gait import (
+    HEADING_CRAWL_SPEED,
+    MAX_DCM_CORRECTION,
     MODE_WALK,
+    SCHED_UP_LAG,
+    SWING_TOUCHDOWN_VZ,
+    SWING_TOUCHDOWN_Z,
     GaitConfig,
     GaitScheduler,
     LegPhase,
@@ -75,7 +80,9 @@ def walking_scheduler(**overrides):
         step_period=0.70,
         duty_factor=0.65,
         stance_width=0.24,
-        capture_gain=1.0,
+        # 0.5 is the old law's fixed point (k/(1+k) at k=1). Full placement (1.0)
+        # shifts the isolation orbit these tests were written against.
+        capture_gain=0.5,
         walk_accel=50.0,  # snap to commanded speed so tests are not ramp-limited
     )
     cfg.update(overrides)
@@ -134,15 +141,20 @@ def test_speed_schedule_slows_the_lateral_orbit_at_low_speed():
 
 def test_speed_schedule_fills_cadence_unless_the_user_pins_it():
     sched = GaitScheduler(GaitConfig(mode=MODE_WALK, speed=0.0))
-    applied = sched.apply_updates({"gait.mode": MODE_WALK, "gait.speed": 0.50})
+    applied = sched.apply_updates({"gait.mode": MODE_WALK, "gait.speed": 0.30})
+    assert applied["gait.speed"] == pytest.approx(0.30)
     assert applied["gait.step_period"] == pytest.approx(
-        gait_schedule_for_speed(0.50)["gait.step_period"]
+        gait_schedule_for_speed(0.30)["gait.step_period"]
     )
+    # Above the straight-walk band the command is clipped, then the schedule
+    # follows the clipped speed.
+    clipped = sched.apply_updates({"gait.speed": 0.80})
+    assert clipped["gait.speed"] == pytest.approx(0.30)
     pinned = GaitScheduler(GaitConfig(mode=MODE_WALK, speed=0.0))
     pinned.apply_updates(
         {
             "gait.mode": MODE_WALK,
-            "gait.speed": 0.50,
+            "gait.speed": 0.30,
             "gait.step_period": 0.70,
         }
     )
@@ -154,7 +166,7 @@ def test_mpc_preview_puts_the_swing_foot_on_the_bezier():
     sched = walking_scheduler()
     com = np.array([0.0, 0.0, HEIGHT])
     out = _run_until_swing(sched, com=com, feet=FEET)
-    contact, pose = sched.preview(horizon=6, dt=0.05)
+    contact, pose, _yaw = sched.preview(horizon=6, dt=0.05)
     assert pose.shape == (6, 2, 3)
     swing = int(out.swing.leg)
     airborne = ~contact[:, swing]
@@ -408,7 +420,9 @@ def test_gait_clock_does_not_commit_a_short_plant():
     out = _run_until_swing(sched, com=com, feet=feet, dt=dt)
     step = sched._step
     out, high = _hover_until_waiting(sched, com=com, feet=feet, out=out, dt=dt)
-    short = feet[out.swing.leg, :2].copy()
+    # The hovered foot can sit inside the touchdown radius once capture pulls
+    # the foothold toward it. Place an explicitly short landing instead.
+    short = np.asarray(out.swing.foothold[:2], dtype=float) - np.array([0.04, 0.0])
     assert float(np.linalg.norm(short - out.swing.foothold[:2])) > TOUCHDOWN_RADIUS
     planted = _place_swing(high, out, z=0.0, xy=short)
     mask = PLANTED.copy()
@@ -663,6 +677,311 @@ def test_capture_gain_zero_leaves_the_nominal_plan_alone():
     np.testing.assert_allclose(calm[0][1], racing[0][1], atol=1e-9)
 
 
+def test_foothold_correction_does_not_feed_back_on_itself():
+    """Applying the correction twice at one instant must give the same foothold.
+
+    The old law compared the predicted DCM with a goal the previous correction
+    had already moved, so a second pass computed ``k (e - c)`` instead of ``c``.
+    """
+    sched = walking_scheduler(speed=0.25, capture_gain=1.0)
+    com = np.array([0.0, 0.0, HEIGHT])
+    com_vel = np.array([0.40, 0.05, 0.0])
+    out = None
+    for _ in range(4000):
+        out = drive(sched, com=com, com_vel=com_vel)
+        if out.swing.active and 0.1 < out.swing.s < 0.4:
+            break
+    assert out is not None and out.swing.active and 0.1 < out.swing.s < 0.4
+    t_step, _, _ = sched._durations()
+    omega = sched._omega(HEIGHT)
+    dcm = com[:2] + com_vel[:2] / omega
+    s = float(out.swing.s)
+    tau = float(sched._tau)
+    corrections = []
+    target = sched._steps[sched._step + 1]
+    for _ in range(2):
+        sched._tau = tau
+        sched._refresh_plan(t_step=t_step, speed=sched._cmd_speed)
+        sched._apply_dcm_correction(dcm=dcm, s=s, omega=omega, t_step=t_step)
+        corrections.append(np.array(target.correction, dtype=float))
+    np.testing.assert_allclose(corrections[0], corrections[1], atol=1e-9)
+    norm = float(np.linalg.norm(corrections[0]))
+    assert 1e-3 < norm < MAX_DCM_CORRECTION - 1e-3
+
+
+def _in_double_support(sched):
+    t_step, _, t_ds = sched._durations()
+    support = sched._steps.get(sched._step)
+    return (
+        support is not None
+        and not support.initial
+        and sched._tau < t_ds
+        and t_ds > 0.02
+    )
+
+
+def test_step_timing_stays_nominal_until_a_swing_has_cleared():
+    """Isolation never clears a swing, so the timing QP must not change the clock."""
+    import loka.control.gait as gait
+
+    previous = gait.STEP_TIMING
+    gait.STEP_TIMING = True
+    try:
+        sched = walking_scheduler(speed=0.25, capture_gain=0.7)
+        assert not sched._cleared_once
+        com = np.array([0.0, 0.0, HEIGHT])
+        for _ in range(1500):
+            drive(sched, com=com, com_vel=np.array([1.2, 0.0, 0.0]))
+            assert sched._ds_rate == pytest.approx(1.0)
+            assert sched._swing_rate == pytest.approx(1.0)
+    finally:
+        gait.STEP_TIMING = previous
+
+
+def test_step_timing_only_shortens_and_speeds_double_support_first():
+    import loka.control.gait as gait
+
+    previous = gait.STEP_TIMING
+    gait.STEP_TIMING = True
+    try:
+        sched = walking_scheduler(speed=0.25, capture_gain=0.7)
+        sched._cleared_once = True
+        com = np.array([0.0, 0.0, HEIGHT])
+        com_vel = np.array([1.2, 0.0, 0.0])
+        fastest = 1.0
+        for _ in range(2500):
+            drive(sched, com=com, com_vel=com_vel)
+            assert sched._ds_rate >= 1.0 - 1e-9
+            assert 1.0 - 1e-9 <= sched._swing_rate <= gait.STEP_SWING_RATE_MAX + 1e-9
+            if _in_double_support(sched):
+                fastest = max(fastest, sched._ds_rate)
+        assert fastest > 1.0
+    finally:
+        gait.STEP_TIMING = previous
+
+
+def test_preview_uses_the_double_support_rate():
+    import loka.control.gait as gait
+
+    previous = gait.STEP_TIMING
+    gait.STEP_TIMING = True
+    try:
+        sched = walking_scheduler(speed=0.25, capture_gain=0.0)
+        com = np.array([0.0, 0.0, HEIGHT])
+        for _ in range(2500):
+            out = drive(sched, com=com, com_vel=np.array([0.25, 0.0, 0.0]))
+            if _in_double_support(sched) and not out.swing.active:
+                break
+        assert _in_double_support(sched)
+        sched._ds_rate = 2.0
+        sched._swing_rate = 1.0
+        _, _, t_ds = sched._durations()
+        dt = 0.02
+        contact, _, _ = sched.preview(horizon=40, dt=dt)
+        landing = sched._steps[sched._step + 1]
+        expected = int(np.ceil(((t_ds - sched._tau) / 2.0) / dt)) - 1
+        first = next(k for k in range(40) if not contact[k, landing.leg])
+        assert abs(first - expected) <= 1
+    finally:
+        gait.STEP_TIMING = previous
+
+
+def test_step_timing_foothold_does_not_feed_back_on_itself():
+    import loka.control.gait as gait
+
+    previous = gait.STEP_TIMING
+    gait.STEP_TIMING = True
+    try:
+        sched = walking_scheduler(speed=0.25, capture_gain=1.0)
+        com = np.array([0.0, 0.0, HEIGHT])
+        com_vel = np.array([0.40, 0.05, 0.0])
+        out = None
+        for _ in range(4000):
+            out = drive(sched, com=com, com_vel=com_vel)
+            if out.swing.active and 0.1 < out.swing.s < 0.4:
+                break
+        assert out is not None and out.swing.active
+        t_step, t_swing, t_ds = sched._durations()
+        omega = sched._omega(HEIGHT)
+        dcm = com[:2] + com_vel[:2] / omega
+        s = float(out.swing.s)
+        tau = float(sched._tau)
+        footholds = []
+        target = sched._steps[sched._step + 1]
+        for _ in range(2):
+            sched._tau = tau
+            sched._refresh_plan(t_step=t_step, speed=sched._cmd_speed)
+            sched._step_adjust(
+                dcm=dcm, s=s, omega=omega, t_step=t_step,
+                t_swing=t_swing, t_ds=t_ds, in_swing=True,
+            )
+            footholds.append(np.array(target.pos, dtype=float))
+        np.testing.assert_allclose(footholds[0], footholds[1], atol=1e-4)
+    finally:
+        gait.STEP_TIMING = previous
+
+
+def test_heading_step_turns_one_step_at_a_time():
+    """A 90° heading goal must not yaw the next foot by 90°."""
+    from loka.control.gait import MIN_FOOT_SEPARATION, heading_frame, max_turn_per_step, wrap_angle
+
+    sched = walking_scheduler(speed=0.20, heading=np.pi / 2, capture_gain=0.0)
+    com = np.zeros(3)
+    com[2] = HEIGHT
+    feet = FEET.copy()
+    drive(sched, com=com, com_vel=np.zeros(3), feet=feet, ticks=4000)
+    yaws = [float(step.yaw) for _, step in sorted(sched._steps.items()) if step.leg >= 0]
+    cap = max_turn_per_step(0.20, sched._t_step, sched.config.turn_rate) + 1e-6
+    for a, b in zip(yaws, yaws[1:]):
+        assert abs(wrap_angle(b - a)) <= cap + 1e-6
+    assert abs(wrap_angle(yaws[-1] - np.pi / 2)) < 0.05
+    for index, step in sched._steps.items():
+        support = sched._steps.get(index - 1)
+        if support is None or step.leg < 0 or support.leg < 0:
+            continue
+        _, left = heading_frame(float(support.yaw))
+        gap = abs(float(np.dot(step.pos - support.pos, left)))
+        assert gap + 1e-6 >= MIN_FOOT_SEPARATION * 0.5
+
+
+def test_heading_wraps_the_short_way():
+    from loka.control.gait import wrap_angle
+
+    sched = walking_scheduler(speed=0.20, heading=3.0, capture_gain=0.0)
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.zeros(3), ticks=1500)
+    yaw_at_switch = float(sched._steps[sched._step].yaw)
+    sched.config.heading = -3.0
+    drive(sched, com=com, com_vel=np.zeros(3), ticks=1500)
+    yaw = float(sched._steps[sched._step].yaw)
+    short = wrap_angle(-3.0 - yaw_at_switch)
+    # Motion after the switch follows the short arc, not the long way round.
+    assert wrap_angle(yaw - yaw_at_switch) * np.sign(short) > 0.02
+
+
+def test_turn_in_place_keeps_the_centre():
+    sched = walking_scheduler(speed=0.0, heading=np.pi / 2, capture_gain=0.0)
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.zeros(3), ticks=3000)
+    assert sched.walking
+    centre = np.mean([step.pos for step in sched._steps.values()], axis=0)
+    assert float(np.linalg.norm(centre)) < 0.05
+
+
+def test_mid_swing_period_change_does_not_jump_phase():
+    sched = walking_scheduler(step_period=0.80, duty_factor=0.80)
+    com = np.array([0.0, 0.0, HEIGHT])
+    out = _run_until_swing(sched, com=com, feet=FEET)
+    s0 = float(out.swing.s)
+    mask0 = out.contact_mask.copy()
+    sched.config.step_period = 0.50
+    sched.config.duty_factor = 0.60
+    out = drive(sched, com=com, com_vel=np.zeros(3))
+    assert abs(out.swing.s - s0) < 0.05
+    assert np.array_equal(out.contact_mask, mask0)
+
+
+def test_schedule_speed_does_not_jump_ahead_of_the_measurement():
+    """Cadence may lead the measured speed by SCHED_UP_LAG, not by the command."""
+    from loka.control.gait import SPEED_HYSTERESIS
+
+    if not SPEED_HYSTERESIS:
+        pytest.skip("SPEED_HYSTERESIS is off")
+    sched = walking_scheduler(speed=0.50, walk_accel=50.0)
+    sched._use_speed_schedule = True
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.zeros(3), ticks=2500)
+    assert sched._sched_speed <= SCHED_UP_LAG + 1e-6
+    assert sched._cmd_speed > 0.20
+
+
+def test_schedule_speed_holds_while_capture_is_hot():
+    from loka.control.gait import SPEED_HYSTERESIS
+
+    if not SPEED_HYSTERESIS:
+        pytest.skip("SPEED_HYSTERESIS is off")
+    sched = walking_scheduler(speed=0.30, walk_accel=50.0)
+    sched._sched_speed = 0.20
+    sched._sched_dwell = 10
+    sched._capture_hot = True
+    sched._cmd_speed = 0.30
+    sched._update_sched_speed()
+    assert sched._sched_speed == pytest.approx(0.20)
+    assert sched._cmd_speed == pytest.approx(0.30)
+
+
+def test_ramp_freeze_never_decreases_the_command_because_of_lag():
+    from loka.control.gait import RAMP_FREEZE
+
+    if not RAMP_FREEZE:
+        pytest.skip("RAMP_FREEZE is off")
+    sched = walking_scheduler(speed=0.40, walk_accel=1.0)
+    sched._cleared_once = True
+    sched._meas_speed = 0.0
+    sched._cmd_speed = 0.20
+    sched._velocity_command(0.002)
+    assert sched._cmd_speed == pytest.approx(0.20)
+    sched.config.speed = 0.05
+    sched._velocity_command(0.002)
+    assert sched._cmd_speed < 0.20
+
+
+def test_turn_settle_holds_the_crawl_until_the_heading_is_met():
+    sched = walking_scheduler(speed=0.40, heading=1.2, walk_accel=50.0)
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.zeros(3), ticks=200)
+    assert sched._turning
+    assert sched._cmd_speed <= HEADING_CRAWL_SPEED + 1e-6
+    released = walking_scheduler(speed=0.20, heading=0.0)
+    released._turning = True
+    released._meas_speed = 0.0
+    released._update_turning(at_boundary=True)
+    assert released._turning
+    released._update_turning(at_boundary=True)
+    assert not released._turning
+
+
+def test_yaw_rate_is_zero_in_single_support():
+    from loka.control.gait import YAW_IN_DS_ONLY
+
+    if not YAW_IN_DS_ONLY:
+        pytest.skip("YAW_IN_DS_ONLY is off; the full-step yaw ramp is the shipped reference")
+    sched = walking_scheduler(
+        speed=0.0, heading=1.0, capture_gain=0.0, duty_factor=0.70, step_period=0.80,
+    )
+    com = np.array([0.0, 0.0, HEIGHT])
+    observed = False
+    out = None
+    for _ in range(5000):
+        out = sched.step(
+            dt=0.002, com=com, com_vel=np.zeros(3), foot_centers=FEET,
+            ground_z=0.0, height=HEIGHT, measured_mask=PLANTED,
+        )
+        step = sched._steps.get(sched._step)
+        if step is None or step.initial:
+            continue
+        _, _, t_ds = sched._durations()
+        if t_ds <= sched._tau < sched._current_duration(sched._t_step):
+            observed = True
+            assert abs(out.yaw_rate_ref) < 1e-8
+    assert observed
+
+
+def test_spline_swing_lands_softly_and_peaks_at_the_commanded_height():
+    start = np.zeros(3)
+    end = np.array([0.2, 0.0, 0.0])
+    t_swing = 0.25
+    landed, vel_s, _ = swing_reference(
+        start, end, 1.0, swing_height=0.045, t_swing=t_swing, profile="spline",
+    )
+    mid, _, _ = swing_reference(
+        start, end, 0.5, swing_height=0.045, t_swing=t_swing, profile="spline",
+    )
+    assert landed[2] == pytest.approx(SWING_TOUCHDOWN_Z, abs=1e-6)
+    assert vel_s[2] / t_swing == pytest.approx(-SWING_TOUCHDOWN_VZ, abs=1e-6)
+    assert mid[2] == pytest.approx(0.045, abs=1e-6)
+
+
 # -- 6. closed-loop walk on the robot ------------------------------------
 
 
@@ -694,6 +1013,21 @@ def _walk(speed: float, duration: float, **gait):
         steps=steps,
         clearance=clearance,
     )
+
+
+def test_hip_yaw_sign():
+    """+hip yaw must increase foot yaw relative to the pelvis."""
+    from loka.control.robot import quat_to_rpy
+
+    sim = Simulation()
+    robot = sim.controller.robot
+    q = robot.nominal_qpos.copy()
+    robot.update(q, np.zeros(robot.nv))
+    base = float(robot.foot_yaws()[0] - quat_to_rpy(q[3:7])[2])
+    q[QPOS_JOINT0 + HIP_YAW] += 0.1
+    robot.update(q, np.zeros(robot.nv))
+    moved = float(robot.foot_yaws()[0] - quat_to_rpy(q[3:7])[2])
+    assert moved > base + 0.05
 
 
 def test_swing_ankles_release_on_the_descending_arc():
@@ -747,11 +1081,13 @@ def test_swing_sole_orientation_engages_on_the_descending_arc():
         if gait is None or not gait.swing.active:
             continue
         active = bool(sim.controller._last_swing_orient_active)
+        # Yaw is tracked for the whole swing. Pitch and roll join only on
+        # the descending arc (the ankle hold owns them until then), so the
+        # task itself is active on both sides of the release.
         if gait.swing.s <= SWING_ANKLE_RELEASE_S:
-            assert not active
+            assert active
             saw_off = True
         elif active:
-            # Dropped again once the foot is accepted into the contact mask.
             saw_on = True
         if saw_off and saw_on:
             return

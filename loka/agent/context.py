@@ -63,24 +63,47 @@ def format_stand_capabilities_block(capabilities: dict) -> str:
         "",
         "### Gait Task_Targets (stand ↔ walk)",
         "gait.mode: stand|walk|tread|limp  (or 0..3)",
-        "gait.speed [m/s], gait.heading [rad world], gait.step_period [s],",
-        "gait.duty_factor, gait.step_length_max, gait.swing_height,",
-        "gait.stance_width, gait.capture_gain, gait.walk_accel,",
-        "gait.foothold_retarget_s",
-        "Setting gait.mode=walk with omitted speed defaults to ~0.25 m/s.",
+        *_gait_knob_lines(),
+        "gait.heading is a goal. The feet turn at gait.turn_rate, and a large",
+        "heading error cuts speed to a crawl. yaw is a standing offset from the",
+        "feet, ignored while walking. lean_x/lean_y are in the stance frame.",
+        "Setting gait.mode=walk with omitted speed and heading defaults to ~0.25 m/s.",
         "Foothold XY and contact schedules are classical (not LLM-settable).",
         "While walking: contact slip, force mismatch, and CoM residuals during",
         "swing are expected. Do NOT lower friction_mu or kp_base_position for",
         "those alone — prefer gait.speed / duty / step_period, or lean.",
         "",
         "### Model_Mutations (belief on the controller's private MjModel)",
-        "object_type: actuator|geom|body; attributes: gear|friction|mass",
-        "Zero actuator gear for virtual amputation; do not raise gear to 'force' a seized joint.",
+        "object_type: actuator|geom|body",
+        "attributes: gear | friction | mass | com",
+        "com is [x, y, z] meters in that body's frame (+x forward, +y left, +z up).",
+        "Shift com when the load is offset; raise mass when the whole body is heavier.",
+        "Zero actuator gear for a dead joint; do not raise gear to 'force' a seized joint.",
+        "",
+        "### Listeners",
+        "Arm a one-shot wake: kind near_xy | heading_error_below | speed_below |",
+        "pelvis_z_below | pelvis_z_above | after_s, plus a message.",
+        "near_xy uses world pelvis x,y and radius (default 0.4 m).",
+        "Set the point early: the call itself takes time and the robot keeps moving.",
+        "Omit Listeners to leave the current set armed; an empty list clears them.",
     ]
     return "\n".join(lines)
 
 
 LEAN_FRACTION_TEXT = "55%"
+
+
+def _gait_knob_lines() -> list[str]:
+    from loka.control.gait import GAIT_KNOBS
+
+    lines = []
+    for knob in GAIT_KNOBS:
+        if knob.field == "mode":
+            continue
+        lines.append(
+            f"  {knob.name} in [{knob.low:.3g}, {knob.high:.3g}]: {knob.summary}"
+        )
+    return lines
 
 
 def format_stand_configuration(controller: LocomotionController) -> str:

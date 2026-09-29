@@ -258,20 +258,31 @@ class G1Model:
         """World positions of the two foot-centre sites, ``(2, 3)``."""
         return self.data.site_xpos[self.foot_center_site_ids].copy()
 
-    def support_margin(self) -> np.ndarray:
+    def foot_yaws(self) -> np.ndarray:
+        """Yaw of each foot-centre site [rad], world frame, shape ``(2,)``."""
+        return np.array(
+            [quat_to_rpy(self.site_quat(int(sid)))[2] for sid in self.foot_center_site_ids]
+        )
+
+    def support_margin(self, yaw: float | None = None) -> np.ndarray:
         """CoM distance to the support-polygon edge, ``[-x, +x, -y, +y]`` [m].
 
-        Uses the axis-aligned bounding box of the planted sole points, which is
-        exact for the rectangular double-support stance this controller holds.
+        The box is axis-aligned in the yaw frame (the stance heading). Omit
+        ``yaw`` to keep the historical world-frame box.
         """
-        contacts = self.data.site_xpos[self.contact_site_ids]
-        com = self.data.subtree_com[0]
+        contacts = np.asarray(self.data.site_xpos[self.contact_site_ids], dtype=float)
+        com = np.asarray(self.data.subtree_com[0], dtype=float)
+        pts = contacts[:, :2] - com[:2]
+        if yaw is not None:
+            c, s = np.cos(float(yaw)), np.sin(float(yaw))
+            rot = np.array([[c, s], [-s, c]])
+            pts = pts @ rot.T
         return np.array(
             [
-                com[0] - contacts[:, 0].min(),
-                contacts[:, 0].max() - com[0],
-                com[1] - contacts[:, 1].min(),
-                contacts[:, 1].max() - com[1],
+                -float(pts[:, 0].min()),
+                float(pts[:, 0].max()),
+                -float(pts[:, 1].min()),
+                float(pts[:, 1].max()),
             ]
         )
 

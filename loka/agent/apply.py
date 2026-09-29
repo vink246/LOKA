@@ -7,6 +7,7 @@ from typing import Any
 import mujoco
 
 from loka.control.locomotion import LocomotionController
+from loka.agent.directives import LISTENER_KINDS, parse_listeners
 from loka.agent.error_spec import format_error_spec, parse_error_tracking
 from loka.agent.model_state import resolve_mjcf_name
 from loka.agent.context import format_stand_configuration
@@ -40,6 +41,7 @@ def apply_stand_scratchpad(
         "task_targets": {},
         "error_tracking": False,
         "mutations": 0,
+        "listeners": 0,
     }
     if not scratchpad or "Semantic_State" not in scratchpad:
         print("\n[!] Failed to parse LOKA scratchpad (missing Semantic_State).")
@@ -115,6 +117,7 @@ def apply_stand_scratchpad(
                 error_tracking, belief_model.nq, belief_model.nv
             )
             loka_state["error_spec"] = new_spec
+            loka_state["error_spec_owner"] = "loka"
             summary["error_tracking"] = True
             print(format_error_spec(new_spec))
         except Exception as exc:
@@ -163,6 +166,42 @@ def apply_stand_scratchpad(
             nominal = belief_model.actuator_gear[:, 0].copy()
             loka_state["nominal_gears"] = nominal
         apply_loka_mutations(belief_model, loka_state, nominal)
+
+    # -- Listeners (wake conditions; omit the key to leave them armed) -----
+    if "Listeners" in scratchpad:
+        raw = scratchpad.get("Listeners") or []
+        parsed = parse_listeners(raw, armed_at=float(sim_time or 0.0))
+        skipped = 0
+        if isinstance(raw, dict):
+            raw_items = [raw]
+        elif isinstance(raw, list):
+            raw_items = raw
+        else:
+            raw_items = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            kind = str(item.get("kind") or item.get("when") or "")
+            if kind not in LISTENER_KINDS or not str(item.get("message") or "").strip():
+                skipped += 1
+                print(f"     * [WARN] Listener ignored (kind={kind!r})")
+        loka_state["listeners"] = parsed
+        summary["listeners"] = len(parsed)
+        if parsed:
+            print("  -> Listeners armed:")
+            for listener in parsed:
+                print(f"     * {listener.format_line()}")
+        else:
+            print("  -> Listeners cleared.")
+        if skipped:
+            print(f"     * [WARN] {skipped} listener(s) dropped")
+
+    if scratchpad.get("Mission_Directives") or scratchpad.get("Primary_Objective"):
+        print(
+            "  -> Mission_Directives / Primary_Objective ignored "
+            "(operator directives are locked)."
+        )
 
     print(format_stand_configuration(controller))
     print("=" * 55 + "\n")

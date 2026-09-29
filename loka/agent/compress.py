@@ -234,6 +234,66 @@ def format_motor_section(frames: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
+def _gait_band_line() -> str:
+    """Safe gait band from the coarse sweep. apply_updates clips to this."""
+    from loka.control.gait import GAIT_KNOBS, gait_schedule_for_speed
+
+    sched = gait_schedule_for_speed(0.25)
+    bits = []
+    for knob in GAIT_KNOBS:
+        if knob.name == "gait.mode":
+            continue
+        default = sched.get(knob.name)
+        if default is None:
+            default = {
+                "gait.speed": 0.25,
+                "gait.heading": 0.0,
+                "gait.step_length_max": 0.30,
+                "gait.swing_height": 0.045,
+                "gait.capture_gain": 0.7,
+                "gait.walk_accel": 0.5,
+                "gait.foothold_retarget_s": 0.70,
+                "gait.turn_rate": 0.40,
+            }.get(knob.name)
+        extra = f" default {default:.3g}" if default is not None else ""
+        bits.append(f"{knob.name} [{knob.low:.3g}, {knob.high:.3g}]{extra}")
+    return (
+        "  gait safe band (out of range is clipped; defaults are the 0.25 m/s walk): "
+        + "; ".join(bits)
+    )
+
+
+def format_full_state_section(frames: Sequence[dict]) -> str:
+    """Attitude, position, and velocity at the trigger, plus the gait command."""
+    if not frames:
+        return "4. FULL STATE\n  (no frames)\n"
+    latest = frames[-1]
+    qpos = np.asarray(latest.get("qpos", np.zeros(7)), dtype=float)
+    qvel = np.asarray(latest.get("qvel", np.zeros(6)), dtype=float)
+    rpy = np.asarray(latest.get("rpy", np.zeros(3)), dtype=float)
+    quat = qpos[3:7] if qpos.size >= 7 else np.zeros(4)
+    lines = [
+        "4. FULL STATE (snapshot at this invoke)",
+        f"  t={float(latest.get('time', 0.0)):.2f}s",
+        f"  pelvis xyz [m]: {qpos[0]:+.3f} {qpos[1]:+.3f} {qpos[2]:+.3f}",
+        f"  attitude rpy [deg]: {np.degrees(rpy[0]):+.1f} {np.degrees(rpy[1]):+.1f} "
+        f"{np.degrees(rpy[2]):+.1f}",
+        f"  quat wxyz: {quat[0]:+.3f} {quat[1]:+.3f} {quat[2]:+.3f} {quat[3]:+.3f}",
+        f"  linear vel xyz [m/s]: {qvel[0]:+.3f} {qvel[1]:+.3f} {qvel[2]:+.3f}",
+        f"  angular vel xyz [rad/s]: {qvel[3]:+.3f} {qvel[4]:+.3f} {qvel[5]:+.3f}",
+        f"  planar speed: {float(latest.get('planar_speed', np.linalg.norm(qvel[:2]))):.3f} m/s",
+        f"  gait cmd: mode={latest.get('cmd_mode')} speed={latest.get('cmd_speed')} "
+        f"heading={latest.get('cmd_heading')} walking={latest.get('walking')}",
+        _gait_band_line(),
+        f"  yaw_ref={latest.get('yaw_ref')} heading_goal={latest.get('heading_goal')} "
+        f"heading_err_raw={latest.get('heading_error_raw')} "
+        f"heading_err_gated={latest.get('heading_error')} "
+        f"cross_track={latest.get('cross_track')}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def synthesize_stand_telemetry(
     nominal_baseline: Sequence[dict],
     anomaly_buffer: Sequence[dict],
@@ -263,16 +323,18 @@ def synthesize_stand_telemetry(
         blocks.append(format_balance_section(anom))
     if sections.section_2_motor_load:
         blocks.append(format_motor_section(anom))
+    blocks.append(format_full_state_section(anom))
     if sections.section_3_directive:
         blocks.append(
             "3. DIRECTIVE\n"
             + (
                 directive
                 or (
-                    "Update the YAML scratchpad to rewrite Controller_Targets "
-                    "(dotted mpc.*/wbc.*/stand.* paths), Task_Targets "
-                    "(height, yaw, lean_x, lean_y), Error_Tracking if the mission "
-                    "changed, and Model_Mutations for belief (gear/friction/mass).\n"
+                    "Update the YAML scratchpad. Task_Targets include height, lean, yaw, "
+                    "and gait.* . Error_Tracking if the success criteria should shift. "
+                    "Model_Mutations for belief (gear, friction, mass, com). "
+                    "Listeners to choose the next wake, with a message. "
+                    "Locked mission directives cannot be edited.\n"
                 )
             )
         )

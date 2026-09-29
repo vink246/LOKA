@@ -4,6 +4,7 @@ import os
 import re
 
 import mujoco
+import numpy as np
 
 _JOINT_TYPES = {
     int(mujoco.mjtJoint.mjJNT_FREE): "free",
@@ -63,13 +64,32 @@ def format_primary_objective_block(objective: str) -> str:
     )
 
 
-def _lookup_nominal(nominal_params, mutation):
-    obj_type = mutation["type"]
-    name = mutation["name"]
-    attr = mutation["attr"]
-    bucket = nominal_params.get(f"{obj_type}s", {})
-    obj = bucket.get(name, {})
-    return obj.get(attr, "unknown")
+def _lookup_nominal(loka_state, mutation):
+    idx = mutation.get("id")
+    attr = mutation.get("attr")
+    kind = mutation.get("type")
+    try:
+        i = int(idx)
+    except (TypeError, ValueError):
+        return "unknown"
+    if kind == "body" and attr == "mass":
+        arr = loka_state.get("nominal_mass")
+        if arr is not None and i < len(arr):
+            return f"{float(arr[i]):.4g}"
+    if kind == "body" and attr in ("com", "ipos"):
+        arr = loka_state.get("nominal_ipos")
+        if arr is not None and i < len(arr):
+            v = np.asarray(arr[i], dtype=float)
+            return f"[{v[0]:.4g}, {v[1]:.4g}, {v[2]:.4g}]"
+    if kind == "actuator" and attr == "gear":
+        arr = loka_state.get("nominal_gears")
+        if arr is not None and i < len(arr):
+            return f"{float(arr[i]):.4g}"
+    if kind == "geom" and attr == "friction":
+        arr = loka_state.get("nominal_friction")
+        if arr is not None and i < len(arr):
+            return f"{float(arr[i][0]):.4g}"
+    return "unknown"
 
 
 def format_current_model_belief(loka_state):
@@ -87,7 +107,7 @@ def format_current_model_belief(loka_state):
 
     lines = ["Active model mutations (nominal -> believed):"]
     for mutation in latest.values():
-        nominal_val = _lookup_nominal(nominal_params, mutation)
+        nominal_val = _lookup_nominal(loka_state, mutation)
         applied_at = mutation.get("applied_at")
         time_note = f", applied at t={applied_at:.2f}s" if applied_at is not None else ""
         lines.append(
@@ -164,7 +184,7 @@ def build_robot_model_context(model, xml_path):
         "Mutable object attributes:",
         "  - actuators: gear",
         "  - geoms: friction",
-        "  - bodies: mass",
+        "  - bodies: mass, com  (com is [x, y, z] m in the body frame; +x forward, +y left, +z up)",
     ])
 
     mjcf = _load_kinematics_mjcf(xml_path)

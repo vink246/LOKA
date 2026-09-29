@@ -87,6 +87,10 @@ COLUMNS = (
     "swing_z",  # swing-foot height above ground [m]
     "swing_des_z",  # commanded swing-foot height [m]
     "swing_tilt_deg",  # sole tilt vs world +z [deg]; 0 = flat
+    "yaw",
+    "yaw_ref",
+    "heading_err",
+    "plan_yaw",
 )
 
 
@@ -129,21 +133,31 @@ def record_walk(
     speed: float = 0.25,
     duration: float = 10.0,
     decimate: int = 4,
+    script: list | None = None,
+    pushes: list | None = None,
     **gait,
 ) -> WalkTrace:
-    """Run a walk and sample the controller every ``decimate`` ticks."""
-    sim = Simulation()
+    """Run a walk and sample the controller every ``decimate`` ticks.
+
+    ``script`` is a ``walk_bench`` event list ``(time, task updates)``. When it
+    is omitted the walk starts immediately at ``speed``.
+    """
+    sim = Simulation(pushes=list(pushes or []))
     controller = sim.controller
-    applied = controller.set_task_targets(
-        {"gait.mode": "walk", "gait.speed": speed, **gait}
-    )
-    heading = float(controller.gait.config.heading)
-    forward, left = heading_frame(heading)
+    if script is None:
+        pending = [(0.0, {"gait.mode": "walk", "gait.speed": speed, **gait})]
+    else:
+        pending = list(script)
+    applied: dict = {}
     omega = float(np.sqrt(GRAVITY / max(0.30, controller.nominal_height)))
 
     rows: list[list[float]] = []
     tick = 0
     while sim.data.time < duration:
+        now = float(sim.data.time)
+        while pending and pending[0][0] <= now:
+            _, updates = pending.pop(0)
+            applied.update(controller.set_task_targets(updates))
         sim.step()
         tick += 1
         if tick % decimate != 0 and not sim.fell:
@@ -151,6 +165,7 @@ def record_walk(
 
         gait_sched = controller.gait
         tel = controller.telemetry
+        forward, left = heading_frame(float(tel.yaw_ref))
         robot = controller.robot
         gait_out = controller._last_gait
         dyn = robot.dynamics(sim.data.qvel)
@@ -273,6 +288,10 @@ def record_walk(
             swing_z,
             swing_des_z,
             float(np.degrees(tel.swing_tilt)) if in_swing else float("nan"),
+            float(tel.rpy[2]),
+            float(tel.yaw_ref),
+            float(tel.heading_error),
+            float(gait_out.stance_yaw) if gait_out is not None else 0.0,
         ]
         rows.append(row)
         if sim.fell:
@@ -519,6 +538,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step-period", type=float, default=None)
     parser.add_argument("--duty-factor", type=float, default=None)
     parser.add_argument("--stance-width", type=float, default=None)
+    parser.add_argument("--scenario", default=None,
+                        help="Replay a loka.walk_bench scenario by name")
     return parser.parse_args(argv)
 
 
@@ -528,6 +549,20 @@ def main(argv: list[str] | None = None) -> int:
         trace = load_trace(args.report)
         print(format_report(trace))
         return 0
+
+    script = None
+    pushes = None
+    if args.scenario:
+        from loka.walk_bench import scenarios
+
+        match = [row for row in scenarios() if row.name == args.scenario]
+        if not match:
+            raise SystemExit(f"unknown scenario {args.scenario!r}")
+        chosen = match[0]
+        script = list(chosen.script)
+        pushes = list(chosen.pushes)
+        args.duration = chosen.duration
+        print(f"recording scenario {chosen.name} for up to {args.duration:.1f}s …")
 
     gait = {"gait.heading": args.heading}
     if args.capture_gain is not None:
@@ -539,9 +574,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.stance_width is not None:
         gait["gait.stance_width"] = args.stance_width
 
-    print(f"recording walk at {args.speed:.2f} m/s for up to {args.duration:.1f}s …")
+    if script is None:
+        print(f"recording walk at {args.speed:.2f} m/s for up to {args.duration:.1f}s …")
     trace = record_walk(
-        speed=args.speed, duration=args.duration, decimate=args.decimate, **gait
+        speed=args.speed,
+        duration=args.duration,
+        decimate=args.decimate,
+        script=script,
+        pushes=pushes,
+        **gait,
     )
     save_trace(trace, args.out)
     print(f"wrote {args.out}")

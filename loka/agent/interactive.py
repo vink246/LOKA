@@ -150,7 +150,7 @@ Interactive commands (type then Enter):
   dead [actuator]                zero actuator (default right_knee)
   clear                          restore mass / friction / dead-actuator edits
   help                           this text
-  <any other text>               operator request (LLM on only)
+  <any other text>               locked mission directive (LLM pursues it)
 
 Viewer keys: 1=torso mass  2=ice  3=push  4=dead knee
              6=left shoulder mass  7=right shoulder mass  5=clear  H=help

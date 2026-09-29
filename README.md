@@ -21,9 +21,10 @@ knob the model can reach later, by the same name, with the same clamp.
 
 Standing is solid and measured below. Walking holds 8 s at 0.10–0.30 m/s and
 30 s at 0.10/0.20/0.35/0.50 m/s under `gait_schedule_for_speed` (high
-double-support at a crawl, more swing time at 0.50 m/s). Isolation's duty
-0.65 still falls at ~3 s. Diagnosis and remaining CoP-edge notes:
-`docs/walking.md`.
+double-support at a crawl, more swing time at 0.50 m/s). A small heading
+change (+0.3 rad) and mid-walk cadence, width, height and stop/restart
+commands hold. Large turns and turn-in-place still fall. Isolation's duty
+0.65 still falls at ~3 s. Notes: `docs/walking.md`.
 
 ## The G1 locomotion controller
 

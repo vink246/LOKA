@@ -18,6 +18,7 @@ from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Push, Simulation
 from loka.agent.apply import apply_stand_scratchpad
 from loka.agent.compress import ANOMALY_COLLECTION_S, synthesize_stand_telemetry
+from loka.agent.directives import heartbeat_due, register_directive, take_fired
 from loka.agent.context import (
     build_stand_capabilities,
     build_stand_robot_context,
@@ -86,11 +87,19 @@ class LokaRuntime:
         self._fired_faults: set[int] = set()
         self.viz = FaultVizState(external_body_id=self.sim.pelvis_id)
 
+        belief = self.controller.robot.model
         self.loka_state: dict = {
             "mutations": [],
-            "nominal_gears": self.controller.robot.model.actuator_gear[:, 0].copy(),
-            "nominal_params": capture_nominal_params(self.controller.robot.model),
+            "nominal_gears": belief.actuator_gear[:, 0].copy(),
+            "nominal_friction": belief.geom_friction.copy(),
+            "nominal_mass": belief.body_mass.copy(),
+            "nominal_inertia": belief.body_inertia.copy(),
+            "nominal_ipos": belief.body_ipos.copy(),
+            "nominal_params": capture_nominal_params(belief),
             "primary_objective": self.config.objective,
+            "mission_directives": [],
+            "listeners": [],
+            "error_spec_owner": "default",
             "error_spec": default_stand_error_spec(
                 nominal_height=float(self.sim.data.qpos[2])
             ),
@@ -109,7 +118,7 @@ class LokaRuntime:
         self._baseline_full = False
         self._anomaly_collect_t0: float | None = None
         self._last_dispatch_t = -1e9
-        self._last_heartbeat_t = 0.0
+        self._last_invoke_t = 0.0
 
         self.failure_episode: FailureEpisode | None = None
         self.operator_session = OperatorSession()
@@ -132,6 +141,8 @@ class LokaRuntime:
         self._prev_wbc_failures = 0
         self._prev_mpc_failures = 0
         self._was_walking = False
+        self._cross_track = 0.0
+        self._heading_watch = (0.0, 0.0, 0.0)
 
         self.log: StandSessionLog | None = None
         if self.config.enable_session_log:
@@ -203,13 +214,57 @@ class LokaRuntime:
             "cmd_lean_x": cmd["lean_x"],
             "cmd_lean_y": cmd["lean_y"],
             "cmd_yaw": cmd["yaw"],
+            "yaw_ref": float(tel.yaw_ref) if tel is not None else 0.0,
+            "heading_goal": float(tel.heading_goal) if tel is not None else 0.0,
+            "heading_error_raw": float(tel.heading_error) if tel is not None else 0.0,
+            "heading_error": self._gated_heading_error(tel),
+            "cross_track": self._update_cross_track(tel),
+            "cmd_mode": cmd.get("gait.mode"),
+            "cmd_speed": cmd.get("gait.speed"),
+            "cmd_heading": cmd.get("gait.heading"),
+            "planar_speed": float(np.linalg.norm(qvel[:2])),
         }
+
+    def _gated_heading_error(self, tel) -> float:
+        """Heading error, zero until the turn's rate budget has elapsed."""
+        if tel is None:
+            return 0.0
+        from loka.control.gait import wrap_angle
+
+        goal = float(tel.heading_goal)
+        watched = self._heading_watch[2]
+        if abs(wrap_angle(goal - watched)) > 1e-3:
+            self._heading_watch = (float(self.sim.data.time), float(tel.yaw_ref), goal)
+        elapsed = float(self.sim.data.time) - self._heading_watch[0]
+        rate = max(float(self.controller.gait.config.turn_rate), 1e-3)
+        need = abs(wrap_angle(goal - self._heading_watch[1])) / rate
+        if elapsed < need:
+            return 0.0
+        return float(tel.heading_error)
+
+    def _update_cross_track(self, tel) -> float:
+        """Leaky integral of lateral velocity in the yaw-reference frame [m]."""
+        if tel is None:
+            return self._cross_track
+        from loka.control.gait import heading_frame
+
+        _, left = heading_frame(float(tel.yaw_ref))
+        vel = np.asarray(self.sim.data.qvel[:2], dtype=float)
+        dt = float(self.controller.config.control_dt)
+        self._cross_track = 0.98 * self._cross_track + float(vel @ left) * dt
+        return float(self._cross_track)
 
     def _sync_gait_mission(self, now: float, walking: bool) -> None:
         """Swap Error_Tracking / suppress early anomaly on stand↔walk transitions."""
         if walking == self._was_walking:
             return
         self._was_walking = walking
+        if self.loka_state.get("error_spec_owner") == "loka":
+            self._suppress_early_until = max(
+                self._suppress_early_until,
+                now + (6.0 if walking else TASK_SETTLE_SUPPRESS_S),
+            )
+            return
         height = float(self.controller.command.height or self.controller.nominal_height)
         if walking:
             self.loka_state["error_spec"] = default_walk_error_spec(
@@ -404,6 +459,29 @@ class LokaRuntime:
             error_spec=self.loka_state["error_spec"],
         )
 
+    def _telemetry_for(self, frame: dict, *, directive: str) -> str:
+        window = list(self.anomaly_buffer) or list(self.nominal_baseline) or [frame]
+        return synthesize_stand_telemetry(
+            self.nominal_baseline,
+            window,
+            control_dt=self.sim.config.control_dt,
+            error_spec=self.loka_state["error_spec"],
+            directive=directive,
+        )
+
+    def _consume_listeners(self, frame: dict) -> list:
+        armed = list(self.loka_state.get("listeners") or [])
+        if not armed:
+            return []
+        stay, fired = take_fired(armed, frame)
+        if fired:
+            self.loka_state["listeners"] = stay
+            print(
+                f"[LOKA] listener fired at t={float(frame['time']):.2f}s "
+                f"({len(fired)} condition(s))"
+            )
+        return fired
+
     def _dispatch(self, session, user_content: str, *, reason: str = "unknown") -> None:
         if not self.config.enable_llm:
             return
@@ -412,6 +490,7 @@ class LokaRuntime:
         self._pending_user_content = user_content
         self._pending_dispatch_reason = reason
         self._last_dispatch_t = self.sim.data.time
+        self._last_invoke_t = float(self.sim.data.time)
         messages = session.compose_api_messages(self.system_prompt, user_content)
         thread = threading.Thread(
             target=stand_llm_worker,
@@ -621,6 +700,7 @@ class LokaRuntime:
             self.loka_state,
             self.loka_state["nominal_gears"],
         )
+        self._refresh_belief_mass()
 
         self._control_step()
 
@@ -630,7 +710,9 @@ class LokaRuntime:
                 "t": frame["time"],
                 "com_error": float(np.linalg.norm(frame["com_error"])),
                 "tracking_error": float(
-                    get_tracking_error(self.sim.data, self.loka_state["error_spec"])
+                    get_tracking_error(
+                        self.sim.data, self.loka_state["error_spec"], frame
+                    )
                 ),
                 "fell": self.sim.fell,
             }
@@ -643,39 +725,69 @@ class LokaRuntime:
             self._push_baseline(frame)
             return frame
 
-        error = get_tracking_error(self.sim.data, self.loka_state["error_spec"])
+        error = get_tracking_error(self.sim.data, self.loka_state["error_spec"], frame)
 
-        # Operator requests take priority when idle.
-        if self.config.enable_llm and not self.llm_busy:
+        # Operator directives are locked text. They do not replace the charter.
+        if not self.llm_busy:
             try:
                 request = self.operator_queue.get_nowait()
             except queue.Empty:
                 request = None
             if request:
-                self.loka_state["primary_objective"] = request
-                self._rebuild_prompt()
-                # Objective is changing; drop standing nominals until the new
-                # Task_Targets settle and we can re-baseline.
-                self._invalidate_mission_baseline(
-                    now,
-                    reason=f"operator:{request[:40]}",
-                    close_failure_episode=True,
+                directive = register_directive(self.loka_state, request, now)
+                goal = (
+                    f" parsed xy={directive.goal_xy}"
+                    if directive.goal_xy is not None
+                    else ""
                 )
-                telemetry = synthesize_stand_telemetry(
-                    self.nominal_baseline,
-                    list(self.anomaly_buffer) or [frame],
-                    control_dt=self.sim.config.control_dt,
-                    error_spec=self.loka_state["error_spec"],
+                print(
+                    f"[LOKA] locked mission directive at t={now:.2f}s: "
+                    f"{directive.text}{goal}"
+                )
+                if self.config.enable_llm:
+                    self._rebuild_prompt()
+                    self._invalidate_mission_baseline(
+                        now,
+                        reason=f"directive:{request[:40]}",
+                        close_failure_episode=True,
+                    )
+                    telemetry = self._telemetry_for(
+                        frame,
+                        directive=(
+                            f"Locked directive: {request}\n"
+                            "Set Task_Targets, gait, Error_Tracking, and a Listener. "
+                            "The directive text itself cannot change.\n"
+                        ),
+                    )
+                    cfg_text = format_stand_configuration(self.controller)
+                    user = self.operator_session.build_request_turn(
+                        request, telemetry, self.loka_state, now, cfg_text
+                    )
+                    self._dispatch(self.operator_session, user, reason="directive")
+                return frame
+
+            fired = self._consume_listeners(frame)
+            if fired and self.config.enable_llm:
+                telemetry = self._telemetry_for(
+                    frame,
                     directive=(
-                        f"Operator request: {request}\n"
-                        "Update Task_Targets and Error_Tracking to match.\n"
+                        "Listener fired. Read the message and the full state. "
+                        "Continue the locked directives.\n"
                     ),
                 )
                 cfg_text = format_stand_configuration(self.controller)
-                user = self.operator_session.build_request_turn(
-                    request, telemetry, self.loka_state, now, cfg_text
+                user = self.operator_session.build_listener_turn(
+                    [item.message for item in fired],
+                    telemetry,
+                    self.loka_state,
+                    now,
+                    cfg_text,
                 )
-                self._dispatch(self.operator_session, user, reason="operator")
+                self._dispatch(
+                    self.operator_session,
+                    user,
+                    reason="listener",
+                )
                 return frame
 
         mission_breach = error > self.loka_state["error_spec"].trigger_threshold
@@ -785,6 +897,7 @@ class LokaRuntime:
                     self.log.note("failure episode closed", sim_time=now)
                 self.failure_episode = None
                 self.active_session = None
+            self._maybe_heartbeat(frame, now)
 
         if self.sim.fell and self.log is not None and not self._fall_logged:
             self._fall_logged = True
@@ -795,6 +908,33 @@ class LokaRuntime:
             )
 
         return frame
+
+    def _maybe_heartbeat(self, frame: dict, now: float) -> None:
+        """Wake LOKA on a fixed period when no listener has called it."""
+        if (
+            not self.config.enable_llm
+            or self.llm_busy
+            or self.failure_episode is not None
+        ):
+            return
+        if not heartbeat_due(now, self._last_invoke_t, self.config.heartbeat_s):
+            return
+        telemetry = self._telemetry_for(
+            frame,
+            directive=(
+                "Periodic check. Recorrect if the locked directives are not "
+                "being met. Listeners did not fire this interval.\n"
+            ),
+        )
+        cfg_text = format_stand_configuration(self.controller)
+        user = self.operator_session.build_heartbeat_turn(
+            telemetry,
+            self.loka_state,
+            now,
+            cfg_text,
+            period_s=self.config.heartbeat_s,
+        )
+        self._dispatch(self.operator_session, user, reason="heartbeat")
 
     def run(self, duration: float, stop_on_fall: bool = True) -> list[dict]:
         while self.sim.data.time < duration:

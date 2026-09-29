@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-VALID_SIGNALS = frozenset({"qpos", "qvel"})
+VALID_SIGNALS = frozenset({"qpos", "qvel", "frame"})
 VALID_MODES = frozenset({
     "below_target",
     "above_target",
@@ -25,11 +25,17 @@ class ErrorTerm:
     weight: float = 1.0
     offset: float = 0.0
 
-    def read(self, data) -> float:
+    def read(self, data, frame: dict | None = None) -> float:
+        if self.signal == "frame":
+            if not frame:
+                return float(self.offset)
+            return float(self.offset + frame.get(self.name, 0.0))
         arr = data.qpos if self.signal == "qpos" else data.qvel
         return float(self.offset + arr[self.index])
 
     def read_frame(self, frame: dict) -> float:
+        if self.signal == "frame":
+            return float(self.offset + frame.get(self.name, 0.0))
         arr = frame[self.signal]
         return float(self.offset + arr[self.index])
 
@@ -85,12 +91,15 @@ def parse_error_tracking(raw: dict, nq: int, nv: int) -> ErrorSpec:
         if mode not in VALID_MODES:
             raise ValueError(f"Invalid mode '{mode}' for term '{name}'")
 
-        index = int(item["index"])
-        limit = nq if signal == "qpos" else nv
-        if index < 0 or index >= limit:
-            raise ValueError(
-                f"Term '{name}' index {index} out of range for {signal} (0..{limit - 1})"
-            )
+        if signal == "frame":
+            index = int(item.get("index", 0))
+        else:
+            index = int(item["index"])
+            limit = nq if signal == "qpos" else nv
+            if index < 0 or index >= limit:
+                raise ValueError(
+                    f"Term '{name}' index {index} out of range for {signal} (0..{limit - 1})"
+                )
 
         terms.append(
             ErrorTerm(
@@ -108,10 +117,10 @@ def parse_error_tracking(raw: dict, nq: int, nv: int) -> ErrorSpec:
     return ErrorSpec(trigger_threshold=threshold, terms=terms)
 
 
-def get_tracking_error(data, error_spec: ErrorSpec) -> float:
+def get_tracking_error(data, error_spec: ErrorSpec, frame: dict | None = None) -> float:
     total = 0.0
     for term in error_spec.terms:
-        total += term.excess(term.read(data)) * term.weight
+        total += term.excess(term.read(data, frame)) * term.weight
     return total
 
 

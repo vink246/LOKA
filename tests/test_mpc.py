@@ -85,3 +85,28 @@ def test_convex_mpc_solve_returns_finite_forces_on_a_dummy_horizon():
     assert forces.shape == (8, 3)
     assert np.all(np.isfinite(forces))
     assert forces[:, 2].sum() == pytest.approx(mass * GRAVITY, rel=0.15)
+
+
+def test_yaw_reference_wraps_across_pi():
+    """A goal just past ±π must be a small correction, not a full turn."""
+    cfg = MPCConfig()
+    mpc = ConvexMPC(cfg, num_contacts=8, mass=35.0)
+    contacts = np.zeros((8, 3))
+    contacts[:, 2] = 0.0
+    contacts[:4, 1] = 0.1
+    contacts[4:, 1] = -0.1
+    state = CentroidalState(
+        rpy=np.array([0.0, 0.0, -3.1]),
+        com=np.array([0.0, 0.0, 0.70]),
+        angular_velocity=np.zeros(3),
+        com_velocity=np.zeros(3),
+        inertia=np.diag([2.0, 2.0, 0.4]),
+        contact_pos=contacts,
+    )
+    near = CentroidalReference(com=state.com.copy(), yaw=3.1)
+    far = CentroidalReference(com=state.com.copy(), yaw=0.0)
+    f_near = mpc.solve(state, near, contact_mask=np.ones(8, dtype=bool))
+    f_far = mpc.solve(state, far, contact_mask=np.ones(8, dtype=bool))
+    assert np.all(np.isfinite(f_near))
+    # The short wrap (~0.08 rad) must cost less yaw moment than a 3 rad error.
+    assert abs(f_near[:, 0]).sum() < abs(f_far[:, 0]).sum()

@@ -145,8 +145,10 @@ LLM YAML (0.5–5 s)
 ```
 
 - **Gait:** classical DCM / capture-point planner (`gait.py`). The LLM may set
-  mode, speed, heading, cadence, width; it never sets footholds. Omitted
-  cadence knobs follow `gait_schedule_for_speed`.
+  mode, speed, heading, cadence, width, `gait.turn_rate`; it never sets
+  footholds. `gait.heading` is a goal the feet approach at `turn_rate`, with
+  speed cut while the error is large. Omitted cadence knobs follow
+  `gait_schedule_for_speed`. Timing and width changes apply at step boundaries.
 - **MPC:** Di Carlo convex SRBD QP (`mpc.py`, `ConvexMPC`) with Sleiman-style
   CoP-in-sole inequalities. Galliker et al. Humanoids 2022 is cited for the
   short-horizon *because the gait is the reference* lesson, not the solver.
@@ -171,7 +173,7 @@ Exposed to LOKA and ablations via `LocomotionController.set_task_targets`:
 | Name | Meaning | Limits (approx.) |
 |---|---|---|
 | `height` | CoM height above foot plane [m] | band ~`[0.50, 0.78]` |
-| `yaw` | Facing [rad] | `|yaw| ≤ 0.8` |
+| `yaw` | Standing torso offset from the feet [rad]. Ignored while walking | `|yaw| ≤ 0.5` |
 | `lean_x` | CoM offset forward (+) [m] | clamped by support margin (~55% of margin) and `|lean| ≤ 0.06` |
 | `lean_y` | CoM offset left (+) [m] | same |
 

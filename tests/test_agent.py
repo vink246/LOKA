@@ -475,3 +475,133 @@ def test_session_log_rewrites_each_session(tmp_path):
     assert "SECOND" in text
     assert "FIRST" not in text
     assert path.with_name("session.jsonl").exists()
+
+
+def test_com_and_mass_mutations_reset_from_nominal():
+    import mujoco
+
+    from loka.agent.model_state import apply_loka_mutations
+
+    controller = LocomotionController()
+    model = controller.robot.model
+    body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+    assert body >= 0
+    nominal_mass = float(model.body_mass[body])
+    nominal_com = model.body_ipos[body].copy()
+    loka_state = {"mutations": []}
+    scratchpad = {
+        "Semantic_State": {"Hypothesis": "offset load", "Analysis": "shift com and mass"},
+        "Model_Mutations": [
+            {
+                "object_type": "body",
+                "name": "torso_link",
+                "attribute": "mass",
+                "value": nominal_mass + 4.0,
+            },
+            {
+                "object_type": "body",
+                "name": "torso_link",
+                "attribute": "com",
+                "value": [-0.04, 0.03, 0.01],
+            },
+        ],
+    }
+    summary = apply_stand_scratchpad(controller, scratchpad, loka_state)
+    assert summary["mutations"] == 2
+    apply_loka_mutations(model, loka_state, loka_state["nominal_gears"])
+    assert model.body_mass[body] == pytest.approx(nominal_mass + 4.0)
+    np.testing.assert_allclose(model.body_ipos[body], [-0.04, 0.03, 0.01])
+    model.body_mass[body] = 1.0
+    model.body_ipos[body] = nominal_com
+    apply_loka_mutations(model, loka_state, loka_state["nominal_gears"])
+    assert model.body_mass[body] == pytest.approx(nominal_mass + 4.0)
+    np.testing.assert_allclose(model.body_ipos[body], [-0.04, 0.03, 0.01])
+
+
+def test_scratchpad_cannot_rewrite_a_locked_directive():
+    from loka.agent.directives import MissionDirective
+
+    controller = LocomotionController()
+    loka_state = {
+        "mutations": [],
+        "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
+        "error_spec": default_stand_error_spec(),
+        "mission_directives": [
+            MissionDirective("go to 10,10", 1.0, (10.0, 10.0))
+        ],
+    }
+    apply_stand_scratchpad(
+        controller,
+        {
+            "Semantic_State": {"Hypothesis": "done", "Analysis": "stop"},
+            "Mission_Directives": ["stay here"],
+            "Listeners": [
+                {
+                    "kind": "near_xy",
+                    "x": 9.0,
+                    "y": 9.0,
+                    "radius": 0.5,
+                    "message": "Close to the destination. Stop and stand.",
+                }
+            ],
+        },
+        loka_state,
+        sim_time=2.0,
+    )
+    assert loka_state["mission_directives"][0].text == "go to 10,10"
+    assert len(loka_state["listeners"]) == 1
+    assert loka_state["listeners"][0].kind == "near_xy"
+
+
+def test_near_listener_and_directive_registration():
+    from loka.agent.directives import heartbeat_due, listener_fired, parse_goal_xy
+
+    assert parse_goal_xy("go to coordinate 10, 10") == (10.0, 10.0)
+    assert parse_goal_xy("please crouch") is None
+    assert heartbeat_due(30.0, 0.0, 30.0)
+    assert not heartbeat_due(29.0, 0.0, 30.0)
+
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, heartbeat_s=30.0))
+    runtime._baseline_full = True
+    runtime.submit_operator("go to 10,10")
+    runtime.step()
+    assert runtime.loka_state["mission_directives"][0].goal_xy == (10.0, 10.0)
+    assert "go to" not in runtime.loka_state["primary_objective"]
+    listener = runtime.loka_state.get("listeners")
+    assert listener == []
+    from loka.agent.directives import parse_listeners
+
+    runtime.loka_state["listeners"] = parse_listeners(
+        [{
+            "kind": "near_xy",
+            "x": 9.0,
+            "y": 9.0,
+            "radius": 0.4,
+            "message": "close to destination",
+        }],
+        armed_at=0.0,
+    )
+    far = {"qpos": np.array([1.0, 1.0, 0.7]), "time": 1.0}
+    assert not listener_fired(runtime.loka_state["listeners"][0], far)
+    near = {"qpos": np.array([8.8, 9.1, 0.7]), "time": 2.0}
+    assert listener_fired(runtime.loka_state["listeners"][0], near)
+    fired = runtime._consume_listeners(near)
+    assert len(fired) == 1
+    assert runtime.loka_state["listeners"] == []
+
+
+def test_compressor_includes_full_state():
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
+    runtime._baseline_full = True
+    frame = runtime.step()
+    text = synthesize_stand_telemetry(
+        [frame],
+        [frame],
+        control_dt=sim.config.control_dt,
+        error_spec=runtime.loka_state["error_spec"],
+    )
+    assert "FULL STATE" in text
+    assert "pelvis xyz" in text
+    assert "linear vel" in text

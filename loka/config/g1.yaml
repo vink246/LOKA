@@ -87,18 +87,18 @@ wbc:
 # High-level gait policy (LLM Task_Targets: gait.*). Geometry stays classical:
 # the walk line, footstep plan and DCM reference are computed in gait.py.
 # If the LLM only sets gait.speed, period / duty / stance_width follow
-# gait_schedule_for_speed (duty ~0.82 at a crawl, ~0.74 at 0.50 m/s so the
-# swing still has time to land a longer stride). Pin those knobs to override.
-# The 0.65 / 0.70 numbers below are isolation-planner defaults, not the walk.
+# gait_schedule_for_speed. Pin those knobs to override. Values outside the
+# bands below are clipped; a 6 s straight walk at 0.25 m/s falls outside them.
 gait:
   mode: 0                 # 0=stand 1=walk 2=tread 3=limp
   speed: 0.0              # m/s in heading frame
   heading: 0.0            # world-frame travel direction [rad]
-  step_period: 0.70       # full two-step cycle; a step is half of this
-  duty_factor: 0.65       # isolation default; walk fills ~0.74–0.84 from speed
-  step_length_max: 0.30
-  swing_height: 0.045
-  stance_width: 0.24      # nominal G1 stance measures 0.237
-  capture_gain: 0.6       # DCM foothold feedback (1.0 = deadbeat capture point)
-  walk_accel: 0.5
-  foothold_retarget_s: 0.70  # fraction of swing the foothold may still move
+  step_period: 0.72       # schedule at 0.25 m/s; band [0.55, 1.10]
+  duty_factor: 0.80       # 0.74 falls at 0.25 m/s; walk schedule is ~0.79 here
+  step_length_max: 0.30   # band [0.08, 0.40]
+  swing_height: 0.045     # band [0.02, 0.08]; 0.10 falls
+  stance_width: 0.24      # nominal G1 is 0.237; band [0.18, 0.28]
+  capture_gain: 0.7       # band [0.30, 1.00]; fraction of full DCM-offset placement; 0 falls
+  walk_accel: 0.5         # band [0.15, 1.60]
+  foothold_retarget_s: 0.70  # band [0.20, 0.90]
+  turn_rate: 0.40         # rad/s toward gait.heading; band [0.10, 0.80]

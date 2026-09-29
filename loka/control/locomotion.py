@@ -41,6 +41,9 @@ from loka.control.gait import (
     MODE_WALK,
     GaitConfig,
     GaitScheduler,
+    circ_mid,
+    heading_frame,
+    wrap_angle,
 )
 from loka.control.mpc import (
     ConvexMPC,
@@ -199,8 +202,13 @@ MAX_LEAN_XY = 0.06
 LEAN_MARGIN_FRACTION = 0.55
 #: Height band relative to the nominal stance [m].
 HEIGHT_BAND = (0.50, 0.78)
-#: Yaw command clamp [rad].
-MAX_YAW = 0.8
+#: Yaw command clamp [rad]. While standing this is an offset from the feet,
+#: not a world heading. Walking ignores it; ``gait.heading`` owns travel yaw.
+MAX_YAW = 0.5
+#: CoM-height slew while walking [m/s]. Standing snaps to the command.
+HEIGHT_SLEW_WALK = 0.05
+#: Lowest CoM height a walk will chase. Deeper crouches are a stand.
+WALK_HEIGHT_MIN = 0.60
 
 
 TASK_PARAMETER_NAMES = frozenset({
@@ -235,6 +243,9 @@ class LocomotionTelemetry:
     swing_error: float = 0.0
     #: Angle between the swing sole's +z and world +z [rad]. Zero is flat.
     swing_tilt: float = 0.0
+    yaw_ref: float = 0.0
+    heading_goal: float = 0.0
+    heading_error: float = 0.0
 
 
 class LocomotionController:
@@ -277,6 +288,7 @@ class LocomotionController:
         self.nominal_base_offset = nominal[0:3] - foot_mid
         self.nominal_height = float(self.nominal_com_offset[2])
         self._refresh_posture_gains()
+        self._build_knee_table()
 
     def _refresh_posture_gains(self) -> None:
         """Pre-build the per-joint posture gains for both leg states.
@@ -296,6 +308,52 @@ class LocomotionController:
         self._posture_kp[1, legs] = cfg.kp_posture_swing
         self._posture_kd[1, legs] = cfg.kd_posture_swing
         self._posture_weight[1, legs] = cfg.weight_posture_swing
+
+    def _build_knee_table(self) -> None:
+        """Stance-knee angle versus CoM height, from a short foot-fixed IK.
+
+        The standing keyframe is the tall pose. Pulling a crouched walk back
+        to that knee fights the height command, so the bias interpolates a
+        pose whose feet stay where the keyframe put them.
+        """
+        robot = self.robot
+        q_nom = robot.nominal_qpos.copy()
+        robot.update(q_nom, np.zeros(robot.nv))
+        feet0 = robot.foot_center_positions().copy()
+        pelvis_z = float(q_nom[2])
+        heights = np.arange(WALK_HEIGHT_MIN, self.nominal_height + 1e-9, 0.02)
+        if heights.size == 0 or abs(heights[-1] - self.nominal_height) > 1e-6:
+            heights = np.append(heights, self.nominal_height)
+        table = np.zeros((len(heights), 2))
+        q = q_nom.copy()
+        per = NUM_LEG_JOINTS // 2
+        leg_cols = np.arange(QVEL_JOINT0, QVEL_JOINT0 + NUM_LEG_JOINTS)
+        for i, h in enumerate(heights):
+            q[:] = q_nom
+            q[2] = pelvis_z - (self.nominal_height - float(h))
+            for _ in range(20):
+                robot.update(q, np.zeros(robot.nv))
+                err = (feet0 - robot.foot_center_positions()).reshape(-1)
+                rows = []
+                for leg in (0, 1):
+                    jp, _ = robot.site_spatial_jacobian(
+                        int(robot.foot_center_site_ids[leg])
+                    )
+                    rows.append(jp)
+                jac = np.vstack(rows)[:, leg_cols]
+                dq = jac.T @ np.linalg.solve(jac @ jac.T + 1e-3 * np.eye(6), err)
+                q[QPOS_JOINT0:QPOS_JOINT0 + NUM_LEG_JOINTS] += dq
+            table[i, 0] = q[QPOS_JOINT0 + KNEE]
+            table[i, 1] = q[QPOS_JOINT0 + per + KNEE]
+        robot.update(q_nom, np.zeros(robot.nv))
+        self._knee_heights = heights
+        self._knee_table = table
+
+    def _knee_bias(self, height: float) -> np.ndarray:
+        return np.array([
+            float(np.interp(height, self._knee_heights, self._knee_table[:, leg]))
+            for leg in (0, 1)
+        ])
 
     def _leg_states(self, contact_mask: np.ndarray) -> np.ndarray:
         """Index into the gain tables: 0 where planted, 1 where airborne.
@@ -324,6 +382,9 @@ class LocomotionController:
         self._last_swing_orient_active = False
         self._last_knee_guard = np.zeros(2, dtype=bool)
         self._last_com_z_scale = 1.0
+        self._height_ref = None
+        self._knee_heights = np.zeros(1)
+        self._knee_table = np.zeros((1, 2))
 
     # -- references -------------------------------------------------------
 
@@ -350,6 +411,8 @@ class LocomotionController:
         feet: np.ndarray,
         contact_pos: np.ndarray,
         ground_z: float,
+        foot_yaw: np.ndarray | None = None,
+        measured_yaw: np.ndarray | None = None,
     ) -> np.ndarray:
         """Sole-point positions over the MPC horizon, ``(horizon, nc, 3)``.
 
@@ -369,9 +432,19 @@ class LocomotionController:
         per_foot = self.robot.num_contacts // 2
         offsets = contact_pos - np.repeat(feet, per_foot, axis=0)
         seq = np.zeros((horizon, self.robot.num_contacts, 3))
+        planned = None if foot_yaw is None else np.asarray(foot_yaw, dtype=float)
+        measured = None if measured_yaw is None else np.asarray(measured_yaw, dtype=float)
         for leg in (0, 1):
             rows = slice(leg * per_foot, (leg + 1) * per_foot)
-            seq[:, rows, :2] = pose[:, leg, None, :2] + offsets[None, rows, :2]
+            local = offsets[rows, :2]
+            if planned is not None and measured is not None:
+                for k in range(horizon):
+                    dy = wrap_angle(float(planned[k, leg]) - float(measured[leg]))
+                    c, s = np.cos(dy), np.sin(dy)
+                    rot = np.array([[c, -s], [s, c]])
+                    seq[k, rows, :2] = pose[k, leg, :2] + local @ rot.T
+            else:
+                seq[:, rows, :2] = pose[:, leg, None, :2] + local
             seq[:, rows, 2] = ground_z + pose[:, leg, 2, None]
         return seq
 
@@ -392,9 +465,21 @@ class LocomotionController:
         foot_mid = feet.mean(axis=0)
         ground_z = self._ground_height
 
-        height = (
-            self.nominal_height if self.command.height is None else self.command.height
+        height_cmd = (
+            self.nominal_height if self.command.height is None else float(self.command.height)
         )
+        if self._height_ref is None:
+            self._height_ref = height_cmd
+        # The gait clock below decides ``walking``; slew using the previous
+        # tick so a height step cannot jump ω₀ inside the step in progress.
+        was_walking = self.gait.walking
+        if was_walking:
+            goal_h = max(height_cmd, WALK_HEIGHT_MIN)
+            step_h = HEIGHT_SLEW_WALK * cfg.control_dt
+            self._height_ref += float(np.clip(goal_h - self._height_ref, -step_h, step_h))
+        else:
+            self._height_ref = height_cmd
+        height = float(self._height_ref)
 
         gait_out = self.gait.step(
             dt=cfg.control_dt,
@@ -404,6 +489,7 @@ class LocomotionController:
             ground_z=ground_z,
             height=height,
             measured_mask=measured_mask,
+            foot_yaws=robot.foot_yaws(),
         )
         self._last_gait = gait_out
         walking = gait_out.walking
@@ -428,35 +514,42 @@ class LocomotionController:
                 ):
                     contact_mask[rows] = True
                     swing_accepted = True
+            # Lean is in the travel frame. Walking faces the plan, not command.yaw.
+            forward, left = heading_frame(float(gait_out.yaw_ref))
+            lean = (
+                self.command.com_offset_xy[0] * forward
+                + self.command.com_offset_xy[1] * left
+            )
             com_ref = np.array(
                 [
-                    gait_out.com_ref_xy[0] + self.command.com_offset_xy[0],
-                    gait_out.com_ref_xy[1] + self.command.com_offset_xy[1],
+                    gait_out.com_ref_xy[0] + lean[0],
+                    gait_out.com_ref_xy[1] + lean[1],
                     ground_z + height,
                 ]
             )
             com_vel_ref = np.array([gait_out.com_vel_ref[0], gait_out.com_vel_ref[1], 0.0])
-            face_yaw = float(self.gait.config.heading)
-            if abs(float(self.command.yaw)) > 1e-3:
-                face_yaw = float(self.command.yaw)
+            face_yaw = float(gait_out.yaw_ref)
+            yaw_rate_ref = float(gait_out.yaw_rate_ref)
         else:
             contact_mask = measured_mask
+            foot_yaws = robot.foot_yaws()
+            stance_yaw = float(circ_mid(foot_yaws[0], foot_yaws[1]))
+            forward, left = heading_frame(stance_yaw)
+            offset = self.nominal_com_offset[:2] + self.command.com_offset_xy
+            lean = offset[0] * forward + offset[1] * left
             com_ref = np.array(
-                [
-                    foot_mid[0] + self.nominal_com_offset[0] + self.command.com_offset_xy[0],
-                    foot_mid[1] + self.nominal_com_offset[1] + self.command.com_offset_xy[1],
-                    ground_z + height,
-                ]
+                [foot_mid[0] + lean[0], foot_mid[1] + lean[1], ground_z + height]
             )
             com_vel_ref = np.zeros(3)
-            face_yaw = float(self.command.yaw)
+            face_yaw = stance_yaw + float(self.command.yaw)
+            yaw_rate_ref = 0.0
 
         # --- centroidal MPC (decimated) ---
         if self._tick % cfg.mpc_decimation == 0:
             schedule = None
             contact_pos_seq = None
             if walking:
-                legs_planted, foot_pose = self.gait.preview(
+                legs_planted, foot_pose, foot_yaw = self.gait.preview(
                     horizon=cfg.mpc.horizon, dt=cfg.mpc.dt
                 )
                 schedule = np.repeat(legs_planted, robot.num_contacts // 2, axis=1)
@@ -465,6 +558,8 @@ class LocomotionController:
                     feet=feet,
                     contact_pos=dynamics.contact_pos,
                     ground_z=ground_z,
+                    foot_yaw=foot_yaw,
+                    measured_yaw=robot.foot_yaws(),
                 )
             state = CentroidalState(
                 rpy=rpy,
@@ -475,7 +570,10 @@ class LocomotionController:
                 contact_pos=dynamics.contact_pos,
             )
             reference = CentroidalReference(
-                com=com_ref, yaw=face_yaw, com_velocity=com_vel_ref
+                com=com_ref,
+                yaw=face_yaw,
+                yaw_rate=yaw_rate_ref,
+                com_velocity=com_vel_ref,
             )
             self._desired_forces = self.mpc.solve(
                 state,
@@ -483,6 +581,7 @@ class LocomotionController:
                 contact_mask,
                 schedule=schedule,
                 contact_pos_seq=contact_pos_seq,
+                foot_yaw_seq=foot_yaw if walking else None,
             )
         self._tick += 1
 
@@ -517,9 +616,10 @@ class LocomotionController:
         yaw_quat = np.array(
             [np.cos(0.5 * face_yaw), 0.0, 0.0, np.sin(0.5 * face_yaw)]
         )
+        omega_ref = rot.T @ np.array([0.0, 0.0, yaw_rate_ref])
         base_angular_acc = np.clip(
             wbc_cfg.kp_base_orientation * orientation_error(base_quat, yaw_quat)
-            - wbc_cfg.kd_base_orientation * qvel[3:6],
+            - wbc_cfg.kd_base_orientation * (qvel[3:6] - omega_ref),
             -cfg.max_angular_acc,
             cfg.max_angular_acc,
         )
@@ -536,23 +636,34 @@ class LocomotionController:
         qj = np.asarray(qpos[QPOS_JOINT0:], dtype=float)
         dqj = qvel_arr[QVEL_JOINT0:]
 
-        def hold_joint(index: int, kp: float, kd: float, weight: float) -> None:
-            """Pin one joint to its nominal angle, overriding the posture row."""
+        def hold_joint(
+            index: int, kp: float, kd: float, weight: float, target: float | None = None
+        ) -> None:
+            """Pin one joint, overriding the posture row. Default target is nominal."""
+            if target is None:
+                target = float(self.nominal_joint_pos[index])
             joint_acc[index] = np.clip(
-                kp * (self.nominal_joint_pos[index] - qj[index]) - kd * dqj[index],
+                kp * (target - qj[index]) - kd * dqj[index],
                 -cfg.max_joint_acc,
                 cfg.max_joint_acc,
             )
             joint_weights[index] = max(float(joint_weights[index]), weight)
 
         per_leg = NUM_LEG_JOINTS // 2
+        foot_yaws_now = robot.foot_yaws()
+        pelvis_yaw = float(rpy[2])
         if walking:
-            # Hip yaw carries no useful walking motion, and the planted-leg
-            # posture gains are zero by design so nothing else holds it; left
-            # free it drifts into a pigeon-toed shuffle.
+            # Hip yaw holds the foot square to the pelvis yaw the base task
+            # is tracking, not to the standing keyframe. A turn otherwise
+            # asks the torso to yaw while the hip pins the foot to yaw 0.
             for leg_i in (0, 1):
-                hold_joint(leg_i * per_leg + HIP_YAW, STANCE_YAW_KP, STANCE_YAW_KD,
-                           STANCE_YAW_WEIGHT)
+                yaw_joint = leg_i * per_leg + HIP_YAW
+                target = self.nominal_joint_pos[yaw_joint] + wrap_angle(
+                    float(foot_yaws_now[leg_i]) - face_yaw
+                )
+                hold_joint(
+                    yaw_joint, STANCE_YAW_KP, STANCE_YAW_KD, STANCE_YAW_WEIGHT, target
+                )
 
         swing_jacobian = None
         swing_acc = None
@@ -580,26 +691,29 @@ class LocomotionController:
             )
             swing_jacobian = j_f
 
-            # World-flat sole on the descending arc. Ankles are released in
-            # the same window so the QP can use them; the stand-pose hold is
-            # the wrong frame (pelvis-relative) and a limp ankle just flops.
-            if swing.s > SWING_ANKLE_RELEASE_S:
-                foot_quat = robot.site_quat(site_id)
-                des_quat = np.array(
-                    [np.cos(0.5 * face_yaw), 0.0, 0.0, np.sin(0.5 * face_yaw)]
-                )
-                err_world = quat_to_mat(foot_quat) @ orientation_error(
-                    foot_quat, des_quat
-                )
-                omega = j_w @ qvel_arr
-                swing_orient_acc = np.clip(
-                    wbc_cfg.kp_swing_orient * err_world
-                    - wbc_cfg.kd_swing_orient * omega
-                    - bias_ang,
-                    -cfg.max_swing_ang_acc,
-                    cfg.max_swing_ang_acc,
-                )
-                swing_orient_jacobian = j_w
+            # Sole yaw tracks the swing arc for the whole swing. Pitch and
+            # roll stay with the ankle hold until the descending arc, then
+            # this task lays the sole flat. Zeroing those rows keeps the
+            # residual 3-wide so the QP sparsity does not change.
+            foot_quat = robot.site_quat(site_id)
+            des_quat = np.array(
+                [np.cos(0.5 * swing.des_yaw), 0.0, 0.0, np.sin(0.5 * swing.des_yaw)]
+            )
+            err_world = quat_to_mat(foot_quat) @ orientation_error(foot_quat, des_quat)
+            omega = j_w @ qvel_arr
+            omega_ref_foot = np.array([0.0, 0.0, swing.des_yaw_rate])
+            swing_orient_acc = np.clip(
+                wbc_cfg.kp_swing_orient * err_world
+                - wbc_cfg.kd_swing_orient * (omega - omega_ref_foot)
+                - bias_ang,
+                -cfg.max_swing_ang_acc,
+                cfg.max_swing_ang_acc,
+            )
+            swing_orient_jacobian = j_w.copy()
+            if swing.s <= SWING_ANKLE_RELEASE_S:
+                swing_orient_jacobian[:2] = 0.0
+                swing_orient_acc = swing_orient_acc.copy()
+                swing_orient_acc[:2] = 0.0
 
             # Damping-only null space, plus a hip-yaw hold so the foot stays
             # square. Ankle pitch/roll stay pinned on the way up and are
@@ -612,7 +726,12 @@ class LocomotionController:
                 cfg.max_joint_acc,
             )
             joint_weights[j0 : j0 + per_leg] = SWING_NULLSPACE_W
-            hold_joint(j0 + HIP_YAW, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
+            yaw_target = self.nominal_joint_pos[j0 + HIP_YAW] + wrap_angle(
+                float(swing.des_yaw) - pelvis_yaw
+            )
+            hold_joint(
+                j0 + HIP_YAW, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W, yaw_target
+            )
             if swing.s <= SWING_ANKLE_RELEASE_S:
                 for local in (ANKLE_PITCH, ANKLE_ROLL):
                     hold_joint(j0 + local, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
@@ -632,7 +751,14 @@ class LocomotionController:
                         STANCE_KNEE_STOP_W,
                     )
                 else:
-                    hold_joint(knee, STANCE_KNEE_KP, STANCE_KNEE_KD, STANCE_KNEE_W)
+                    knees = self._knee_bias(height)
+                    hold_joint(
+                        knee,
+                        STANCE_KNEE_KP,
+                        STANCE_KNEE_KD,
+                        STANCE_KNEE_W,
+                        float(knees[leg_i]),
+                    )
                 knee_guard[leg_i] = True
 
         self._last_joint_weights = joint_weights
@@ -687,6 +813,9 @@ class LocomotionController:
             swing_tilt=(
                 float(robot.sole_tilt(swing.leg)) if swing.active else 0.0
             ),
+            yaw_ref=float(face_yaw),
+            heading_goal=float(self.gait.config.heading),
+            heading_error=float(wrap_angle(self.gait.config.heading - face_yaw)),
         )
         return solution.torque
 
@@ -708,7 +837,8 @@ class LocomotionController:
 
     def lean_limits(self) -> dict[str, float]:
         """Physics-aware lean clamps from the current support polygon."""
-        margin = self.robot.support_margin()
+        yaw = None if self._last_gait is None else float(self._last_gait.stance_yaw)
+        margin = self.robot.support_margin(yaw=yaw)
         return {
             "lean_x_min": -LEAN_MARGIN_FRACTION * float(margin[0]),
             "lean_x_max": LEAN_MARGIN_FRACTION * float(margin[1]),
@@ -782,22 +912,15 @@ class LocomotionController:
             # Entering walk with zero speed: nudge a default crawl so mode alone works.
             if (
                 "gait.mode" in gait_applied
-                and gait_applied["gait.mode"] >= MODE_WALK
+                and gait_applied["gait.mode"] == MODE_WALK
                 and self.gait.config.speed <= 1e-6
+                and "gait.speed" not in gait_updates
+                and "gait.heading" not in gait_updates
             ):
                 self.gait.config.speed = 0.25
-                applied["gait.speed"] = 0.25  # crawl default; safer than 0.3 with lift
+                applied["gait.speed"] = 0.25
             applied.update(self.gait.apply_speed_schedule())
             self.config.gait = self.gait.config
-            # Align facing with travel heading when starting a walk if yaw~0.
-            if (
-                "gait.mode" in gait_applied
-                and gait_applied["gait.mode"] >= MODE_WALK
-                and abs(self.command.yaw) < 1e-6
-                and "gait.heading" in gait_applied
-            ):
-                self.command.yaw = float(self.gait.config.heading)
-                applied["yaw"] = float(self.command.yaw)
         return applied
 
     def tunables(self) -> dict[str, float]:
