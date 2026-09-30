@@ -135,6 +135,7 @@ def record_walk(
     decimate: int = 4,
     script: list | None = None,
     pushes: list | None = None,
+    config=None,
     **gait,
 ) -> WalkTrace:
     """Run a walk and sample the controller every ``decimate`` ticks.
@@ -142,7 +143,7 @@ def record_walk(
     ``script`` is a ``walk_bench`` event list ``(time, task updates)``. When it
     is omitted the walk starts immediately at ``speed``.
     """
-    sim = Simulation(pushes=list(pushes or []))
+    sim = Simulation(config, pushes=list(pushes or []))
     controller = sim.controller
     if script is None:
         pending = [(0.0, {"gait.mode": "walk", "gait.speed": speed, **gait})]
@@ -167,7 +168,9 @@ def record_walk(
         tel = controller.telemetry
         forward, left = heading_frame(float(tel.yaw_ref))
         robot = controller.robot
-        gait_out = controller._last_gait
+        gait_out = getattr(controller, "last_gait", None)
+        if gait_out is None:
+            gait_out = controller._last_gait
         dyn = robot.dynamics(sim.data.qvel)
 
         com = np.asarray(tel.com[:2], dtype=float)
@@ -540,6 +543,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stance-width", type=float, default=None)
     parser.add_argument("--scenario", default=None,
                         help="Replay a loka.walk_bench scenario by name")
+    parser.add_argument("--stack", default=None)
+    parser.add_argument("--config", type=Path, default=None)
     return parser.parse_args(argv)
 
 
@@ -576,12 +581,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if script is None:
         print(f"recording walk at {args.speed:.2f} m/s for up to {args.duration:.1f}s …")
+    from loka.control.locomotion import LocomotionConfig
+    from loka.control.stacks import apply_stack_arg
+
+    config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
+    apply_stack_arg(config, args)
     trace = record_walk(
         speed=args.speed,
         duration=args.duration,
         decimate=args.decimate,
         script=script,
         pushes=pushes,
+        config=config,
         **gait,
     )
     save_trace(trace, args.out)

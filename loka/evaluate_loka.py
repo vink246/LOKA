@@ -17,7 +17,10 @@ from pathlib import Path
 
 import numpy as np
 
+import copy
+
 from loka.control.locomotion import LocomotionConfig
+from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.sim import Simulation
 from loka.agent.faults import FaultSpec
 from loka.agent.runtime import LokaConfig, LokaRuntime
@@ -37,6 +40,13 @@ class ScenarioResult:
     notes: str = ""
 
 
+_CONFIG = LocomotionConfig()
+
+
+def _active_config() -> LocomotionConfig:
+    return copy.deepcopy(_CONFIG)
+
+
 def _run(
     name: str,
     *,
@@ -47,7 +57,7 @@ def _run(
     enable_llm: bool = False,
     local_operator_fn=None,
 ) -> ScenarioResult:
-    sim = Simulation(LocomotionConfig())
+    sim = Simulation(_active_config())
     runtime = LokaRuntime(
         sim,
         LokaConfig(enable_llm=enable_llm),
@@ -130,7 +140,7 @@ def scenario_mass_fault_scripted_recovery() -> ScenarioResult:
     """
     from loka.agent.apply import apply_stand_scratchpad
 
-    sim = Simulation(LocomotionConfig())
+    sim = Simulation(_active_config())
     runtime = LokaRuntime(
         sim,
         LokaConfig(enable_llm=False),
@@ -210,7 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
     )
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None)
+    add_stack_argument(parser)
     args = parser.parse_args(argv)
+    global _CONFIG
+    _CONFIG = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
+    apply_stack_arg(_CONFIG, args)
 
     names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
     results = []

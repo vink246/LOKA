@@ -77,7 +77,9 @@ class Simulation:
         self.config = config or LocomotionConfig()
         if model_path is not None:
             self.config.model_path = str(model_path)
-        self.controller = LocomotionController(self.config)
+        from loka.control.stacks import make as make_stack
+
+        self.controller = make_stack(self.config)
 
         self.model = mujoco.MjModel.from_xml_path(self.config.model_path)
         self.data = mujoco.MjData(self.model)

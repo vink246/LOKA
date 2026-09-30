@@ -69,7 +69,8 @@ def snapshot_metrics(frames: Sequence[dict]) -> EpisodeMetrics | None:
             force_errs.append(0.0)
         rpy = np.asarray(frame.get("rpy", np.zeros(3)), dtype=float)
         tilts.append(float(np.linalg.norm(rpy[:2])))
-        costs.append(float(frame.get("mpc_cost", 0.0)))
+        if frame.get("mpc_cost") is not None:
+            costs.append(float(frame["mpc_cost"]))
     mean_com = np.mean(np.stack(com_errs, axis=0), axis=0)
     return EpisodeMetrics(
         anomaly_score=float(np.mean(scores)),
@@ -78,7 +79,7 @@ def snapshot_metrics(frames: Sequence[dict]) -> EpisodeMetrics | None:
         com_error=(float(mean_com[0]), float(mean_com[1]), float(mean_com[2])),
         force_mismatch_n=float(np.mean(force_errs)),
         tilt_rad=float(np.mean(tilts)),
-        mpc_cost=float(np.mean(costs)),
+        mpc_cost=float(np.mean(costs)) if costs else 0.0,
     )
 
 

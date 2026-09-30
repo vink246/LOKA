@@ -20,7 +20,7 @@ immune layer** over a **fast certified balance plant**.
 
 | Layer | Rate | Job |
 |---|---|---|
-| Plant (centroidal MPC + whole-body QP) | ~50 Hz MPC / ~500 Hz WBC | Stay upright *now* |
+| Plant (`--stack`: `legacy_dcm`, `alip_footstep`) | ~50 Hz plan / ~500 Hz torque | Stay upright *now*. The prompt's `{{PLANT}}` sentence is filled from the active stack. |
 | LOKA orchestrator | ~0.5–5+ s (async) | Diagnose from compressed telemetry; mutate typed YAML (costs, tasks, mission criteria, model belief) |
 | Operator language | sparse | New objectives + updated `Error_Tracking` |
 

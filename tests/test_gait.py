@@ -566,6 +566,7 @@ def _closed_loop_plan(sched, *, ticks=2000, dt=0.002):
     return history
 
 
+@pytest.mark.stack_legacy
 def test_plan_settles_at_commanded_forward_speed():
     speed = 0.20
     sched = walking_scheduler(speed=speed)
@@ -576,6 +577,7 @@ def test_plan_settles_at_commanded_forward_speed():
     assert mean_vx == pytest.approx(speed, rel=0.05)
 
 
+@pytest.mark.stack_legacy
 def test_plan_lateral_motion_is_a_bounded_limit_cycle():
     sched = walking_scheduler(speed=0.20, stance_width=0.24)
     history = _closed_loop_plan(sched, ticks=3000)
@@ -591,6 +593,7 @@ def test_plan_lateral_motion_is_a_bounded_limit_cycle():
     assert float(np.abs(dcm_ys).max()) < 0.12
 
 
+@pytest.mark.stack_legacy
 def test_first_lift_has_limit_cycle_lateral_velocity():
     """Opening ZMP on the upcoming swing-foot inset preloads the DCM orbit.
 
@@ -651,6 +654,7 @@ def test_com_reference_never_leads_the_robot_unboundedly():
 # -- 5. capture-point adjustment -----------------------------------------
 
 
+@pytest.mark.stack_legacy
 def test_foothold_steps_out_when_com_is_racing():
     """Excess forward velocity must move the foothold forward, and only so far."""
     slow = walking_scheduler(speed=0.25, capture_gain=1.0)
@@ -666,6 +670,7 @@ def test_foothold_steps_out_when_com_is_racing():
     assert pushed[0][1][0] < 0.45
 
 
+@pytest.mark.stack_legacy
 def test_capture_gain_zero_leaves_the_nominal_plan_alone():
     sched = walking_scheduler(speed=0.25, capture_gain=0.0)
     com = np.array([0.0, 0.0, HEIGHT])
@@ -677,6 +682,7 @@ def test_capture_gain_zero_leaves_the_nominal_plan_alone():
     np.testing.assert_allclose(calm[0][1], racing[0][1], atol=1e-9)
 
 
+@pytest.mark.stack_legacy
 def test_foothold_correction_does_not_feed_back_on_itself():
     """Applying the correction twice at one instant must give the same foothold.
 
@@ -821,6 +827,7 @@ def test_step_timing_foothold_does_not_feed_back_on_itself():
         gait.STEP_TIMING = previous
 
 
+@pytest.mark.stack_legacy
 def test_heading_step_turns_one_step_at_a_time():
     """A 90° heading goal must not yaw the next foot by 90°."""
     from loka.control.gait import MIN_FOOT_SEPARATION, heading_frame, max_turn_per_step, wrap_angle
@@ -866,6 +873,50 @@ def test_turn_in_place_keeps_the_centre():
     assert sched.walking
     centre = np.mean([step.pos for step in sched._steps.values()], axis=0)
     assert float(np.linalg.norm(centre)) < 0.05
+
+
+def test_in_place_capture_does_not_walk_the_centre():
+    """A backward capture step must not move the latched turn centre.
+
+    convex-mpc-biped rotates the lateral offset about the footprint centre.
+    Chaining the next centre off the corrected foot walked a 90° turn ~0.71 m.
+    """
+    sched = walking_scheduler(speed=0.0, heading=np.pi / 2, capture_gain=0.7)
+    com = np.array([-0.08, 0.0, HEIGHT])
+    vel = np.array([-0.05, 0.0, 0.0])
+    max_correction = 0.0
+    for _ in range(2500):
+        drive(sched, com=com, com_vel=vel)
+        target = sched._steps.get(sched._step + 1)
+        if target is not None:
+            max_correction = max(
+                max_correction, float(np.linalg.norm(target.correction))
+            )
+    assert max_correction > 0.01, "capture never moved a foot, so the chain was not tested"
+    assert sched._turn_center is not None
+    latched = np.asarray(sched._turn_center, dtype=float)
+    assert float(np.linalg.norm(latched)) < 0.05
+    radius = 0.5 * float(sched.config.stance_width)
+    for step in sched._steps.values():
+        if step.leg < 0 or step.nominal is None or step.frozen:
+            continue
+        dist = float(np.linalg.norm(np.asarray(step.nominal) - latched))
+        assert dist == pytest.approx(radius, abs=0.01)
+
+
+def test_closed_loop_turn_in_place_stays_near_the_start():
+    """90° at zero speed stays up and within 0.15 m of the start.
+
+    Before the latched footprint centre this drift was about 0.71 m.
+    """
+    from loka.control.gait import wrap_angle
+
+    result = _walk(0.0, 8.0, **{"gait.heading": float(np.pi / 2)})
+    assert not result["fell"], f"fell after {result['elapsed']:.2f}s"
+    drift = float(np.hypot(result["forward"], result["lateral"]))
+    assert drift < 0.15, f"pelvis moved {drift:.3f} m"
+    yaw = float(result["sim"].controller.last_gait.stance_yaw)
+    assert abs(wrap_angle(yaw - np.pi / 2)) < 0.15
 
 
 def test_mid_swing_period_change_does_not_jump_phase():
@@ -985,8 +1036,12 @@ def test_spline_swing_lands_softly_and_peaks_at_the_commanded_height():
 # -- 6. closed-loop walk on the robot ------------------------------------
 
 
-def _walk(speed: float, duration: float, **gait):
-    sim = Simulation()
+def _walk(speed: float, duration: float, stack: str = "legacy_dcm", **gait):
+    from loka.control.locomotion import LocomotionConfig
+
+    config = LocomotionConfig()
+    config.stack = stack
+    sim = Simulation(config)
     controller = sim.controller
     controller.set_task_targets({"gait.mode": "walk", "gait.speed": speed, **gait})
     start = np.array(sim.data.qpos[:2])
@@ -1164,9 +1219,10 @@ def test_walk_command_produces_real_steps_not_a_shuffle():
     assert result["forward"] > 0.15, "barely any forward travel"
 
 
+@pytest.mark.parametrize("stack", ["legacy_dcm", "alip_footstep"])
 @pytest.mark.parametrize("speed", [0.10, 0.20, 0.30])
-def test_closed_loop_walk_stays_up(speed):
-    result = _walk(speed, WALK_TEST_DURATION)
+def test_closed_loop_walk_stays_up(speed, stack):
+    result = _walk(speed, WALK_TEST_DURATION, stack=stack)
     assert not result["fell"], (
         f"fell after {result['elapsed']:.2f}s / {result['steps']} steps "
         f"(forward {result['forward']:+.2f} m, lateral {result['lateral']:+.2f} m)"
@@ -1178,9 +1234,19 @@ def test_closed_loop_walk_stays_up(speed):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize(
+    "stack",
+    [
+        "legacy_dcm",
+        pytest.param(
+            "alip_footstep",
+            marks=pytest.mark.xfail(reason="ALIP footstep walk is not a limit cycle yet", strict=False),
+        ),
+    ],
+)
 @pytest.mark.parametrize("speed", [0.10, 0.20, 0.35, 0.50])
-def test_closed_loop_walk_is_a_limit_cycle(speed):
-    result = _walk(speed, WALK_LIMIT_CYCLE_DURATION)
+def test_closed_loop_walk_is_a_limit_cycle(speed, stack):
+    result = _walk(speed, WALK_LIMIT_CYCLE_DURATION, stack=stack)
     assert not result["fell"], (
         f"fell after {result['elapsed']:.2f}s / {result['steps']} steps "
         f"(forward {result['forward']:+.2f} m, lateral {result['lateral']:+.2f} m)"

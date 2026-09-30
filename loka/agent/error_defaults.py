@@ -127,3 +127,31 @@ def default_walk_error_spec(*, nominal_height: float = 0.778) -> ErrorSpec:
             ),
         ],
     )
+
+
+def _world_origin_drift(term: ErrorTerm) -> bool:
+    """World x/y measured against the origin.
+
+    A walk or a go-to leaves that point on purpose. ``heading_error`` and
+    ``cross_track`` are the mission terms for that motion.
+    """
+    return (
+        term.signal == "qpos"
+        and term.index in (0, 1)
+        and term.mode in ("abs_deviation", "abs_above")
+        and abs(float(term.target)) <= 1e-6
+    )
+
+
+def adapt_error_spec_for_walk(spec: ErrorSpec) -> ErrorSpec:
+    """Drop origin drift and ensure the walk heading / cross-track terms.
+
+    Other terms the orchestrator wrote (height, rates, a drift term aimed at
+    a nonzero target) are kept. Idempotent on an already-adapted spec.
+    """
+    kept = [term for term in spec.terms if not _world_origin_drift(term)]
+    names = {term.name for term in kept}
+    for term in default_walk_error_spec().terms:
+        if term.name in ("heading_error", "cross_track") and term.name not in names:
+            kept.append(term)
+    return ErrorSpec(trigger_threshold=spec.trigger_threshold, terms=kept)

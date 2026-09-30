@@ -88,8 +88,9 @@ Policy guidance requires aligning belief with observations---e.g., reducing gear
 \subsection{Locomotion plant: stand and walk}
 \label{sec:plant}
 
-The reference plant couples a centroidal convex MPC (contact forces) with a whole-body QP (torques).
-Walking adds a gait clock, capture-point footholds with a Raibert-style velocity feedback term, and a Cartesian swing-foot task tracked in the WBC via foot-center Jacobians (quintic/Bezier lift arc; no separate analytical foot IK).
+The reference plant is selectable. The default, \texttt{legacy\_dcm}, couples a centroidal convex MPC (contact forces) with a whole-body QP (torques) and DCM capture-point footholds.
+Three ALIP stacks (Xiong \& Ames, T-RO 2022) share the same \texttt{compute\_torque} contract: \texttt{alip\_footstep} keeps the MPC and WBC and replaces the foothold law; \texttt{alip\_paper} tracks height, torso and the swing foot with the WBC and does not treat horizontal CoM as an output; \texttt{alip\_wbqp} replaces both QPs with one contact-wrench program whose steps come from an ALIP MPC.
+Walking adds a gait clock and a Cartesian swing-foot task tracked via foot-center Jacobians (quintic or Bézier lift; no separate analytical foot IK).
 \texttt{gait.mode=walk} engages planned contact masks and velocity-aligned CoM references; \texttt{heading} and \texttt{yaw} provide travel direction and torso facing.
 Foothold $xy$ and per-tick contact bits remain classical---out of the LLM vocabulary---so language commands such as ``walk at $0.3\,\mathrm{m/s}$ heading left'' retune policy knobs rather than invent geometry.
 

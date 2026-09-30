@@ -22,6 +22,7 @@ import mujoco
 import numpy as np
 
 from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig
+from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.recording import RecordingToggle
 from loka.sim import Simulation, push_sequence
 
@@ -47,11 +48,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--push-period", type=float, default=3.0,
                         help="Seconds between pushes")
     parser.add_argument("--seed", type=int, default=0)
+    add_stack_argument(parser)
     return parser.parse_args(argv)
 
 
 def build_simulation(args: argparse.Namespace) -> Simulation:
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
+    apply_stack_arg(config, args)
     duration = args.duration or (30.0 if not args.headless else 10.0)
     pushes = (
         push_sequence(

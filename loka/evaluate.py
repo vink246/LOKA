@@ -22,6 +22,7 @@ import time
 import numpy as np
 
 from loka.control.locomotion import LocomotionConfig
+from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.sim import Push, Simulation
 
 DIRECTIONS = {
@@ -107,9 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--skip-pushes", action="store_true")
+    add_stack_argument(parser)
     args = parser.parse_args(argv)
 
     config = LocomotionConfig()
+    apply_stack_arg(config, args)
     evaluate_hold(config)
     if not args.skip_pushes:
         evaluate_pushes(config)

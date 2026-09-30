@@ -44,6 +44,7 @@ from loka.control.gait import (
     heading_frame,
 )
 from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig
+from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.recording import RecordingToggle
 from loka.sim import Push, Simulation
 
@@ -246,6 +247,9 @@ class Dashboard:
         for entry in tuning.TUNABLES:
             if entry.group != group:
                 continue
+            stack = getattr(self.sim.controller.config, "stack", "legacy_dcm")
+            if stack not in entry.stacks:
+                continue
             self._add_slider(
                 entry.path,
                 # The knob name, not the attribute: weight_orientation_rp and
@@ -422,8 +426,8 @@ class Dashboard:
         dpg.set_value(
             "status2",
             f"CoM margin  fwd {margin[1] * 1e3:5.1f} mm   back {margin[0] * 1e3:5.1f} mm"
-            f"   |   QP fallbacks  wbc {controller.wbc._qp.failures}"
-            f"  mpc {controller.mpc._qp.failures}",
+            f"   |   QP fallbacks  "
+            + "  ".join(f"{k} {v}" for k, v in controller.qp_failures().items()),
         )
         forward, _ = heading_frame(float(telemetry.yaw_ref))
         travel = float((np.asarray(self.sim.data.qpos[:2]) - self._origin) @ forward)
@@ -494,12 +498,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Start in walk mode at this speed [m/s]")
     parser.add_argument("--heading", type=float, default=0.0,
                         help="World-frame travel direction [rad]")
+    add_stack_argument(parser)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
+    apply_stack_arg(config, args)
     sim = Simulation(config, model_path=args.model)
     if args.walk is not None:
         sim.controller.set_task_targets(

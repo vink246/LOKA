@@ -111,8 +111,11 @@ def test_no_widget_callback_raises(dashboard):
         fire(item)
 
 
+_LEGACY_TUNABLES = [entry for entry in tuning.TUNABLES if "legacy_dcm" in entry.stacks]
+
+
 @needs_display
-@pytest.mark.parametrize("entry", tuning.TUNABLES, ids=lambda e: e.path)
+@pytest.mark.parametrize("entry", _LEGACY_TUNABLES, ids=lambda e: e.path)
 def test_slider_drives_its_own_parameter_and_no_other(dashboard, entry):
     controller = dashboard.sim.controller
     before = controller.tunables()
@@ -133,7 +136,7 @@ def test_slider_drives_its_own_parameter_and_no_other(dashboard, entry):
 
 @needs_display
 def test_restore_defaults_resets_parameters_and_slider_positions(dashboard):
-    for entry in tuning.TUNABLES:
+    for entry in _LEGACY_TUNABLES:
         dpg.set_value(entry.path, np.log10(entry.high) if entry.log else entry.high)
         fire(entry.path)
 
@@ -258,7 +261,7 @@ def test_leaving_walk_stops_the_gait_clock(dashboard, standing_again):
     "path,field,value",
     [
         ("gait.speed", "speed", 0.30),
-        ("gait.swing_height", "swing_height", 0.09),
+        ("gait.swing_height", "swing_height", 0.08),
         ("gait.step_period", "step_period", 0.80),
         ("gait.stance_width", "stance_width", 0.26),
         ("gait.capture_gain", "capture_gain", 1.0),

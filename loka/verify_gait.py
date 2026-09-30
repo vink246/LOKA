@@ -146,6 +146,61 @@ def report_closed_loop(duration: float = 10.0) -> None:
               f"{result['swing_err']*1000:5.1f}mm")
 
 
+def alip_isolation() -> int:
+    """Perfect ALIP tracker: the plant is the model. Gate 2 lives here."""
+    from loka.control.alip import OrbitCache, lateral_step, p1_orbit
+
+    mass, height, t_ss, t_ds = 35.0, 0.70, 0.25, 0.10
+    t_step = t_ss + t_ds
+    cache = OrbitCache()
+    cache.refresh(mass, height, t_ss, t_ds, 0.7)
+    failed = False
+    for speed in (0.05, 0.2, 0.4, 0.6):
+        x_star = p1_orbit(cache.a, cache.b, speed * t_step)
+        x = np.zeros(2)
+        for _ in range(3):
+            u = cache.sagittal_step(x, speed, t_step)
+            x = cache.a @ x + cache.b * u
+        # Compare in metres and m/s. The raw (x, L) norm mixes m with N·m·s.
+        mh = mass * height
+        err_x = abs(float(x[0] - x_star[0]))
+        err_v = abs(float(x[1] - x_star[1])) / mh
+        ok = err_x < 0.02 and err_v < 0.02
+        print(
+            f"  speed {speed:.2f}  after 3 steps |dx| {err_x:.4f} m  |dv| {err_v:.4f} m/s  "
+            f"{'ok' if ok else 'FAIL'}"
+        )
+        failed = failed or not ok
+        kicked = x.copy()
+        kicked[1] *= 0.7
+        signs = []
+        for _ in range(4):
+            u = cache.sagittal_step(kicked, speed, t_step)
+            kicked = cache.a @ kicked + cache.b * u
+            signs.append(np.sign(kicked[1]))
+        # A -30% momentum kick must not reverse the sagittal velocity.
+        flipped = speed > 0 and any(s < 0 for s in signs)
+        print(f"    kick signs {signs}  {'ok' if not flipped else 'FAIL'}")
+        failed = failed or flipped
+    # Lateral limit cycle, centred.
+    width = 0.22
+    x = np.zeros(2)
+    samples = []
+    leg = 0
+    for _ in range(8):
+        u_star = lateral_step(leg, width, 0.0, t_step)
+        u = cache.lateral_step(x, leg, width, 0.0, t_step)
+        x = cache.a @ x + cache.b * u
+        samples.append(float(x[0]))
+        leg = 1 - leg
+        del u_star
+    centre = float(np.mean(samples[-2:]))
+    print(f"  lateral centre {centre * 1e3:.2f} mm")
+    if abs(centre) > 1e-3:
+        failed = True
+    return 1 if failed else 0
+
+
 def main() -> None:
     report_plan()
     report_closed_loop()
@@ -156,4 +211,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import sys
+
+    if "--stack" in sys.argv:
+        raise SystemExit(alip_isolation())
     main()

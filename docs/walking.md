@@ -1,6 +1,13 @@
 # Phase B: the walking plant
 
-Status: **8 s at 0.10–0.30 m/s holds. 30 s at 0.10 m/s holds; 30 s at 0.20 m/s stays up but drifts about 0.56 m sideways, so that limit-cycle bound fails.**
+Two stacks, one contract (`compute_torque` never blocks). Select with `--stack`:
+
+| Stack | Footholds | Force / torque |
+|---|---|---|
+| `legacy_dcm` (default) | DCM capture point | ConvexMPC + WBC |
+| `alip_footstep` | ALIP stepping law (Xiong & Ames) on the same chain | same ConvexMPC + WBC |
+
+Status of `legacy_dcm`: **8 s at 0.10–0.30 m/s holds. 30 s at 0.10 m/s holds; 30 s at 0.20 m/s stays up but drifts about 0.56 m sideways, so that limit-cycle bound fails.**
 with the speed-scheduled high-DS gait (`gait_schedule_for_speed`, duty
 ~0.82 crawl → ~0.74 at 0.50 m/s). Isolation duty 0.65 still pitches over
 at ~3 s — do not pin the yaml 0.65 default when asking for a walk. CoP
@@ -295,6 +302,98 @@ it is supposed to be trading against.
 `python -m loka.verify_gait` is the planner-vs-closed-loop split. It first runs
 the planner in isolation against a perfectly-tracking robot — the check to run
 first after touching `gait.py` — then sweeps the closed loop.
+
+## ALIP experiments (2026-09-28)
+
+`alip_paper` and `alip_wbqp` were removed. The plant options are `legacy_dcm` and `alip_footstep`. The side-by-side bench lives in `docs/walk_bench.md`.
+
+Isolation (`python -m loka.verify_gait --stack`) on the ALIP model with a perfect tracker: speed error is 0 after 3 steps at 0.05, 0.20, 0.40 and 0.60 m/s; a −30% momentum kick does not flip the sign of \(L\); the lateral cycle is centred to 0.0 mm. That is Gate 2, and it passed.
+
+Closed loop, short smoke only (not the full bench):
+
+| Trial | Result | Hypothesis |
+|---|---|---|
+| `alip_paper` quiet stand with `wbc.weight_force = 0` | OSQP: KKT not quasidefinite, fall | The force block is singular. Walking uses `1e-3`, not 0. |
+| `alip_paper` quiet stand with CoP regularization left on | Fall at ~4 s, no solver error | The moment penalty fights the standing force plan. CoP weight is 0 while standing and 2 while walking. |
+| `alip_paper` quiet stand after that split | 8 s, no fall | Standing path is the legacy WBC again. |
+| `alip_footstep` walk at 0.20 m/s | Fall at ~2.1 s | First swing. Suspects, not yet separated: sagittal \(L\) sign, stance-width sign, or `capture_gain` 0.7 on a plant the law was not identified on. Not retuned to pass a test. |
+
+Second pass on `alip_footstep` (0.20 m/s, 8 s). A per-touchdown trace checks the pre-impact prediction at the
+freeze point against the real pre-impact state, and the law's step against
+the landing. After the first two fixes both agree to about a centimetre, so
+the remaining error is in the step-to-step map itself.
+
+| Hypothesis | Result |
+|---|---|
+| LQR `Q = I` weights `L` ~(mH)² over `x` | True: every `capture_gain < 1` was deadbeat (eig 0.012). `Q = diag(1, 1/(mH)²)` now spans eig 0.12–0.32. Kept. |
+| Deadbeat law asked for 0 → 0.2 m/s in one step | True: first foot 10 cm behind, second far ahead. Orbit speed now moves ≤ 0.05 m/s per step. Kept. |
+| Orbit CoM reference with the DCM leash | The MPC brakes the pendulum; real lateral velocity is ~1/3 of the model's; law over-steps. Replaced. |
+| Legacy DCM CoM reference for the whole walk | Pushes the CoM against the ALIP footholds (−0.25 m/s by step 2). Kept only for the opening step, where it supplies the weight shift. |
+| Look-ahead pendulum velocity reference | The MPC pushes the CoM along the fall; reality diverges faster than the model. Replaced by the measured ALIP velocity. |
+| Per-knot ALIP trajectory handed to the MPC | Falls at 2.7 s at all speeds and p95 rises to 7 ms. Reverted. |
+| X&A double support (`L` constant) | Wrong on this plant: lateral velocity reverses within a 0.22 s double support. A CoP moving old → new contact over 80% of double support matches the traced steps. Kept (`DS_TRANSFER_FRACTION`). |
+| Lateral cycle after that | Converges: 0.32 → 0.25 m steps, 6 s up. |
+| Sagittal after that | Walks backward at ~0.25 m/s: a persistent ~+2 cm pivot offset the law did not know about. |
+| Pivot-bias correction (online `L̇ = mg(x−d)` estimate, per-step EMA) | Reverses the sign (now accelerates forward), then overshoots and falls at 4–6 s. Grid over `capture_gain` 0.4/0.7/1.0 × bias rate 0.1/0.3: best is 8 s up but 1.7 m backward. Open. |
+| Paper timing (0.8 s / duty 0.625) | Worse with every reference tried. |
+
+At the end of this pass, `alip_footstep`, `alip_paper`, and `alip_wbqp` all still fell inside 8 s.
+The ALIP model is right in single support; the convex MPC's 0.3 s horizon
+changes double support and the sagittal pivot, so the step map the law
+assumes is not the one the plant executes. Next step: identify the
+step-to-step map online (least squares on logged `(X_k, u_k, X_{k+1})`,
+model as prior) rather than fitting constants by hand.
+
+Fixed in the same pass: the ALIP-MPC QP registered a dense Hessian
+pattern, so every OSQP update after the first failed and returned the
+previous answer. That planner left with `alip_wbqp`.
+
+### Third pass: `alip_footstep` walks
+
+| Hypothesis | Result |
+|---|---|
+| Identify the step-to-step map online (RLS on `(X_k, u_k, X_{k+1})`, model prior) | Stable, but still backward: the measured-velocity reference makes the MPC a velocity holder, so stepping cannot change speed. The 0.25 m/s outlier gate also rejected the sagittal samples. Kept for the `free` mode (`StepMapEstimator`). |
+| Commanded speed as the MPC's sagittal velocity reference | The MPC and the law both regulate speed and fight; falls at 3 s. Partial pull (0.1–0.3) and weaker sagittal gain: falls at 3–7 s. |
+| Nominal chain footholds + ALIP feedback, MPC on the DCM CoM reference | Error vs the ALIP model orbit: biased, falls at 2.5–3.5 s. Error vs the gait's own CoM reference: 0.2 and 0.3 m/s hold 8 s. |
+| LQR/deadbeat gain on that error | 0.1 m/s crawl (two-thirds double support) walks backward into a fall. Capture-point shape `capture_gain*(dx + dv/omega)`: holds. |
+| Correct in double support too | Worse at 0.1 m/s. Swing only, like the DCM nudge. |
+| `L` about the contact vs `m H v_com` for the error | `L` reads the swing leg's and arms' momentum as a speed error; 0.1 m/s raced forward at 0.28 m/s. CoM velocity: 0.1/0.2/0.3 m/s all hold 8 s. The ALIP model still carries the error to impact. |
+| 0.25 rad/step turn cap | Falls on T2, T5, N1, P2. Chain cap restored. |
+| ALIP error while turning or treading | Still falls on T2, T5, N1 and B1's tread (the leashed CoM reference does not rotate with the chain). The DCM nudge while turning or treading: T2, T5, N1 pass. |
+| Correction clamp 0.1 / 0.2, large-error handoff to the DCM nudge | No change on the 10 N·s pushes. Off by default. |
+| `capture_gain` 0.4 / 0.7 / 1.0 | 1.0 passes P1_left_ds_10 but loses G3 and S1 (13/17). 0.7 is the default (14/17). |
+
+Bench subset (17 scenarios), `legacy_dcm` vs `alip_footstep` at the
+defaults: 14 vs 14. ALIP passes S1 (30 s lateral drift ≤ 0.15 m), which
+legacy fails at 0.26 m; legacy survives B1 (tread → walk),
+P1_back_late_10 and P1_left_ds_10, where ALIP falls. Both pass T1, T2, T5,
+G1, G3, S0, B2, N1, P2 and the 8 N·s mid-swing pushes in all four
+directions. Current numbers are in `docs/walk_bench.md`.
+
+Open: large (10 N·s) backward pushes and the tread-to-walk start. After a
+big push the ALIP error keeps the pre-push reference speed; the DCM nudge
+re-anchors on the corrected foothold instead.
+
+### Turning in place without walking off
+
+A 90° zero-speed turn used to move the pelvis 0.71 m. The capture correction
+put the swing foot 8–11 cm behind the plan, and the chain rebuilt its centre
+on that foot, so the DCM reference followed.
+
+The zero-speed chain now matches convex-mpc-biped's pure yaw: the footprint
+centre is latched, and each foot is only the lateral offset rotated to that
+step's yaw. Capture still moves the foot in the air. It does not move the
+centre. A capped return `2/s × (centre − CoM)`, at most 0.10 m/s, is added
+to the MPC velocity so the body walks back onto that centre. Measured on
+`legacy_dcm`: a 90° turn ends about 0.11 m away (peak about 0.12 m) and a
+straight 8 s walk at 0.20 m/s is unchanged (1.29 m forward, −0.16 m lateral).
+A walking turn (speed 0.10 m/s and above) stays on the forward chain.
+
+The earlier chain-pull of 5–10 cm/step did not hold (0.41–0.76 m): the
+correction re-added what the pull removed. That ALIP-only rewrite is gone;
+both stacks use the latched centre.
+
+`legacy_dcm` remains the default. It is not retired.
 
 `tests/test_gait.py` holds the planner invariants plus
 `test_closed_loop_walk_stays_up` (8 s, 0.10/0.20/0.30) and

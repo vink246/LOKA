@@ -102,6 +102,9 @@ class WBCConfig:
     kd_swing_orient: float = 28.0
     kp_posture_upper: float = 100.0
     kd_posture_upper: float = 10.0
+    #: Quadratic penalty on the stance-foot moment about the sole centre.
+    #: Zero on the convex-MPC stacks, so their Hessian sparsity is unchanged.
+    cop_regularization: float = 0.0
 
 
 @dataclass
@@ -124,6 +127,9 @@ class WBCTargets:
     #: Optional sole-orientation task, same residual form on ``J_ω``.
     swing_orient_jacobian: np.ndarray | None = None  # (3, nv)
     swing_orient_acc: np.ndarray | None = None  # (3,)
+    #: 0 drops the horizontal CoM task (Xiong & Ames: horizontal CoM is not an
+    #: output). Vertical height and orientation keep ``base_weight_scale``.
+    base_xy_scale: float = 1.0
 
 
 @dataclass
@@ -195,6 +201,9 @@ class WholeBodyController:
         mask[: self.nv, : self.nv] = True
         idx = np.arange(self.nv, self.num_vars)
         mask[idx, idx] = True
+        if float(self.config.cop_regularization) > 0.0:
+            # CoP regularization couples the force components of one foot.
+            mask[self.nv :, self.nv :] = True
         return Sparsity(np.triu(mask))
 
     def _constraint_pattern(self) -> Sparsity:
@@ -307,9 +316,11 @@ class WholeBodyController:
         weights = self._diagonal
         if targets.joint_weights is not None:
             weights[self._joint_slice] = targets.joint_weights
-        weights[: self.n_base_rows] = targets.base_weight_scale * np.concatenate(
-            (np.full(3, cfg.weight_base_position), np.full(3, cfg.weight_base_orientation))
-        )
+        pos_w = targets.base_weight_scale * cfg.weight_base_position
+        xy = float(targets.base_xy_scale)
+        weights[0:2] = pos_w * xy
+        weights[2] = pos_w
+        weights[3:6] = targets.base_weight_scale * cfg.weight_base_orientation
 
         target = np.empty(self.num_vars)
         target[0:3] = targets.base_linear_acc
@@ -319,8 +330,11 @@ class WholeBodyController:
 
         hessian = self._hessian
         hessian[:nv, :nv] = cfg.weight_contact * (jac_active.T @ jac_active)
-        # The acceleration diagonal adds onto the freshly written JᵀJ; the
-        # force block is diagonal only, so it is assigned rather than summed.
+        # The acceleration diagonal adds onto the freshly written JᵀJ. The
+        # force block is rewritten every tick: diagonal from the force weight,
+        # and (only when CoP regularization is on) the moment coupling. Clear
+        # it first so that coupling cannot accumulate across solves.
+        hessian[nv:, nv:] = 0.0
         acc = np.arange(nv)
         force = np.arange(nv, self.num_vars)
         hessian[acc, acc] += weights[:nv] + cfg.regularization
@@ -344,6 +358,10 @@ class WholeBodyController:
             targets.swing_orient_acc,
             cfg.weight_swing_orient,
         )
+        if cfg.cop_regularization > 0.0 and dynamics.contact_pos is not None:
+            _add_cop_cost(
+                hessian, cfg.cop_regularization, dynamics.contact_pos, nv, planted
+            )
 
         solution = self._qp.solve(
             hessian, gradient, self._constraint, self._lower, self._upper
@@ -355,3 +373,32 @@ class WholeBodyController:
         return WBCSolution(
             torque=torque, qacc=qacc, forces=forces.reshape(self.num_contacts, 3)
         )
+
+
+def _add_cop_cost(hessian, weight, contact_pos, nv, planted) -> None:
+    """Penalise the moment of the contact forces about each sole's centre.
+
+    A zero moment is a centre-of-pressure at the foot centre, which is the
+    flat-foot stand-in for the point-foot assumption in Xiong & Ames.
+    """
+    pos = np.asarray(contact_pos, dtype=float).reshape(-1, 3)
+    per = pos.shape[0] // 2
+    for foot in (0, 1):
+        sl = slice(foot * per, (foot + 1) * per)
+        if not np.any(planted[sl]):
+            continue
+        sites = pos[sl]
+        centre = sites.mean(axis=0)
+        # Two moment rows, one column per force component of this foot.
+        moment = np.zeros((2, per * 3))
+        for j, site in enumerate(sites):
+            r = site - centre
+            # m_x = r_y f_z - r_z f_y,  m_y = r_z f_x - r_x f_z
+            moment[0, 3 * j + 1] = -r[2]
+            moment[0, 3 * j + 2] = r[1]
+            moment[1, 3 * j + 0] = r[2]
+            moment[1, 3 * j + 2] = -r[0]
+        block = float(weight) * (moment.T @ moment)
+        c0 = nv + foot * per * 3
+        c1 = c0 + per * 3
+        hessian[c0:c1, c0:c1] += block

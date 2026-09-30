@@ -41,6 +41,8 @@ class Tunable:
     indices: tuple[int, ...] | None = None
     #: Slider (and LLM step) on a multiplicative scale. Weights span decades.
     log: bool = True
+    #: Stacks whose ``update_weights`` accepts this path.
+    stacks: tuple[str, ...] = ("legacy_dcm", "alip_footstep")
 
     @property
     def group(self) -> str:
@@ -124,6 +126,11 @@ TUNABLES: tuple[Tunable, ...] = (
     Tunable("stand.max_joint_acc", "Cap on commanded joint acceleration [rad/s^2]",
             10.0, 2e3, log=False),
 )
+
+
+def paths_for_stack(stack: str) -> set[str]:
+    """Dotted paths ``update_weights`` may write on ``stack``."""
+    return {t.path for t in TUNABLES if stack in t.stacks}
 
 BY_PATH: Mapping[str, Tunable] = {t.path: t for t in TUNABLES}
 

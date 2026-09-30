@@ -36,6 +36,7 @@ from pathlib import Path
 import mujoco
 
 from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig, TASK_PARAMETER_NAMES
+from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.sim import Simulation
 from loka.agent.faults import FaultSpec
 from loka.agent.interactive import FAULT_HELP, parse_fault_command
@@ -158,6 +159,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Initial gait.heading [rad] world-frame travel direction",
     )
+    add_stack_argument(parser)
     args = parser.parse_args(argv)
     if args.operator and args.no_llm:
         parser.error(
@@ -290,6 +292,7 @@ def _make_key_callback(runtime: LokaRuntime):
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
+    apply_stack_arg(config, args)
     sim = Simulation(config, model_path=args.model)
     log_path = None
     if not args.no_log:

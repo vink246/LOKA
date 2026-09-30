@@ -149,6 +149,19 @@ def _semantic_tags(frame: dict) -> list[str]:
     return tags
 
 
+def _force_mismatch(des: np.ndarray, got: np.ndarray) -> float | None:
+    """Net force error, summed per foot when both arrays are the eight sole sites."""
+    if des.shape != got.shape or des.size == 0:
+        return None
+    if des.ndim == 2 and des.shape[0] == 8:
+        err = 0.0
+        for foot in (0, 1):
+            sl = slice(foot * 4, (foot + 1) * 4)
+            err += float(np.linalg.norm(des[sl].sum(axis=0) - got[sl].sum(axis=0)))
+        return err
+    return float(np.linalg.norm(des - got))
+
+
 def format_balance_section(frames: Sequence[dict]) -> str:
     if not frames:
         return "1. BALANCE / CONTACTS\n  (no frames)\n"
@@ -159,7 +172,8 @@ def format_balance_section(frames: Sequence[dict]) -> str:
     mask = np.asarray(latest.get("contact_mask", ()), dtype=bool)
     des = np.asarray(latest.get("desired_forces", np.zeros((1, 3))), dtype=float)
     got = np.asarray(latest.get("contact_forces", np.zeros((1, 3))), dtype=float)
-    force_err = float(np.linalg.norm(des - got)) if des.shape == got.shape else float("nan")
+    force_err = _force_mismatch(des, got)
+    force_text = "n/a" if force_err is None else f"{force_err:.1f} N"
 
     com_errs = [float(np.linalg.norm(f.get("com_error", np.zeros(3)))) for f in frames]
     tilts = [float(np.linalg.norm(f.get("rpy", np.zeros(3))[:2])) for f in frames]
@@ -174,8 +188,13 @@ def format_balance_section(frames: Sequence[dict]) -> str:
         f"{margin[0]*1e3:.0f}/{margin[1]*1e3:.0f}/{margin[2]*1e3:.0f}/{margin[3]*1e3:.0f}",
         f"  contacts planted: {int(mask.sum())}/8"
         f"  contact speed max: {float(latest.get('contact_speed_max', 0.0)):.3f} m/s",
-        f"  force tracking ||f*-f||: {force_err:.1f} N"
-        f"  mpc_cost: {float(latest.get('mpc_cost', 0.0)):.3g}"
+        f"  force tracking ||f*-f||: {force_text}",
+        "  mpc_cost: "
+        + (
+            "n/a"
+            if latest.get("mpc_cost") is None
+            else f"{float(latest.get('mpc_cost')):.3g}"
+        ),
         f"  qp_fail wbc/mpc: "
         f"{latest.get('wbc_failures_total', latest.get('wbc_failures', 0))}/"
         f"{latest.get('mpc_failures_total', latest.get('mpc_failures', 0))}"
@@ -234,13 +253,13 @@ def format_motor_section(frames: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
-def _gait_band_line() -> str:
+def _gait_band_line(stack: str = "legacy_dcm") -> str:
     """Safe gait band from the coarse sweep. apply_updates clips to this."""
-    from loka.control.gait import GAIT_KNOBS, gait_schedule_for_speed
+    from loka.control.gait import gait_knobs, gait_schedule_for_speed
 
     sched = gait_schedule_for_speed(0.25)
     bits = []
-    for knob in GAIT_KNOBS:
+    for knob in gait_knobs(stack):
         if knob.name == "gait.mode":
             continue
         default = sched.get(knob.name)
@@ -263,6 +282,50 @@ def _gait_band_line() -> str:
     )
 
 
+def _progress_lines(latest: dict, qpos: np.ndarray, qvel: np.ndarray) -> list[str]:
+    """Heading-frame speed, and closing speed when a world goal is active.
+
+    ``planar speed`` has no sign. A walk that has already left the origin can
+    still be going backwards; closing speed is the component toward the goal.
+    """
+    from loka.control.gait import heading_frame
+
+    walking = bool(latest.get("walking", False))
+    goal_on = bool(latest.get("goal_active", False))
+    if not walking and not goal_on:
+        return []
+    heading = float(latest.get("heading_goal", latest.get("cmd_heading", 0.0)) or 0.0)
+    forward, _ = heading_frame(heading)
+    along = float(np.asarray(qvel[:2], dtype=float) @ forward)
+    lines = [
+        f"  along heading [m/s]: {along:+.3f}"
+        "  (positive = commanded walk direction; negative = walking backwards)",
+    ]
+    if not goal_on:
+        return lines
+    goal = np.array(
+        [float(latest.get("goal_x", 0.0)), float(latest.get("goal_y", 0.0))],
+        dtype=float,
+    )
+    delta = goal - np.asarray(qpos[:2], dtype=float)
+    dist = float(np.linalg.norm(delta))
+    closing = float(np.asarray(qvel[:2], dtype=float) @ delta / dist) if dist > 1e-4 else 0.0
+    if closing < -0.02:
+        tag = "MOVING AWAY FROM GOAL"
+    elif along < -0.02:
+        tag = "WALKING BACKWARDS"
+    else:
+        tag = "toward goal"
+    lines.append(
+        f"  goal xy [m]: {goal[0]:+.3f} {goal[1]:+.3f}  distance {dist:.3f} m"
+    )
+    lines.append(
+        f"  closing speed [m/s]: {closing:+.3f}"
+        f"  (positive = toward the goal)  {tag}"
+    )
+    return lines
+
+
 def format_full_state_section(frames: Sequence[dict]) -> str:
     """Attitude, position, and velocity at the trigger, plus the gait command."""
     if not frames:
@@ -281,10 +344,12 @@ def format_full_state_section(frames: Sequence[dict]) -> str:
         f"  quat wxyz: {quat[0]:+.3f} {quat[1]:+.3f} {quat[2]:+.3f} {quat[3]:+.3f}",
         f"  linear vel xyz [m/s]: {qvel[0]:+.3f} {qvel[1]:+.3f} {qvel[2]:+.3f}",
         f"  angular vel xyz [rad/s]: {qvel[3]:+.3f} {qvel[4]:+.3f} {qvel[5]:+.3f}",
-        f"  planar speed: {float(latest.get('planar_speed', np.linalg.norm(qvel[:2]))):.3f} m/s",
+        f"  planar speed: {float(latest.get('planar_speed', np.linalg.norm(qvel[:2]))):.3f} m/s"
+        "  (unsigned; use along heading and closing speed for direction)",
+        *_progress_lines(latest, qpos, qvel),
         f"  gait cmd: mode={latest.get('cmd_mode')} speed={latest.get('cmd_speed')} "
         f"heading={latest.get('cmd_heading')} walking={latest.get('walking')}",
-        _gait_band_line(),
+        _gait_band_line(str(latest.get("stack", "legacy_dcm"))),
         f"  yaw_ref={latest.get('yaw_ref')} heading_goal={latest.get('heading_goal')} "
         f"heading_err_raw={latest.get('heading_error_raw')} "
         f"heading_err_gated={latest.get('heading_error')} "

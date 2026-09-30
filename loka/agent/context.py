@@ -31,9 +31,15 @@ def default_stand_objective() -> str:
 
 
 def build_stand_capabilities(controller: LocomotionController) -> dict:
+    from loka.control.stacks import SPECS
+
     limits = controller.lean_limits()
+    stack = getattr(controller.config, "stack", "legacy_dcm")
+    spec = SPECS.get(stack, SPECS["legacy_dcm"])
     return {
-        "cost_weights": sorted(LLM_STAND_CONTROLLER_ALLOWLIST),
+        "cost_weights": sorted(spec.llm_allowlist),
+        "plant": spec.description,
+        "stack": stack,
         "task_parameters": sorted(TASK_PARAMETER_NAMES),
         "task_limits": limits,
         "max_lean_xy": MAX_LEAN_XY,
@@ -63,11 +69,16 @@ def format_stand_capabilities_block(capabilities: dict) -> str:
         "",
         "### Gait Task_Targets (stand ↔ walk)",
         "gait.mode: stand|walk|tread|limp  (or 0..3)",
-        *_gait_knob_lines(),
+        *_gait_knob_lines(capabilities.get("stack", "legacy_dcm")),
         "gait.heading is a goal. The feet turn at gait.turn_rate, and a large",
         "heading error cuts speed to a crawl. yaw is a standing offset from the",
         "feet, ignored while walking. lean_x/lean_y are in the stance frame.",
         "Setting gait.mode=walk with omitted speed and heading defaults to ~0.25 m/s.",
+        "To reach a world point, set gait.goal_x and gait.goal_y (and gait.speed as",
+        "the cruise). The plant re-aims the heading every tick, slows near the goal,",
+        "stops inside gait.goal_tolerance, and walks back if pushed off. Do not",
+        "re-steer with gait.heading: writing it alone cancels the goal. Arm near_xy",
+        "on the same point with radius >= goal_tolerance + 0.1 to wake on arrival.",
         "Foothold XY and contact schedules are classical (not LLM-settable).",
         "While walking: contact slip, force mismatch, and CoM residuals during",
         "swing are expected. Do NOT lower friction_mu or kp_base_position for",
@@ -93,11 +104,11 @@ def format_stand_capabilities_block(capabilities: dict) -> str:
 LEAN_FRACTION_TEXT = "55%"
 
 
-def _gait_knob_lines() -> list[str]:
-    from loka.control.gait import GAIT_KNOBS
+def _gait_knob_lines(stack: str = "legacy_dcm") -> list[str]:
+    from loka.control.gait import gait_knobs
 
     lines = []
-    for knob in GAIT_KNOBS:
+    for knob in gait_knobs(stack):
         if knob.field == "mode":
             continue
         lines.append(
@@ -118,9 +129,14 @@ def format_stand_configuration(controller: LocomotionController) -> str:
         else:
             lines.append(f"  {key}: {value:.4g}")
     lines.append("Controller_Targets (allowlisted):")
-    for path in sorted(LLM_STAND_CONTROLLER_ALLOWLIST):
-        if path in weights:
-            lines.append(f"  {path}: {weights[path]:.4g}")
+    allow = sorted(weights)
+    from loka.control.stacks import SPECS
+
+    stack = getattr(controller.config, "stack", "legacy_dcm")
+    if stack in SPECS:
+        allow = [p for p in sorted(SPECS[stack].llm_allowlist) if p in weights]
+    for path in allow:
+        lines.append(f"  {path}: {weights[path]:.4g}")
     return "\n".join(lines)
 
 

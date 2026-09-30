@@ -252,10 +252,14 @@ class OperatorSession(ConversationMixin):
         belief = format_current_model_belief(loka_state)
         return (
             f"--- PERIODIC CHECK (t={sim_time:.2f}s, every {period_s:.0f}s) ---\n"
-            "No listener invoked you in this interval. Recheck the locked "
-            "directives against the telemetry. Correct gait, task targets, "
-            "Error_Tracking, or model belief if the robot has drifted off the "
-            "plan. Leave listeners armed if they are still the right wake-up.\n\n"
+            "No listener invoked you in this interval. Before changing costs "
+            "or friction, read closing speed and along heading in the full-state "
+            "snapshot. Positive closing speed is motion toward the goal. "
+            "Negative means the robot is walking away; planar speed has no sign. "
+            "A position closer than the start is not progress while closing "
+            "speed is negative. If it is walking away, re-aim gait.heading or "
+            "stop and stand, then walk again. Leave listeners armed if they "
+            "are still the right wake-up.\n\n"
             + _format_context_sections(
                 mpc_config,
                 belief,

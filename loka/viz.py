@@ -114,7 +114,9 @@ def render_gait_overlays(viewer, controller) -> None:
       orange -- DCM reference           yellow  -- the swing arc, sampled
       cyan   -- the planned foothold
     """
-    gait_out = getattr(controller, "_last_gait", None)
+    gait_out = getattr(controller, "last_gait", None)
+    if gait_out is None:
+        gait_out = getattr(controller, "_last_gait", None)
     if gait_out is None or not controller.gait.wants_walk():
         return
 

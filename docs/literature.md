@@ -26,6 +26,15 @@ a foothold and never waits inside the control thread.
 | A. Herzog, N. Rotella, S. Mason, F. Grimminger, S. Schaal, L. Righetti, *Momentum control with hierarchical inverse dynamics on a torque-controlled humanoid*, Autonomous Robots, 2016 | Contact, posture, and swing as costs on a torque-controlled humanoid at the WBC rate. Ours is one weighted QP, not their strict hierarchy. |
 | `loka/control/wbc.py` (local choice, not a paper) | Contact is a cost, not a hard constraint. A hard "hold this point" row goes infeasible when a heel lands with leftover velocity. \(f = 0\) and a free-falling \(\ddot q\) remain feasible, so a bad contact change degrades instead of returning a garbage iterate. |
 
+## ALIP stepping
+
+| Paper | In the code |
+|---|---|
+| X. Xiong, A. D. Ames, *3-D Underactuated Bipedal Walking via H-LIP Based Gait Synthesis and Stepping Stabilization*, IEEE T-RO 2022, [arXiv:2101.09588](https://arxiv.org/abs/2101.09588) | `loka/control/alip.py` and `AlipStepFootholdPolicy` on `alip_footstep`. The state is \((x, L)\) about the stance contact, not CoM velocity. The G1 plant keeps the DCM chain and the convex MPC; the stepping law corrects the next foothold from the pre-impact error. |
+| Y. Gong, J. Grizzle, *Zero Dynamics, Pendulum Models, and Angular Momentum in Bipedal Walking*, JDSMC 2022, [arXiv:2105.08170](https://arxiv.org/abs/2105.08170) | Why \(L\) about the contact is the right second state when the swing leg carries angular momentum. Not a separate controller. |
+
+`legacy_dcm` does not call `alip.py`. Both stacks use the same convex MPC and whole-body QP.
+
 ## Gait
 
 | Paper | In the code |

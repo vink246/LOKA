@@ -8,6 +8,7 @@
 # LocomotionController.update_weights() and set_task_targets().
 
 model_path: models/g1/scene.xml
+stack: legacy_dcm        # legacy_dcm | alip_footstep
 control_dt: 0.002        # whole-body QP period  -> 500 Hz
 mpc_decimation: 10       # MPC every 10 QP ticks ->  50 Hz
 ground_height: 0.0       # starting guess; refined from the soles once loaded

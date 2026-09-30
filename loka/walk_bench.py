@@ -41,11 +41,24 @@ class Scenario:
     speed_goal: float | None = None
     #: If set, the robot must be standing (gait idle, all sites planted) by then.
     stand_by: float | None = None
+    #: Sim time by which pelvis velocity along the heading must be positive.
+    forward_by: float | None = None
+    #: Max |lateral| drift from the start, in the initial heading frame [m].
+    lateral_limit: float | None = None
+    #: World (x, y) of a ``gait.goal_*`` walk-to point. Pass needs the pelvis
+    #: inside ``goal_radius`` by ``goal_by`` and still there, standing, at the end.
+    goal_xy: tuple[float, float] | None = None
+    goal_by: float | None = None
+    goal_radius: float = 0.25
     group: str = "turn"
 
 
 def _walk(speed: float, **extra) -> dict:
     return {"gait.mode": "walk", "gait.speed": speed, **extra}
+
+
+def _goal(x: float, y: float, cruise: float) -> dict:
+    return {"gait.speed": cruise, "gait.goal_x": x, "gait.goal_y": y}
 
 
 def scenarios() -> list[Scenario]:
@@ -117,6 +130,43 @@ def scenarios() -> list[Scenario]:
             heading_goal=1.0, heading_at=4.0, speed_goal=0.40, group="gait",
         ),
         Scenario("S0", 30.0, [(0.5, _walk(0.20))], speed_goal=0.20, group="regression"),
+        Scenario(
+            "B1", 16.0,
+            [(0.5, {"gait.mode": "tread", "gait.speed": 0.0}), (8.0, _walk(0.20))],
+            speed_goal=0.20, forward_by=11.0, group="alip",
+        ),
+        Scenario(
+            "B2", 12.0,
+            [(0.5, _walk(0.20))],
+            pushes=[Push(8.0, np.array([-1.0, 0.0, 0.0]), time=3.0)],
+            speed_goal=0.20, forward_by=7.0, group="alip",
+        ),
+        Scenario(
+            "N1", 22.0,
+            [(0.5, _walk(0.20, **{"gait.heading": np.pi}))],
+            heading_goal=np.pi, heading_at=0.5, speed_goal=0.20, group="alip",
+        ),
+        Scenario(
+            "S1", 30.0, [(0.5, _walk(0.20))],
+            speed_goal=0.20, lateral_limit=0.15, group="alip",
+        ),
+        Scenario(
+            "W1", 25.0, [(0.5, _goal(2.0, 1.0, 0.20))],
+            goal_xy=(2.0, 1.0), goal_by=20.0, group="goal",
+        ),
+        Scenario(
+            "W2", 28.0, [(0.5, _goal(-1.5, 0.5, 0.20))],
+            goal_xy=(-1.5, 0.5), goal_by=23.0, group="goal",
+        ),
+        Scenario(
+            "W3", 50.0, [(0.5, _goal(5.0, 5.0, 0.25))],
+            goal_xy=(5.0, 5.0), goal_by=45.0, group="goal",
+        ),
+        Scenario(
+            "W4", 28.0, [(0.5, _goal(3.0, 0.0, 0.20))],
+            pushes=[Push(8.0, np.array([0.0, 1.0, 0.0]), time=6.0)],
+            goal_xy=(3.0, 0.0), goal_by=23.0, group="goal",
+        ),
     ]
     out.extend(_push_matrix())
     return out
@@ -168,6 +218,12 @@ class BenchResult:
     stood: bool | None
     passed: bool
     reasons: list[str]
+    forward_ok: bool | None = None
+    lateral_drift: float | None = None
+    turn_cap: float = TURN_CAP_STAND
+    goal_err: float | None = None
+    goal_time: float | None = None
+    goal_holding: bool | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -184,6 +240,8 @@ class BenchResult:
             "stood": self.stood,
             "passed": self.passed,
             "reasons": self.reasons,
+            "goal_err": self.goal_err,
+            "goal_time": self.goal_time,
         }
 
 
@@ -199,8 +257,13 @@ def _forward_speed(sim: Simulation) -> float:
     return float(vel @ forward)
 
 
-def run_scenario(scenario: Scenario) -> BenchResult:
-    sim = Simulation(pushes=list(scenario.pushes))
+def run_scenario(scenario: Scenario, config=None) -> BenchResult:
+    import copy
+
+    config = copy.deepcopy(config) if config is not None else None
+    sim = Simulation(config, pushes=list(scenario.pushes))
+    policy_cap = getattr(sim.controller.gait.policy, "turn_cap", None)
+    turn_cap = TURN_CAP_STAND if policy_cap is None else float(policy_cap)
     pending = list(scenario.script)
     yaw_err_time = None
     speed_samples: list[float] = []
@@ -208,6 +271,12 @@ def run_scenario(scenario: Scenario) -> BenchResult:
     knee_min = np.inf
     stood = None
     fall_time = None
+    forward_ok = None if scenario.forward_by is None else False
+    origin = np.asarray(sim.data.qpos[:2], dtype=float).copy()
+    _, left0 = heading_frame(_pelvis_yaw(sim))
+    lateral_drift = 0.0
+    goal = None if scenario.goal_xy is None else np.asarray(scenario.goal_xy, dtype=float)
+    goal_time = None
     per_leg = 6
 
     while sim.data.time < scenario.duration and not sim.fell:
@@ -232,6 +301,15 @@ def run_scenario(scenario: Scenario) -> BenchResult:
             mask = sim.controller.telemetry.contact_mask
             stood = (not gait.walking) and bool(np.all(mask))
 
+        if scenario.forward_by is not None and now <= scenario.forward_by:
+            if _forward_speed(sim) > 0.0:
+                forward_ok = True
+        if scenario.lateral_limit is not None:
+            delta = np.asarray(sim.data.qpos[:2], dtype=float) - origin
+            lateral_drift = max(lateral_drift, abs(float(delta @ left0)))
+        if goal is not None and goal_time is None:
+            if float(np.linalg.norm(sim.data.qpos[:2] - goal)) <= scenario.goal_radius:
+                goal_time = now
         if now > scenario.duration - 3.0:
             speed_samples.append(_forward_speed(sim))
 
@@ -256,6 +334,14 @@ def run_scenario(scenario: Scenario) -> BenchResult:
         stood=stood,
         passed=False,
         reasons=[],
+        forward_ok=forward_ok,
+        lateral_drift=lateral_drift if scenario.lateral_limit is not None else None,
+        turn_cap=turn_cap,
+        goal_err=(
+            None if goal is None else float(np.linalg.norm(sim.data.qpos[:2] - goal))
+        ),
+        goal_time=goal_time,
+        goal_holding=None if goal is None else not sim.controller.gait.walking,
     )
     result.passed, result.reasons = evaluate(scenario, result)
     return result
@@ -273,7 +359,7 @@ def evaluate(scenario: Scenario, result: BenchResult) -> tuple[bool, list[str]]:
             delta = abs(scenario.heading_delta)
         # The per-step cap can bind below turn_rate. Size the deadline to
         # whichever is slower, using a 0.35 s step as the crawl.
-        rate = min(TURN_RATE, TURN_CAP_STAND / 0.35)
+        rate = min(TURN_RATE, result.turn_cap / 0.35)
         budget = delta / rate + 2.0
         # The clock starts at the command, not at t = 0.
         deadline = scenario.heading_at + budget
@@ -290,6 +376,21 @@ def evaluate(scenario: Scenario, result: BenchResult) -> tuple[bool, list[str]]:
             )
     if scenario.stand_by is not None and result.stood is not True:
         reasons.append("did not stand by the deadline")
+    if scenario.forward_by is not None and result.forward_ok is not True:
+        reasons.append(f"forward speed was not positive by t={scenario.forward_by}")
+    if scenario.lateral_limit is not None:
+        drift = result.lateral_drift if result.lateral_drift is not None else float("inf")
+        if drift > scenario.lateral_limit:
+            reasons.append(f"lateral drift {drift:.3f} > {scenario.lateral_limit}")
+    if scenario.goal_xy is not None:
+        if result.goal_time is None or (
+            scenario.goal_by is not None and result.goal_time > scenario.goal_by
+        ):
+            reasons.append(f"goal radius reached at {result.goal_time}, deadline {scenario.goal_by}")
+        if result.goal_err is None or result.goal_err > scenario.goal_radius:
+            reasons.append(f"final goal error {result.goal_err} > {scenario.goal_radius}")
+        if result.goal_holding is not True:
+            reasons.append("still walking at the end")
     return (not reasons), reasons
 
 
@@ -302,19 +403,34 @@ def select(names: list[str] | None) -> list[Scenario]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from loka.control.locomotion import LocomotionConfig
+    from loka.control.stacks import STACK_NAMES, add_stack_argument, apply_stack_arg
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", action="append", default=None,
-                        help="Scenario name or group (turn, gait, push, regression)")
+                        help="Scenario name or group (turn, gait, push, regression, alip)")
     parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None)
+    add_stack_argument(parser, allow_all=True)
     args = parser.parse_args(argv)
     chosen = select(args.only)
+    stacks = list(STACK_NAMES) if args.stack == "all" else [args.stack]
     results = []
-    for scenario in chosen:
-        result = run_scenario(scenario)
-        results.append(result.to_dict())
-        flag = "PASS" if result.passed else "FAIL"
-        why = "; ".join(result.reasons) if result.reasons else "ok"
-        print(f"{flag} {scenario.name:22s} {why}")
+    for stack_name in stacks:
+        base = (
+            LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
+        )
+        probe = argparse.Namespace(stack=stack_name)
+        apply_stack_arg(base, probe)
+        label = stack_name or base.stack
+        for scenario in chosen:
+            result = run_scenario(scenario, base)
+            row = result.to_dict()
+            row["stack"] = label
+            results.append(row)
+            flag = "PASS" if result.passed else "FAIL"
+            why = "; ".join(result.reasons) if result.reasons else "ok"
+            print(f"{flag} {label:14s} {scenario.name:22s} {why}")
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(results, indent=2), encoding="utf-8")

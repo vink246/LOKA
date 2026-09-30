@@ -14,6 +14,15 @@ from loka.walk_bench import scenarios, run_scenario
 # Closed-loop results on the yaw-aware plant. Anything not listed here is an
 # open failure (strict xfail) so a surprise pass is visible.
 PASSING = ("T1", "T2", "T3", "T5", "G1", "G2", "G3", "G4", "G5b", "S0", "P2")
+# Other stacks have not cleared Gate 3. Keep them out of the strict-xfail list
+# (group "alip") and do not pretend they pass the legacy set.
+PASSING_BY_STACK = {
+    "legacy_dcm": PASSING,
+    "alip_footstep": (
+        "T1", "T2", "T5", "G1", "G3", "S0", "B2", "N1", "S1", "P2",
+        "P1_fwd_mid_8", "P1_back_mid_8", "P1_left_mid_8", "P1_right_mid_8",
+    ),
+}
 FAST = ("T1", "T5", "T7", "G2", "G3")
 
 
@@ -45,7 +54,7 @@ def test_slow_transition_passing(name):
 
 _OPEN = [
     row.name for row in scenarios()
-    if row.name not in PASSING and not row.name.startswith("P1_")
+    if row.name not in PASSING and not row.name.startswith("P1_") and row.group != "alip"
 ]
 
 

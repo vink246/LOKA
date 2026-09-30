@@ -215,6 +215,50 @@ class G1Model:
         jacp_next, jacr_next = self.site_spatial_jacobian(site_id, s)
         return (jacp_next - jacp) @ qvel / eps, (jacr_next - jacr) @ qvel / eps
 
+    def angular_momentum_about(self, point: np.ndarray) -> np.ndarray:
+        """Angular momentum of the whole robot about ``point``, world frame.
+
+        ``subtree_angmom[0]`` is about the CoM. Shifting the reference point by
+        ``c - p`` adds ``m (c - p) × v``, which is the ALIP contact-point
+        momentum when ``point`` is the stance foot and ``v_z`` is small.
+        """
+        mujoco.mj_subtreeVel(self.model, self.data)
+        c = np.asarray(self.data.subtree_com[0], dtype=float)
+        v = np.asarray(self.data.subtree_linvel[0], dtype=float)
+        p = np.asarray(point, dtype=float).reshape(3)
+        return np.asarray(self.data.subtree_angmom[0], dtype=float) + (
+            self.total_mass * np.cross(c - p, v)
+        )
+
+    def centroidal_angular_momentum(self) -> np.ndarray:
+        """Angular momentum about the CoM, world frame."""
+        mujoco.mj_subtreeVel(self.model, self.data)
+        return np.asarray(self.data.subtree_angmom[0], dtype=float).copy()
+
+    def centroidal_momentum_matrix(self) -> np.ndarray:
+        """``A_G`` such that ``A_G qvel`` is centroidal momentum ``[p; k]``.
+
+        Linear part is ``m J_com``. Angular part is each body's locked inertia
+        plus the orbital term about the composite CoM (Wensing & Orin 2013).
+        """
+        m, d = self.model, self.data
+        nv = self.nv
+        ag = np.zeros((6, nv))
+        com = np.asarray(d.subtree_com[0], dtype=float)
+        jacp = np.zeros((3, nv))
+        jacr = np.zeros((3, nv))
+        for i in range(1, m.nbody):
+            mass = float(m.body_mass[i])
+            if mass <= 0.0:
+                continue
+            mujoco.mj_jacBodyCom(m, d, jacp, jacr, i)
+            ag[:3] += mass * jacp
+            r = np.asarray(d.xipos[i], dtype=float) - com
+            rot = np.asarray(d.ximat[i], dtype=float).reshape(3, 3)
+            inertia = rot @ np.diag(m.body_inertia[i]) @ rot.T
+            ag[3:] += inertia @ jacr + mass * _skew(r) @ jacp
+        return ag
+
     def com_inertia(self) -> np.ndarray:
         """Composite rigid-body rotational inertia about the CoM, world frame.
 
@@ -299,6 +343,11 @@ class G1Model:
         height = float(self.data.subtree_com[0][2] - contacts[:, 2].mean())
         omega = np.sqrt(GRAVITY / height)
         return self.support_margin() * omega
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    x, y, z = (float(v[0]), float(v[1]), float(v[2]))
+    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
 
 
 def quat_to_rpy(quat: Sequence[float]) -> np.ndarray:

@@ -147,6 +147,8 @@ class LocomotionConfig:
     mpc: MPCConfig = field(default_factory=MPCConfig)
     wbc: WBCConfig = field(default_factory=WBCConfig)
     gait: GaitConfig = field(default_factory=GaitConfig)
+    #: Which locomotion stack ``Simulation`` builds. See ``loka.control.stacks``.
+    stack: str = "legacy_dcm"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "LocomotionConfig":
@@ -160,6 +162,8 @@ class LocomotionConfig:
 
             gait_raw["mode"] = parse_gait_mode(gait_raw["mode"])
         gait = GaitConfig(**gait_raw) if gait_raw else GaitConfig()
+        raw.pop("alip", None)
+        raw.pop("wbqp", None)
         if raw.get("model_path"):
             raw["model_path"] = str((REPO_ROOT / raw["model_path"]).resolve())
         return cls(mpc=mpc, wbc=wbc, gait=gait, **raw)
@@ -233,7 +237,7 @@ class LocomotionTelemetry:
     contact_forces: np.ndarray
     desired_forces: np.ndarray
     contact_mask: np.ndarray
-    mpc_cost: float
+    mpc_cost: float | None
     solve_ms: float
     walking: bool = False
     gait_phase: float = 0.0
@@ -249,8 +253,14 @@ class LocomotionTelemetry:
 
 
 class LocomotionController:
-    def __init__(self, config: LocomotionConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: LocomotionConfig | None = None,
+        *,
+        foothold_policy=None,
+    ) -> None:
         self.config = config or LocomotionConfig()
+        self._foothold_policy = foothold_policy
         self.robot = G1Model(self.config.model_path)
         self.command = LocomotionCommand()
 
@@ -376,7 +386,11 @@ class LocomotionController:
         self._desired_forces = self.mpc.last_forces.copy()
         self._ground_height = float(self.config.ground_height)
         self.telemetry: LocomotionTelemetry | None = None
-        self.gait = GaitScheduler(self.config.gait)
+        self.gait = GaitScheduler(
+            self.config.gait,
+            policy=self._foothold_policy,
+            stack_name=getattr(self.config, "stack", "legacy_dcm"),
+        )
         self._last_gait = None
         self._last_joint_weights = np.zeros(self.robot.nu)
         self._last_swing_orient_active = False
@@ -481,6 +495,8 @@ class LocomotionController:
             self._height_ref = height_cmd
         height = float(self._height_ref)
 
+        stance_i = int(np.argmin(feet[:, 2]))
+        self.gait.mass = float(robot.total_mass)
         gait_out = self.gait.step(
             dt=cfg.control_dt,
             com=dynamics.com,
@@ -490,6 +506,7 @@ class LocomotionController:
             height=height,
             measured_mask=measured_mask,
             foot_yaws=robot.foot_yaws(),
+            L_meas=robot.angular_momentum_about(feet[stance_i]),
         )
         self._last_gait = gait_out
         walking = gait_out.walking
@@ -916,6 +933,7 @@ class LocomotionController:
                 and self.gait.config.speed <= 1e-6
                 and "gait.speed" not in gait_updates
                 and "gait.heading" not in gait_updates
+                and float(self.gait.config.goal_active) < 0.5
             ):
                 self.gait.config.speed = 0.25
                 applied["gait.speed"] = 0.25
@@ -923,9 +941,30 @@ class LocomotionController:
             self.config.gait = self.gait.config
         return applied
 
+    def qp_failures(self) -> dict[str, int]:
+        """Solver fallback counts. Missing layers are omitted, not zero."""
+        out: dict[str, int] = {}
+        wbc = getattr(self, "wbc", None)
+        mpc = getattr(self, "mpc", None)
+        if wbc is not None:
+            out["wbc"] = int(wbc._qp.failures)
+        if mpc is not None:
+            out["mpc"] = int(mpc._qp.failures)
+        return out
+
+    @property
+    def last_gait(self):
+        return self._last_gait
+
     def tunables(self) -> dict[str, float]:
-        """Current value of every runtime-mutable parameter, by dotted path."""
-        return tuning.snapshot(self.config)
+        """Current value of every knob this stack accepts, by dotted path."""
+        stack = getattr(self.config, "stack", "legacy_dcm")
+        allowed = tuning.paths_for_stack(stack)
+        return {
+            path: value
+            for path, value in tuning.snapshot(self.config).items()
+            if path in allowed
+        }
 
     def update_weights(self, **overrides: float) -> dict[str, float]:
         """Patch weights and gains in place; return the clamped values applied.
@@ -936,6 +975,10 @@ class LocomotionController:
         :mod:`loka.control.tuning`, which disambiguate the several fields that
         exist on both layers with very different magnitudes.
         """
+        stack = getattr(self.config, "stack", "legacy_dcm")
+        disallowed = sorted(set(overrides) - tuning.paths_for_stack(stack))
+        if disallowed:
+            raise KeyError(f"Not tunable on stack {stack}: {disallowed}")
         applied = tuning.apply(self.config, overrides)
         groups = {tuning.BY_PATH[path].group for path in applied}
         if "mpc" in groups:

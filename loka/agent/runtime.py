@@ -27,6 +27,7 @@ from loka.agent.context import (
 )
 from loka.agent.anomaly import assess_stand_anomaly
 from loka.agent.error_defaults import (
+    adapt_error_spec_for_walk,
     default_stand_error_spec,
     default_walk_error_spec,
 )
@@ -177,8 +178,9 @@ class LokaRuntime:
 
         cmd = self.controller.task_snapshot()
         walking = self.controller.gait.wants_walk()
-        wbc_total = int(self.controller.wbc._qp.failures)
-        mpc_total = int(self.controller.mpc._qp.failures)
+        fails = self.controller.qp_failures()
+        wbc_total = int(fails.get("wbc", 0))
+        mpc_total = int(fails.get("mpc", 0))
         wbc_delta = max(0, wbc_total - self._prev_wbc_failures)
         mpc_delta = max(0, mpc_total - self._prev_mpc_failures)
         self._prev_wbc_failures = wbc_total
@@ -201,7 +203,10 @@ class LokaRuntime:
             "desired_forces": (
                 tel.desired_forces.copy() if tel is not None else np.zeros((8, 3))
             ),
-            "mpc_cost": float(tel.mpc_cost) if tel is not None else 0.0,
+            "mpc_cost": (
+                None if tel is None or tel.mpc_cost is None else float(tel.mpc_cost)
+            ),
+            "stack": getattr(self.controller.config, "stack", "legacy_dcm"),
             "support_margin": robot.support_margin(),
             "contact_speed_max": contact_speed,
             # Per-tick deltas for anomaly; totals for compressor display.
@@ -223,6 +228,9 @@ class LokaRuntime:
             "cmd_speed": cmd.get("gait.speed"),
             "cmd_heading": cmd.get("gait.heading"),
             "planar_speed": float(np.linalg.norm(qvel[:2])),
+            "goal_active": float(self.controller.gait.config.goal_active) >= 0.5,
+            "goal_x": float(self.controller.gait.config.goal_x),
+            "goal_y": float(self.controller.gait.config.goal_y),
         }
 
     def _gated_heading_error(self, tel) -> float:
@@ -264,6 +272,10 @@ class LokaRuntime:
                 self._suppress_early_until,
                 now + (6.0 if walking else TASK_SETTLE_SUPPRESS_S),
             )
+            # A spec written while standing must not keep scoring world x/y
+            # against the origin once the robot is walking.
+            if walking:
+                self._adopt_walk_tracking(now)
             return
         height = float(self.controller.command.height or self.controller.nominal_height)
         if walking:
@@ -285,6 +297,25 @@ class LokaRuntime:
         print(
             f"[LOKA] Error_Tracking → "
             f"{'walk' if walking else 'stand'} defaults at t={now:.2f}s"
+        )
+
+    def _adopt_walk_tracking(self, now: float) -> None:
+        """Replace origin drift in an orchestrator-owned spec with walk terms."""
+        old = self.loka_state.get("error_spec")
+        if old is None:
+            return
+        new = adapt_error_spec_for_walk(old)
+        if new.to_dict() == old.to_dict():
+            return
+        self.loka_state["error_spec"] = new
+        self._rebuild_prompt()
+        self._invalidate_mission_baseline(
+            now,
+            reason="walk drops world-origin drift",
+            close_failure_episode=True,
+        )
+        print(
+            f"[LOKA] Error_Tracking dropped world-origin drift at t={now:.2f}s"
         )
 
     def _push_baseline(self, frame: dict) -> None:
@@ -922,8 +953,14 @@ class LokaRuntime:
         telemetry = self._telemetry_for(
             frame,
             directive=(
-                "Periodic check. Recorrect if the locked directives are not "
-                "being met. Listeners did not fire this interval.\n"
+                "Periodic check. Before any cost or friction change, read closing "
+                "speed and along heading in the full-state snapshot. Positive "
+                "closing speed is motion toward the goal. Negative means the "
+                "robot is walking away; planar speed does not show the sign. "
+                "A position closer than the start is not progress while closing "
+                "speed is negative. If it is walking away, re-aim gait.heading "
+                "or stop and stand, then walk again. Listeners did not fire "
+                "this interval.\n"
             ),
         )
         cfg_text = format_stand_configuration(self.controller)

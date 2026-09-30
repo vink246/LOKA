@@ -6,12 +6,22 @@ from typing import Any
 
 import mujoco
 
+from loka.control.gait import MODE_LIMP, MODE_WALK
 from loka.control.locomotion import LocomotionController
 from loka.agent.directives import LISTENER_KINDS, parse_listeners
+from loka.agent.error_defaults import adapt_error_spec_for_walk
 from loka.agent.error_spec import format_error_spec, parse_error_tracking
 from loka.agent.model_state import resolve_mjcf_name
 from loka.agent.context import format_stand_configuration
 from loka.agent.policy import filter_controller_targets
+
+
+def _mission_is_locomotion(controller: LocomotionController) -> bool:
+    """True while a walk or an active go-to should not be scored from the origin."""
+    cfg = controller.gait.config
+    mode = float(cfg.mode)
+    goal = float(cfg.goal_active) >= 0.5
+    return goal or mode in (MODE_WALK, MODE_LIMP)
 
 
 def apply_stand_scratchpad(
@@ -66,7 +76,8 @@ def apply_stand_scratchpad(
         except (TypeError, ValueError):
             print(f"     * [WARN] Non-numeric Controller_Targets '{name}' (ignored)")
     if weight_updates:
-        allowed, rejected = filter_controller_targets(weight_updates)
+        stack = getattr(getattr(controller, "config", None), "stack", None)
+        allowed, rejected = filter_controller_targets(weight_updates, stack=stack)
         summary["rejected_controller_targets"] = rejected
         if rejected:
             print("  -> Controller_Targets locked (ignored):")
@@ -116,6 +127,14 @@ def apply_stand_scratchpad(
             new_spec = parse_error_tracking(
                 error_tracking, belief_model.nq, belief_model.nv
             )
+            if _mission_is_locomotion(controller):
+                adapted = adapt_error_spec_for_walk(new_spec)
+                if adapted.to_dict() != new_spec.to_dict():
+                    print(
+                        "  -> world-origin drift dropped; "
+                        "walk tracks heading_error and cross_track"
+                    )
+                new_spec = adapted
             loka_state["error_spec"] = new_spec
             loka_state["error_spec_owner"] = "loka"
             summary["error_tracking"] = True

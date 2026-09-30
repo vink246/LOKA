@@ -97,6 +97,95 @@ def test_apply_locks_robot_tuned_mpc_weights():
     assert "wbc.kp_base_position" in summary["controller_targets"]
 
 
+def test_walk_scratchpad_drops_world_origin_drift():
+    """A go-to must not keep the standing 'stay at world y = 0' test."""
+    from loka.agent.error_spec import ErrorTerm, get_tracking_error
+
+    controller = LocomotionController()
+    loka_state = {
+        "mutations": [],
+        "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
+        "error_spec": default_stand_error_spec(),
+    }
+    stand = default_stand_error_spec()
+    # A term aimed at the goal y is a real criterion and stays.
+    stand.terms.append(
+        ErrorTerm(
+            name="goal_y",
+            signal="qpos",
+            index=1,
+            mode="abs_deviation",
+            target=4.0,
+            tolerance=0.25,
+            weight=1.0,
+        )
+    )
+    scratchpad = {
+        "Semantic_State": {"Hypothesis": "go to 4,4", "Analysis": "walk"},
+        "Task_Targets": {
+            "gait.mode": "walk",
+            "gait.speed": 0.2,
+            "gait.goal_x": 4.0,
+            "gait.goal_y": 4.0,
+        },
+        "Error_Tracking": stand.to_dict(),
+    }
+    apply_stand_scratchpad(controller, scratchpad, loka_state)
+    spec = loka_state["error_spec"]
+    names = [term.name for term in spec.terms]
+    assert "lateral_drift" not in names
+    assert "forward_drift" not in names
+    assert "heading_error" in names
+    assert "cross_track" in names
+    assert "pelvis_height" in names
+    assert "goal_y" in names
+    assert loka_state["error_spec_owner"] == "loka"
+    # At the goal, world y is 4 m. The standing lateral_drift term (target 0,
+    # tol 0.15) would already be past the 0.25 trigger. Heading and
+    # cross-track from the logged turn are inside the walk bands.
+
+    class _Data:
+        qpos = np.array([4.0, 4.0, 0.78])
+        qvel = np.zeros(6)
+
+    frame = {"heading_error": 0.0, "cross_track": 0.01}
+    assert get_tracking_error(_Data(), spec, frame) < spec.trigger_threshold
+
+
+def test_walk_transition_drops_origin_drift_owned_by_loka():
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
+    runtime.loka_state["error_spec_owner"] = "loka"
+    runtime.loka_state["error_spec"] = default_stand_error_spec()
+    runtime._was_walking = False
+    runtime._sync_gait_mission(1.0, True)
+    names = [term.name for term in runtime.loka_state["error_spec"].terms]
+    assert "lateral_drift" not in names
+    assert "forward_drift" not in names
+    assert "heading_error" in names
+    assert "cross_track" in names
+    assert "pelvis_height" in names
+    assert runtime.loka_state["error_spec_owner"] == "loka"
+
+
+def test_stand_scratchpad_keeps_origin_drift():
+    controller = LocomotionController()
+    loka_state = {
+        "mutations": [],
+        "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
+        "error_spec": default_stand_error_spec(),
+    }
+    scratchpad = {
+        "Semantic_State": {"Hypothesis": "stand", "Analysis": "hold"},
+        "Error_Tracking": default_stand_error_spec().to_dict(),
+    }
+    apply_stand_scratchpad(controller, scratchpad, loka_state)
+    names = [term.name for term in loka_state["error_spec"].terms]
+    assert "lateral_drift" in names
+    assert "forward_drift" in names
+    assert "heading_error" not in names
+
+
 def test_compressor_emits_balance_section():
     sim = Simulation()
     runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
@@ -605,3 +694,31 @@ def test_compressor_includes_full_state():
     assert "FULL STATE" in text
     assert "pelvis xyz" in text
     assert "linear vel" in text
+
+
+def test_full_state_flags_walking_away_from_the_goal():
+    """The t=62s go-to snapshot: world speed looks slow, but it points backward."""
+    from loka.agent.compress import format_full_state_section
+
+    frame = {
+        "time": 62.43,
+        "qpos": np.array([2.456, 2.523, 0.792, 1, 0, 0, 0]),
+        "qvel": np.array([-0.081, 0.015, 0.002, 0, 0, 0]),
+        "rpy": np.zeros(3),
+        "walking": True,
+        "goal_active": True,
+        "goal_x": 4.0,
+        "goal_y": 4.0,
+        "heading_goal": 0.759,
+        "cmd_mode": 1.0,
+        "cmd_speed": 0.14,
+        "cmd_heading": 0.759,
+        "heading_error_raw": 0.0,
+        "heading_error": 0.0,
+        "cross_track": 0.001,
+        "yaw_ref": 0.759,
+    }
+    text = format_full_state_section([frame])
+    assert "MOVING AWAY FROM GOAL" in text
+    assert "along heading" in text
+    assert "closing speed" in text

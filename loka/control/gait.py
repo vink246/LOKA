@@ -151,6 +151,19 @@ SLEW_SWING_HEIGHT = 0.01  # m
 TURN_CAP_STAND = 0.12  # rad / step at 0 m/s. 0.16 made turn-in-place fall; 0.08 was the previous cap.
 TURN_CAP_FAST = 0.12  # rad / step at 0.50 m/s and above
 DEFAULT_TURN_RATE = 0.40  # rad/s
+#: Commanded speed below which a heading change is a turn on the spot.
+#: The swing foot is the lateral offset rotated about the footprint centre
+#: (convex-mpc-biped pure yaw: no translation preview, no tangential lead).
+#: The centre is latched when the turn starts and is not rebuilt from the
+#: capture-corrected foot. Rebuilding it walked a 90° turn about 0.71 m.
+#: A walking turn stays on the forward chain; its crawl floor is 0.10 m/s.
+IN_PLACE_SPEED = 0.02  # m/s
+#: While the centre is latched, add this much of (centre − CoM) to the
+#: reference velocity, capped. The foot circle alone does not walk the body
+#: back; the 0.3 s force horizon can, at a crawl. 2/s and 0.10 m/s held a
+#: 90° turn near the start without touching a 0.20 m/s walk.
+IN_PLACE_RETURN_GAIN = 2.0  # 1/s
+IN_PLACE_RETURN_SPEED = 0.10  # m/s
 
 #: Heading error past which forward speed is cut, and the crawl it is cut to.
 HEADING_ERR_FREE = 0.35  # rad
@@ -192,8 +205,8 @@ SWING_TOUCHDOWN_Z = -0.001  # m, spline profile
 SWING_TIME_SCALE = 0.20  # s; shorter swings shrink height (spline profile)
 
 #: Step duration as a decision beside the foothold (Khadiv et al., TRO 2020).
-#: The 0.02 / 0.1 / 0.5 weight sweep walked S0 backwards and added falls
-#: (temp_docs sweep, 2026-09-28), so this stays off.
+#: A 0.02 / 0.1 / 0.5 weight sweep on 2026-09-28 walked S0 backwards and
+#: added falls, so this stays off.
 STEP_TIMING = False
 STEP_TIMING_WEIGHT = 0.1  # cost on (tau - tau_nom)^2 beside the foothold/offset costs
 STEP_DS_MIN = 0.05  # s; shortest double support left after an early lift-off
@@ -201,6 +214,19 @@ STEP_SWING_RATE_MAX = 1.25  # fastest swing clock; v1 only ever shortens a step
 
 #: Extra steps after a stop request before the feet-square test loosens.
 STOP_RELAX_STEPS = 4
+
+#: Plant-side go-to-point (``gait.goal_*``). The scheduler re-aims
+#: ``heading`` at the goal and sets ``speed`` every tick, so the orchestrator
+#: does not have to close the position loop at its own call rate.
+GOAL_SLOW_GAIN = 0.5  # 1/s; approach speed = gain × (distance − tolerance)
+GOAL_MIN_SPEED = 0.10  # m/s; slowest approach, the crawl both stacks hold
+GOAL_DEFAULT_SPEED = 0.20  # m/s cruise when a goal arrives with no gait.speed
+#: Inside this radius the bearing swings with every lateral sway, so the
+#: last heading is held instead of chasing it.
+GOAL_HEADING_FREEZE = 0.30  # m
+GOAL_HEADING_DEADBAND = 0.03  # rad; smaller bearing changes leave heading alone
+#: After arriving, walk back only once pushed this many tolerances away.
+GOAL_REENGAGE = 2.0
 
 
 class LegPhase(str, Enum):
@@ -234,6 +260,12 @@ class GaitConfig:
     #: How fast the plan may yaw toward ``heading`` [rad/s]. The heading
     #: itself is a goal; the feet turn by at most one step's worth per step.
     turn_rate: float = DEFAULT_TURN_RATE
+    #: World point the plant walks to while ``goal_active`` is 1. ``speed`` is
+    #: then the cruise speed and ``heading`` is written by the scheduler.
+    goal_x: float = 0.0
+    goal_y: float = 0.0
+    goal_active: float = 0.0
+    goal_tolerance: float = 0.15  # stop once the CoM is this close [m]
 
 
 @dataclass(frozen=True)
@@ -291,6 +323,19 @@ GAIT_KNOBS: tuple[GaitKnob, ...] = (
              "How fast the plan yaws toward gait.heading [rad/s]. Straight "
              "walk did not bind this; the per-step cap still applies",
              0.10, 0.80),
+    GaitKnob("gait.goal_x",
+             "World x of the walk-to point [m]. Setting goal_x or goal_y turns "
+             "goal_active on",
+             -20.0, 20.0),
+    GaitKnob("gait.goal_y", "World y of the walk-to point [m]", -20.0, 20.0),
+    GaitKnob("gait.goal_active",
+             "1 = the plant steers heading and speed to (goal_x, goal_y), with "
+             "gait.speed as cruise, and holds there. gait.heading alone or "
+             "stand cancels it",
+             0.0, 1.0),
+    GaitKnob("gait.goal_tolerance",
+             "Arrival radius around the goal [m]; the robot stops inside it",
+             0.05, 0.50),
 )
 
 #: Clamps applied when the LLM / operator sets gait.* Task_Targets.
@@ -299,6 +344,34 @@ GAIT_LIMITS: dict[str, tuple[float, float]] = {
 }
 
 GAIT_PARAMETER_NAMES = frozenset(GAIT_LIMITS.keys())
+
+
+def gait_knobs(stack: str = "legacy_dcm") -> tuple[GaitKnob, ...]:
+    """Knob catalogue for ``stack``. Ranges match ``GAIT_LIMITS``.
+
+    ALIP stacks keep the legacy numeric band. Only the wording of the knobs
+    the stepping law actually uses changes, so a slider and the prompt agree.
+    """
+    if not str(stack).startswith("alip"):
+        return GAIT_KNOBS
+    overrides = {
+        "gait.capture_gain": GaitKnob(
+            "gait.capture_gain",
+            "ALIP stepping-law blend. 0 holds the nominal step; 1 is deadbeat",
+            0.30, 1.00,
+        ),
+        "gait.foothold_retarget_s": GaitKnob(
+            "gait.foothold_retarget_s",
+            "Fraction of swing after which the ALIP foothold freezes",
+            0.20, 0.90,
+        ),
+        "gait.turn_rate": GaitKnob(
+            "gait.turn_rate",
+            "Yaw rate toward gait.heading [rad/s], clipped to 0.25 rad per step",
+            0.10, 0.80,
+        ),
+    }
+    return tuple(overrides.get(knob.name, knob) for knob in GAIT_KNOBS)
 
 #: Cadence / width knobs the speed schedule may fill when the LLM omitted them.
 _SCHEDULED_FIELDS = frozenset({"step_period", "duty_factor", "stance_width"})
@@ -524,12 +597,28 @@ class GaitOutput:
 class GaitScheduler:
     """Periodic bipedal gait: footstep plan, DCM reference and swing arcs."""
 
-    def __init__(self, config: GaitConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: GaitConfig | None = None,
+        policy=None,
+        *,
+        stack_name: str = "legacy_dcm",
+    ) -> None:
         self.config = config or GaitConfig()
+        self.stack_name = stack_name
+        if policy is None:
+            from loka.control.footholds import DcmFootholdPolicy
+
+            policy = DcmFootholdPolicy()
+        self.policy = policy
+        self.mass = 35.0
         #: ``step_period`` / ``duty_factor`` / ``stance_width`` the operator or
         #: LLM set explicitly. The speed schedule fills the rest.
         self._user_gait_fields: set[str] = set()
         self._use_speed_schedule = False
+        # Goal state survives reset(): arriving ends the walk, which resets.
+        self._goal_arrived = False
+        self._goal_cruise = GOAL_DEFAULT_SPEED
         self._step_qp = QP(
             "step_adjust",
             hessian_pattern=Sparsity.diagonal(5),
@@ -571,8 +660,10 @@ class GaitScheduler:
         self._cleared_once = False
         self._turning = False
         self._turn_settle_count = 0
+        self._turn_center = None
         self._ds_rate = 1.0
         self._swing_rate = 1.0
+        self._L_meas = np.zeros(3)
 
     def set_config(self, config: GaitConfig) -> None:
         self.config = config
@@ -643,9 +734,70 @@ class GaitScheduler:
                     self._stop_requested = True
                 else:
                     self.reset()
+        self._apply_goal_updates(applied)
         self._use_speed_schedule = float(self.config.mode) >= MODE_WALK
         applied.update(self.apply_speed_schedule())
         return applied
+
+    def _apply_goal_updates(self, applied: dict[str, float]) -> None:
+        """Arm, retarget or cancel the walk-to goal from one update batch."""
+        cfg = self.config
+        was_active = float(cfg.goal_active) >= 0.5
+        moved = "gait.goal_x" in applied or "gait.goal_y" in applied
+        if applied.get("gait.mode") == MODE_STAND:
+            cfg.goal_active = 0.0
+        elif "gait.goal_active" not in applied:
+            if moved:
+                cfg.goal_active = 1.0
+            elif "gait.heading" in applied:
+                cfg.goal_active = 0.0
+        active = float(cfg.goal_active) >= 0.5
+        if active != was_active or (active and "gait.goal_active" in applied):
+            applied["gait.goal_active"] = float(cfg.goal_active)
+        if not active:
+            self._goal_arrived = False
+            return
+        if moved or not was_active:
+            self._goal_arrived = False
+        if "gait.speed" in applied:
+            self._goal_cruise = float(applied["gait.speed"])
+        elif not was_active:
+            speed = float(cfg.speed)
+            self._goal_cruise = speed if speed > 1e-4 else GOAL_DEFAULT_SPEED
+        if float(cfg.mode) < MODE_WALK and "gait.mode" not in applied:
+            cfg.mode = MODE_WALK
+            applied["gait.mode"] = MODE_WALK
+
+    def _steer_to_goal(self, com_xy: np.ndarray) -> None:
+        """Write ``heading`` and ``speed`` toward the active goal."""
+        cfg = self.config
+        mode = float(cfg.mode)
+        if float(cfg.goal_active) < 0.5 or mode < MODE_WALK or mode == MODE_TREAD:
+            return
+        delta = np.array([float(cfg.goal_x), float(cfg.goal_y)]) - com_xy
+        dist = float(np.hypot(delta[0], delta[1]))
+        tol = float(cfg.goal_tolerance)
+        if self._goal_arrived:
+            if dist < GOAL_REENGAGE * tol:
+                cfg.speed = 0.0
+                return
+            self._goal_arrived = False
+        if dist <= tol:
+            self._goal_arrived = True
+            cfg.speed = 0.0
+            cfg.heading = self._stance_yaw()
+            return
+        if dist > max(GOAL_HEADING_FREEZE, 1.5 * tol):
+            bearing = float(np.arctan2(delta[1], delta[0]))
+            if abs(wrap_angle(bearing - float(cfg.heading))) > GOAL_HEADING_DEADBAND:
+                cfg.heading = bearing
+        cfg.speed = float(
+            min(max(GOAL_SLOW_GAIN * (dist - tol), GOAL_MIN_SPEED), self._goal_cruise)
+        )
+
+    @property
+    def goal_arrived(self) -> bool:
+        return bool(self._goal_arrived)
 
     def apply_speed_schedule(self) -> dict[str, float]:
         """Fill cadence/width from ``gait.speed`` unless the user pinned them."""
@@ -941,6 +1093,32 @@ class GaitScheduler:
             return self._stance_yaw()
         return float(self.config.heading)
 
+    def _use_in_place_turn(self, center: np.ndarray, *, speed: float, yaw: float) -> bool:
+        """Latch the footprint centre for a zero-speed heading change.
+
+        Returns true while the chain should rotate the stance offsets about
+        that centre instead of walking the centre line forward.
+        """
+        turning = abs(wrap_angle(self._heading_goal() - float(yaw))) > 0.03
+        if abs(float(speed)) >= IN_PLACE_SPEED or self._stop_requested or not turning:
+            self._turn_center = None
+            return False
+        if self._turn_center is None:
+            self._turn_center = np.asarray(center, dtype=float).reshape(2).copy()
+        return True
+
+    def _in_place_return(self, com_xy: np.ndarray) -> np.ndarray:
+        """Capped velocity toward the latched turn centre, or zeros."""
+        if self._turn_center is None:
+            return np.zeros(2)
+        back = IN_PLACE_RETURN_GAIN * (
+            self._turn_center - np.asarray(com_xy, dtype=float).reshape(2)
+        )
+        norm = float(np.linalg.norm(back))
+        if norm > IN_PLACE_RETURN_SPEED:
+            back *= IN_PLACE_RETURN_SPEED / norm
+        return back
+
     def _refresh_plan(self, *, t_step: float, speed: float) -> None:
         """Rebuild the unfrozen tail of the footstep chain.
 
@@ -950,6 +1128,10 @@ class GaitScheduler:
         side of the centre, so a heading change cannot plant the next foot
         behind the stance foot. At zero yaw this is the old
         ``previous + stride + side * width`` chain.
+
+        Below :data:`IN_PLACE_SPEED` the centre is latched and each foot is
+        only that lateral offset rotated to the step's yaw. Capture may still
+        move the foot that is in the air; it does not move the centre.
         """
         width = float(self._width if self._latch_valid else self.config.stance_width)
         goal = self._heading_goal()
@@ -961,22 +1143,30 @@ class GaitScheduler:
             if support.leg >= 0
             else 0.0
         )
+        in_place = self._use_in_place_turn(center, speed=speed, yaw=yaw)
+        if in_place:
+            center = np.asarray(self._turn_center, dtype=float)
 
         for index in range(self._step + 1, self._step + PLAN_HORIZON + 1):
             existing = self._steps.get(index)
             if existing is not None and existing.frozen:
                 yaw = float(existing.yaw)
-                if existing.leg >= 0:
+                if not in_place and existing.leg >= 0:
                     center = np.asarray(existing.pos, dtype=float) - (
                         _side(existing.leg) * 0.5 * width * heading_frame(yaw)[1]
                     )
                 continue
             dyaw = float(np.clip(wrap_angle(goal - yaw), -turn, turn))
-            forward, left = heading_frame(yaw + 0.5 * dyaw)
-            center = center + speed * t_step * forward
-            yaw = yaw + dyaw
             leg = self._leg_of(index)
-            nominal = center + _side(leg) * 0.5 * width * left
+            if in_place:
+                yaw = yaw + dyaw
+                _, left = heading_frame(yaw)
+                nominal = center + _side(leg) * 0.5 * width * left
+            else:
+                forward, left = heading_frame(yaw + 0.5 * dyaw)
+                center = center + speed * t_step * forward
+                yaw = yaw + dyaw
+                nominal = center + _side(leg) * 0.5 * width * left
             if existing is None:
                 self._steps[index] = Footstep(
                     leg=leg,
@@ -990,10 +1180,14 @@ class GaitScheduler:
                 existing.nominal_yaw = yaw
                 existing.pos = nominal + existing.correction
                 existing.yaw = yaw
+            if in_place:
+                yaw = float(self._steps[index].yaw)
+                continue
             # The following step chains off where this foot actually is,
             # correction included. Leaving it on the geometric centre makes
             # the end-of-step DCM ignore the correction and the foothold
-            # ratchets back onto the liftoff foot.
+            # ratchets back onto the liftoff foot. In-place turns do not:
+            # that re-anchor walks the footprint centre off the spot.
             center = np.asarray(self._steps[index].pos, dtype=float) - (
                 _side(leg) * 0.5 * width * heading_frame(yaw)[1]
             )
@@ -1426,6 +1620,7 @@ class GaitScheduler:
         height: float,
         measured_mask: np.ndarray,
         foot_yaws: np.ndarray | None = None,
+        L_meas: np.ndarray | None = None,
     ) -> GaitOutput:
         com_xy = np.asarray(com[:2], dtype=float)
         com_vel_xy = np.asarray(com_vel[:2], dtype=float)
@@ -1435,7 +1630,9 @@ class GaitScheduler:
             yaws = np.zeros(2)
         else:
             yaws = np.asarray(foot_yaws, dtype=float).reshape(2)
+        self._L_meas = np.zeros(3) if L_meas is None else np.asarray(L_meas, dtype=float).reshape(3)
         self._stand_yaw = float(circ_mid(yaws[0], yaws[1]))
+        self._steer_to_goal(com_xy)
         forward_h, _ = heading_frame(self._stance_yaw())
         self._meas_speed = float(np.dot(com_vel_xy, forward_h))
         self._update_turning(at_boundary=False)
@@ -1526,25 +1723,37 @@ class GaitScheduler:
         else:
             self._touchdown_hold = 0.0
 
-        self._refresh_plan(t_step=t_step, speed=speed)
+        self.policy.refresh_plan(self, t_step=t_step, speed=speed)
 
         # -- swing window ---------------------------------------------------
         support = self._steps[self._step]
         in_swing = (not support.initial) and self._tau >= t_ds and t_swing > 1e-6
         s = float(np.clip((self._tau - t_ds) / t_swing, 0.0, 1.0)) if in_swing else 0.0
 
-        # -- DCM reference, then bounded foothold feedback -------------------
-        dcm = com_xy + com_vel_xy / omega
-        if STEP_TIMING:
-            self._step_adjust(
-                dcm=dcm, s=s, omega=omega, t_step=t_step,
-                t_swing=t_swing, t_ds=t_ds, in_swing=in_swing,
-            )
-        elif in_swing:
-            self._apply_dcm_correction(dcm=dcm, s=s, omega=omega, t_step=t_step)
-        dcm_ref = self._dcm_at(omega=omega, t_step=t_step, t_ds=t_ds)
-        self._dcm_ref = dcm_ref
-        self._integrate_com_ref(dt=dt, omega=omega, dcm_ref=dcm_ref)
+        self.policy.correct_target(
+            self,
+            com=com_xy,
+            com_vel=com_vel_xy,
+            L_meas=self._L_meas,
+            s=s,
+            t_step=t_step,
+            t_swing=t_swing,
+            t_ds=t_ds,
+            in_swing=in_swing,
+            height=height,
+        )
+        com_ref_xy, com_vel_ref, dcm_ref = self.policy.com_reference(
+            self,
+            com=com_xy,
+            com_vel=com_vel_xy,
+            dt=dt,
+            height=height,
+            t_step=t_step,
+            t_ds=t_ds,
+            omega=omega,
+        )
+        self._com_vel_ref = np.asarray(com_vel_ref, dtype=float).reshape(2)
+        self._dcm_ref = np.asarray(dcm_ref, dtype=float).reshape(2)
 
         # -- contacts and swing trajectory ----------------------------------
         mask = np.ones(8, dtype=bool)
@@ -1602,7 +1811,7 @@ class GaitScheduler:
         yaw_ref, yaw_rate = self._yaw_now(t_step)
         return GaitOutput(
             contact_mask=mask,
-            com_ref_xy=self._com_ref_output(com_xy),
+            com_ref_xy=np.asarray(com_ref_xy, dtype=float).reshape(2),
             com_vel_ref=self._com_vel_ref.copy(),
             dcm_ref=dcm_ref.copy(),
             swing=swing,

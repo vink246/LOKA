@@ -10,7 +10,7 @@ When motors seize, friction collapses, mass shifts, or an operator says *"crouch
 
 | | Entry point | What it is |
 |---|---|---|
-| **Plant** | `python -m loka.main` | The G1 locomotion controller: centroidal MPC feeding a whole-body QP, with a gait layer on top. Never waits on anything. |
+| **Plant** | `python -m loka.main --stack legacy_dcm` | The G1 locomotion controller. Default stack is centroidal MPC + whole-body QP + DCM footholds. `--stack alip_footstep` keeps that plant and replaces the foothold law. Never waits on anything. |
 | **Manual tuning** | `python -m loka.dashboard` | The same plant with every knob on a slider and the footstep plan drawn in the viewer. No LLM in the loop. |
 | **Orchestration** | `python -m loka.run_loka` | The research loop: telemetry compression → LLM diagnosis → typed parameter mutation, driving that plant. |
 
@@ -36,6 +36,8 @@ classical gait in front of them:
              ──► ConvexMPC       (50 Hz)  ──► desired contact forces
              └─► whole-body QP   (500 Hz) ──► 29 joint torques ──► plant
 ```
+
+`--stack` is shared by `loka.main`, `loka.dashboard`, `loka.run_loka`, `loka.walk_bench`, `loka.evaluate`, `loka.evaluate_loka`, and `loka.diagnose_walk`. The choices are `legacy_dcm` (default) and `alip_footstep`. The latest side-by-side bench is `docs/walk_bench.md`.
 
 The **gait** (Englsberger DCM, Pratt capture point) is the reference a
 short-horizon force plan needs (Galliker et al. 2022). The **MPC** is Di

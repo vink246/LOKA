@@ -46,12 +46,22 @@ def assert_allowlist_subset_of_tunables() -> None:
 
 def filter_controller_targets(
     updates: dict[str, float],
+    stack: str | None = None,
 ) -> tuple[dict[str, float], list[str]]:
-    """Split updates into (allowed, rejected_paths)."""
+    """Split updates into (allowed, rejected_paths).
+
+    ``stack=None`` keeps the historical allowlist, so callers that have not
+    been taught about stacks stay on ``legacy_dcm``.
+    """
+    allow = LLM_STAND_CONTROLLER_ALLOWLIST
+    if stack is not None:
+        from loka.control.stacks import SPECS
+
+        allow = SPECS[stack].llm_allowlist
     allowed: dict[str, float] = {}
     rejected: list[str] = []
     for path, value in updates.items():
-        if path in LLM_STAND_CONTROLLER_ALLOWLIST:
+        if path in allow:
             allowed[path] = value
         else:
             rejected.append(path)

@@ -27,6 +27,12 @@ def load_stand_system_prompt(
     error_spec=None,
 ) -> str:
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8").rstrip()
+    plant = (
+        "The robot is a Unitree G1 controlled by a centroidal convex MPC and a whole-body QP."
+    )
+    if capabilities and capabilities.get("plant"):
+        plant = str(capabilities["plant"])
+    system_prompt = system_prompt.replace("{{PLANT}}", plant)
     blocks = [system_prompt]
     if objective:
         blocks.append(format_primary_objective_block(objective))
