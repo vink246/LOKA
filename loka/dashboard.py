@@ -5,6 +5,11 @@
     python -m loka.dashboard --no-robot   # sliders only, if the GPU is busy
     python -m loka.dashboard --walk 0.25  # start walking immediately
 
+Number keys perturb the plant (viewer window or this GUI; R still records):
+    2  right knee at 50% of nominal torque    3  push    4  ice
+    5  +5 kg on the left shoulder    6  torso +5 kg
+    7  right shoulder +5 kg    8  clear    H  help
+
 Every widget writes through one of the two surfaces the orchestrator uses:
 weights and gains through :mod:`loka.control.tuning`, and task setpoints --
 height, yaw, lean, and the whole ``gait.*`` policy -- through
@@ -36,6 +41,7 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 from loka import viz
+from loka.agent.interactive import FAULT_HELP, InteractivePlant
 from loka.control import tuning
 from loka.control.gait import (
     GAIT_KNOBS,
@@ -47,6 +53,23 @@ from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig
 from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.recording import RecordingToggle
 from loka.sim import Push, Simulation
+
+
+def _glfw_keycode(key: int) -> int:
+    """Map a DearPyGui key to the GLFW code the perturbation table uses.
+
+    Already-GLFW codes (the MuJoCo viewer, and tests) pass through.
+    """
+    for digit in range(10):
+        if key in (
+            getattr(dpg, f"mvKey_{digit}"),
+            getattr(dpg, f"mvKey_NumPad{digit}"),
+        ):
+            return ord(str(digit))
+    if key == dpg.mvKey_H:
+        return ord("h")
+    return key
+
 
 RENDER_HZ = 60.0
 #: The robot window is redrawn slower than the plots -- a standing robot barely
@@ -122,6 +145,7 @@ class Dashboard:
         self._last_wall = time.perf_counter()
         self._realtime = 0.0
         self.recording = RecordingToggle(sim.model, sim.config.model_path)
+        self.faults = InteractivePlant(sim)
 
     # -- controller plumbing ----------------------------------------------
     #
@@ -197,6 +221,22 @@ class Dashboard:
     def _on_toggle_running(self, sender, app_data, user_data) -> None:
         self.running = not self.running
         dpg.set_item_label("pause", "pause" if self.running else "resume")
+
+    def _on_perturb_key(self, sender, app_data, user_data) -> None:
+        """Number keys in the GUI window. The viewer has its own hook.
+
+        DearPyGui key codes are not GLFW codes (``mvKey_1`` is 537, not
+        ``ord("1")``), so translate before the shared map.
+        """
+        if isinstance(app_data, (list, tuple)):
+            app_data = app_data[0] if app_data else None
+        if not isinstance(app_data, int):
+            return
+        self.faults.handle_key(_glfw_keycode(app_data))
+
+    def _viewer_key(self, keycode: int) -> None:
+        self.recording.key_callback(keycode, self.sim.data.time)
+        self.faults.handle_key(keycode)
 
     # -- layout -------------------------------------------------------------
 
@@ -366,6 +406,8 @@ class Dashboard:
                                     parent=axis, tag=f"series::{trace.key}",
                                 )
         dpg.set_primary_window("root", True)
+        with dpg.handler_registry():
+            dpg.add_key_press_handler(callback=self._on_perturb_key)
 
     # -- frame --------------------------------------------------------------
 
@@ -445,6 +487,7 @@ class Dashboard:
         self._build_ui()
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        print(FAULT_HELP)
 
         if self.show_robot:
             import mujoco
@@ -456,9 +499,7 @@ class Dashboard:
                 self.sim.data,
                 show_left_ui=False,
                 show_right_ui=False,
-                key_callback=lambda keycode: self.recording.key_callback(
-                    keycode, self.sim.data.time
-                ),
+                key_callback=self._viewer_key,
             )
             self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = True
 
@@ -475,6 +516,11 @@ class Dashboard:
                         and self._frame % self.robot_sync_every == 0
                     ):
                         viz.begin_frame(self.viewer)
+                        self.faults.viz.external_force = self.sim._applied_force()
+                        self.faults.viz.external_body_id = self.sim.pelvis_id
+                        viz.render_fault_overlays(
+                            self.viewer, self.sim.model, self.sim.data, self.faults.viz
+                        )
                         viz.render_gait_overlays(self.viewer, self.sim.controller)
                         self.viewer.sync()
                 self._refresh_plots()

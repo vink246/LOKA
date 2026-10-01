@@ -15,7 +15,7 @@ from loka.control.locomotion import LocomotionController
 from loka.agent.error_spec import get_tracking_error
 from loka.agent.model_state import apply_loka_mutations, zero_dead_actuator_commands
 from loka.agent.session import FailureEpisode, OperatorSession
-from loka.sim import Push, Simulation
+from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
 from loka.agent.compress import ANOMALY_COLLECTION_S, synthesize_stand_telemetry
 from loka.agent.directives import heartbeat_due, register_directive, take_fired
@@ -31,8 +31,8 @@ from loka.agent.error_defaults import (
     default_stand_error_spec,
     default_walk_error_spec,
 )
-from loka.agent.faults import FaultSpec, apply_plant_fault, capture_nominal_params, clear_plant_faults
-from loka.agent.interactive import FaultVizState
+from loka.agent.faults import FaultSpec, capture_nominal_params
+from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
 from loka.agent.llm import load_stand_system_prompt, stand_llm_worker
 from loka.agent.plateau import (
     EpisodeMetrics,
@@ -84,9 +84,11 @@ class LokaRuntime:
         self.config = config or LokaConfig()
         self.controller: LocomotionController = sim.controller
         self.faults = list(faults or [])
-        self._fault_backups = []
         self._fired_faults: set[int] = set()
         self.viz = FaultVizState(external_body_id=self.sim.pelvis_id)
+        # Same list the visualizer restores from, so a key and a scripted fault
+        # cannot diverge.
+        self._fault_backups = self.viz.backups
 
         belief = self.controller.robot.model
         self.loka_state: dict = {
@@ -601,83 +603,21 @@ class LokaRuntime:
 
     # -- faults -------------------------------------------------------------
 
-    def _record_friction_viz(self, backup, mu: float) -> None:
-        floor_id = int(backup.payload["id"])
-        self.viz.floor_geom_id = floor_id
-        if self.viz.floor_rgba_nominal is None:
-            self.viz.floor_rgba_nominal = self.sim.model.geom_rgba[floor_id].copy()
-        self.viz.friction_mu = float(mu)
-        # Strong ice tint when slippery; restore color on clear.
-        if mu < 0.6:
-            self.sim.model.geom_rgba[floor_id] = np.array(
-                [0.15, 0.75, 1.0, 1.0], dtype=np.float32
-            )
-        elif self.viz.floor_rgba_nominal is not None:
-            self.sim.model.geom_rgba[floor_id] = self.viz.floor_rgba_nominal
-
     def inject_fault_now(self, fault: FaultSpec) -> bool:
         """Apply a plant fault immediately (interactive / scripted)."""
-        now = float(self.sim.data.time)
-        fault = FaultSpec(fault.kind, now, dict(fault.params))
-        if fault.kind == "push":
-            impulse = float(fault.params.get("impulse", 6.0))
-            direction = np.asarray(
-                fault.params.get("direction", (1.0, 0.0, 0.0)), dtype=float
-            )
-            n = float(np.linalg.norm(direction[:2]))
-            if n < 1e-9:
-                direction = np.array([1.0, 0.0, 0.0])
-            else:
-                direction = np.array([direction[0] / n, direction[1] / n, 0.0])
-            self.sim.pushes.append(
-                Push(impulse=impulse, direction=direction, time=now)
-            )
-            msg = f"[FAULT] push {impulse:.1f} N.s dir=({direction[0]:+.1f},{direction[1]:+.1f}) at t={now:.2f}s"
-            print(msg)
-            if self.log is not None:
-                self.log.note(msg, sim_time=now)
-            return True
-
-        backup = apply_plant_fault(self.sim.model, fault)
-        if backup is None:
-            print(f"[FAULT] failed to apply {fault.kind} params={fault.params}")
-            return False
-        self._fault_backups.append(backup)
-        self.viz.backups.append(backup)
-        if backup.kind == "mass":
-            delta = max(0.0, float(fault.params.get("delta_kg", 0.0)))
-            body_id = int(backup.payload["id"])
-            self.viz.mass_loads.append((body_id, delta))
-        elif backup.kind == "friction":
-            self._record_friction_viz(backup, float(fault.params.get("mu", 0.25)))
-        elif backup.kind == "actuator_dead":
-            self.viz.dead_actuator = str(backup.payload.get("name", "?"))
-        msg = f"[FAULT] {fault.kind} applied at t={now:.2f}s params={fault.params}"
+        ok, msg = commit_fault(self.sim, self.viz, fault)
         print(msg)
         if self.log is not None:
-            self.log.note(msg, sim_time=now)
-        return True
+            self.log.note(msg, sim_time=float(self.sim.data.time))
+        return ok
 
     def clear_interactive_faults(self) -> None:
-        """Restore mass / friction / dead-actuator plant edits (not pushes)."""
-        if not self._fault_backups:
+        """Restore mass / friction / actuator plant edits (not pushes)."""
+        msg = restore_faults(self.sim, self.viz)
+        if msg is None:
             print("[FAULT] nothing to clear")
             return
-        clear_plant_faults(self.sim.model, self._fault_backups)
-        if (
-            self.viz.floor_geom_id >= 0
-            and self.viz.floor_rgba_nominal is not None
-        ):
-            self.sim.model.geom_rgba[self.viz.floor_geom_id] = (
-                self.viz.floor_rgba_nominal
-            )
-        self._fault_backups.clear()
-        self.viz.backups.clear()
-        self.viz.mass_loads.clear()
-        self.viz.friction_mu = None
-        self.viz.dead_actuator = None
         self._residual_floor = None
-        msg = f"[FAULT] cleared plant mutations at t={self.sim.data.time:.2f}s"
         print(msg)
         if self.log is not None:
             self.log.note(msg, sim_time=float(self.sim.data.time))

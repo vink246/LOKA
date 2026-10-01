@@ -21,8 +21,10 @@ cadence, …).
 Session logs rewrite ``logs/loka/session.log`` (+ ``.jsonl``) each run.
 
 Interactive viewer commands (stdin) and keys:
-  mass / friction|ice / push / dead / clear / help
-  Keys: 1 mass, 2 ice, 3 push, 4 dead knee, 5 clear, H help
+  mass / friction|ice / push / dead / scale|weak / clear / help
+  Keys: 2 right knee at 50% torque, 3 push, 4 ice,
+        5 left-shoulder +5 kg, 6 torso +5 kg,
+        7 right-shoulder +5 kg, 8 clear, H help
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig, TASK_PARAME
 from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.sim import Simulation
 from loka.agent.faults import FaultSpec
-from loka.agent.interactive import FAULT_HELP, parse_fault_command
+from loka.agent.interactive import FAULT_HELP, KeyDebounce, fault_for_keycode, parse_fault_command
 from loka.agent.runtime import LokaConfig, LokaRuntime
 from loka.agent.session_log import default_log_path
 from loka.viz import begin_frame, render_fault_overlays, render_gait_overlays
@@ -245,46 +247,19 @@ def _stdin_command_thread(
 
 
 def _make_key_callback(runtime: LokaRuntime):
+    keys = KeyDebounce()
+
     def key_callback(keycode: int) -> None:
         # GLFW keycodes: digits and letters are their Unicode code points.
-        if keycode == ord("1"):
-            runtime.inject_fault_now(
-                FaultSpec("mass", 0.0, {"delta_kg": 5.0, "body": "torso_link"})
-            )
-        elif keycode == ord("2"):
-            runtime.inject_fault_now(FaultSpec("friction", 0.0, {"mu": 0.2}))
-        elif keycode == ord("3"):
-            runtime.inject_fault_now(
-                FaultSpec(
-                    "push",
-                    0.0,
-                    {"impulse": 6.0, "direction": (1.0, 0.0, 0.0)},
-                )
-            )
-        elif keycode == ord("4"):
-            runtime.inject_fault_now(
-                FaultSpec("actuator_dead", 0.0, {"actuator": "right_knee"})
-            )
-        elif keycode == ord("5"):
-            runtime.clear_interactive_faults()
-        elif keycode == ord("6"):
-            runtime.inject_fault_now(
-                FaultSpec(
-                    "mass",
-                    0.0,
-                    {"delta_kg": 5.0, "body": "left_shoulder_roll_link"},
-                )
-            )
-        elif keycode == ord("7"):
-            runtime.inject_fault_now(
-                FaultSpec(
-                    "mass",
-                    0.0,
-                    {"delta_kg": 5.0, "body": "right_shoulder_roll_link"},
-                )
-            )
-        elif keycode in (ord("h"), ord("H")):
+        action = fault_for_keycode(keycode)
+        if action is None or not keys.allow(keycode):
+            return
+        if action == "help":
             print(FAULT_HELP)
+        elif action == "clear":
+            runtime.clear_interactive_faults()
+        else:
+            runtime.inject_fault_now(action)
 
     return key_callback
 

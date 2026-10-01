@@ -269,6 +269,72 @@ def test_interactive_fault_commands_parse():
     assert push.params["impulse"] == 8.0
     assert push.params["direction"] == (0.0, 1.0, 0.0)
     assert parse_fault_command("please crouch") is None
+    weak = parse_fault_command("weak")
+    assert weak.kind == "actuator_scale"
+    assert weak.params["actuator"] == "right_knee"
+    assert weak.params["scale"] == pytest.approx(0.5)
+    scaled = parse_fault_command("scale left_knee 0.25")
+    assert scaled.params["actuator"] == "left_knee"
+    assert scaled.params["scale"] == pytest.approx(0.25)
+
+
+def test_number_keys_add_shoulder_mass_and_halve_knee_torque():
+    import mujoco
+
+    from loka.agent.interactive import InteractivePlant, fault_for_keycode
+
+    sim = Simulation()
+    plant = InteractivePlant(sim)
+    shoulder = mujoco.mj_name2id(
+        sim.model, mujoco.mjtObj.mjOBJ_BODY, "left_shoulder_roll_link"
+    )
+    knee = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_knee")
+    mass0 = float(sim.model.body_mass[shoulder])
+    gear0 = float(sim.model.actuator_gear[knee, 0])
+    belief_mass = float(sim.controller.robot.model.body_mass[shoulder])
+    belief_gear = float(sim.controller.robot.model.actuator_gear[knee, 0])
+
+    joint = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_JOINT, "right_knee_joint")
+    dof = int(sim.model.jnt_dofadr[joint])
+    data = mujoco.MjData(sim.model)
+    mujoco.mj_resetDataKeyframe(sim.model, data, 0)
+    data.ctrl[:] = 0.0
+    data.ctrl[knee] = 40.0
+    mujoco.mj_forward(sim.model, data)
+    # Motor torque on the joint is gear * ctrl. actuator_force itself stays
+    # equal to ctrl; the gear is what the plant delivers.
+    full = float(data.qfrc_actuator[dof])
+
+    assert fault_for_keycode(ord("1")) is None
+    assert fault_for_keycode(ord("5")).params["body"] == "left_shoulder_roll_link"
+    assert fault_for_keycode(ord("4")).params["mu"] == pytest.approx(0.2)
+    assert fault_for_keycode(ord("8")) == "clear"
+    # GLFW keypad codes: KP_5 = 325, KP_2 = 322.
+    assert fault_for_keycode(325).params["body"] == "left_shoulder_roll_link"
+    assert fault_for_keycode(322).kind == "actuator_scale"
+    assert fault_for_keycode(322).params["scale"] == pytest.approx(0.5)
+
+    plant.handle_key(ord("5"))
+    assert sim.model.body_mass[shoulder] == pytest.approx(mass0 + 5.0)
+    # Key repeat must not stack another 5 kg.
+    plant.handle_key(ord("5"))
+    assert sim.model.body_mass[shoulder] == pytest.approx(mass0 + 5.0)
+    assert sim.controller.robot.model.body_mass[shoulder] == pytest.approx(belief_mass)
+
+    plant.handle_key(ord("2"))
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.5 * gear0)
+    plant._keys.interval = 0.0
+    plant.handle_key(ord("2"))
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.5 * gear0)
+    assert sim.controller.robot.model.actuator_gear[knee, 0] == pytest.approx(belief_gear)
+    assert sim.model.actuator_ctrlrange[knee, 1] == pytest.approx(139.0)
+
+    mujoco.mj_forward(sim.model, data)
+    assert float(data.qfrc_actuator[dof]) == pytest.approx(0.5 * full, rel=1e-5)
+
+    plant.handle_key(ord("8"))
+    assert sim.model.body_mass[shoulder] == pytest.approx(mass0)
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(gear0)
 
 
 def test_inject_and_clear_faults_update_viz():
