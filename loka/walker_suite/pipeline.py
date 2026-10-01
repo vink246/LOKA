@@ -103,7 +103,7 @@ def _ordered_results(run_dir: Path, results: list[dict]) -> list[dict]:
 def merge_partials(run_dir: Path) -> list[str]:
     """Combine per-job partials into one summary, then write statistics and plots.
 
-    Returns the queued jobs that have no partial yet.
+    Returns the baselines and trials that were queued but have no partial yet.
     """
     run_dir = Path(run_dir)
     partial_dir = run_dir / "partials"
@@ -125,20 +125,11 @@ def merge_partials(run_dir: Path) -> list[str]:
     jobs_path = run_dir / "slurm" / "jobs.json"
     if jobs_path.is_file():
         jobs = json.loads(jobs_path.read_text(encoding="utf-8")).get("jobs") or []
-        have = {
-            (str(row.get("test")), str(row.get("baseline")), int(row.get("trial", -1)))
-            for row in results
-        }
+        have = {(row.get("baseline"), int(row.get("trial", -1))) for row in results}
         for job in jobs:
-            baseline = str(job.get("baseline"))
-            trial = int(job.get("trial", -1))
-            test_name = job.get("test")
-            if test_name is None:
-                if not any(item[1] == baseline and item[2] == trial for item in have):
-                    missing.append(f"{baseline} trial {trial}")
-                continue
-            if (str(test_name), baseline, trial) not in have:
-                missing.append(f"{test_name} {baseline} trial {trial}")
+            key = (job.get("baseline"), int(job.get("trial", -1)))
+            if key not in have:
+                missing.append(f"{key[0]} trial {key[1]}")
     if missing:
         print("[walker_suite] missing partials: " + ", ".join(missing))
     else:
@@ -186,12 +177,12 @@ def run_pipeline(suite: SuiteConfig) -> Path:
     if shared_slice:
         partial_dir = run_dir / "partials"
         partial_dir.mkdir(parents=True, exist_ok=True)
+        by_baseline: dict[str, list[dict]] = {}
         for row in results:
-            trial = int(row.get("trial", suite.trial if suite.trial is not None else 0))
-            path = partial_dir / (
-                f"{row['test']}__{row['baseline']}__trial_{trial:02d}.json"
-            )
-            path.write_text(json.dumps(_json_ready([row]), indent=2), encoding="utf-8")
+            by_baseline.setdefault(str(row["baseline"]), []).append(row)
+        for baseline, rows in by_baseline.items():
+            path = partial_dir / f"{baseline}__trial_{suite.trial:02d}.json"
+            path.write_text(json.dumps(_json_ready(rows), indent=2), encoding="utf-8")
             print(f"[walker_suite] partial {path}")
         print(f"\n[walker_suite] wrote {run_dir}")
         return run_dir

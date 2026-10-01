@@ -28,24 +28,21 @@ def _suite(**overrides):
 
 
 class PaceIceSubmitTests(unittest.TestCase):
-    def test_one_job_per_perturbation_baseline_trial(self):
+    def test_one_job_per_baseline_trial(self):
         jobs = iter_jobs(_suite())
-        self.assertEqual(len(jobs), 12)
-        self.assertEqual(jobs[0], {"test": "nominal", "baseline": "loka", "trial": 0})
-        self.assertEqual(jobs[1], {"test": "nominal", "baseline": "loka", "trial": 1})
-        self.assertEqual(jobs[-1], {"test": "ice", "baseline": "dr_rl", "trial": 1})
+        self.assertEqual(len(jobs), 6)
+        self.assertEqual(jobs[0], {"baseline": "loka", "trial": 0})
+        self.assertEqual(jobs[1], {"baseline": "loka", "trial": 1})
+        self.assertEqual(jobs[-1], {"baseline": "dr_rl", "trial": 1})
 
     def test_trial_index_selects_one(self):
         suite = _suite()
         suite.trial = 1
         self.assertEqual(trial_indices(suite), [1])
         self.assertEqual(iter_jobs(suite), [
-            {"test": "nominal", "baseline": "loka", "trial": 1},
-            {"test": "nominal", "baseline": "fixed_mpc", "trial": 1},
-            {"test": "nominal", "baseline": "dr_rl", "trial": 1},
-            {"test": "ice", "baseline": "loka", "trial": 1},
-            {"test": "ice", "baseline": "fixed_mpc", "trial": 1},
-            {"test": "ice", "baseline": "dr_rl", "trial": 1},
+            {"baseline": "loka", "trial": 1},
+            {"baseline": "fixed_mpc", "trial": 1},
+            {"baseline": "dr_rl", "trial": 1},
         ])
         suite.trial = 2
         with self.assertRaises(ValueError):
@@ -173,42 +170,6 @@ class PaceIceSubmitTests(unittest.TestCase):
             )
             self.assertEqual(missing, ["loka trial 1"])
             self.assertTrue((run / "plots" / "nominal_metrics.png").is_file())
-
-    def test_merge_partials_names_missing_perturbation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run = Path(tmp)
-            (run / "partials").mkdir()
-            (run / "slurm").mkdir()
-            (run / "config.resolved.yaml").write_text(
-                "num_trials: 1\n"
-                "baselines: [loka]\n"
-                "defaults: {goal_distance_m: 10, perturbation_time_s: 0, timeout_s: 20, speed_goal: 1}\n"
-                "tests:\n"
-                "  - {name: nominal, perturbation: {kind: none}}\n"
-                "  - {name: ice, perturbation: {kind: friction, mu: 0.001}}\n",
-                encoding="utf-8",
-            )
-            (run / "slurm" / "jobs.json").write_text(
-                json.dumps({
-                    "jobs": [
-                        {"test": "nominal", "baseline": "loka", "trial": 0},
-                        {"test": "ice", "baseline": "loka", "trial": 0},
-                    ]
-                }),
-                encoding="utf-8",
-            )
-            (run / "partials" / "nominal__loka__trial_00.json").write_text(
-                json.dumps([{
-                    "test": "nominal",
-                    "baseline": "loka",
-                    "trial": 0,
-                    "outcome": "success",
-                    "t_end": 10.0,
-                }]),
-                encoding="utf-8",
-            )
-            missing = merge_partials(run)
-            self.assertEqual(missing, ["ice loka trial 0"])
 
 
 if __name__ == "__main__":

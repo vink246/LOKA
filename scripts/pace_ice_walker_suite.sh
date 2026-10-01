@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Submit the Walker suite on a PACE-ICE login node.
-# Each Slurm job is one perturbation of one baseline and trial, CPU only.
+# Each Slurm job is one trial of one baseline, CPU only, at most 10 in flight.
 #
 #   bash scripts/pace_ice_walker_suite.sh --num-trials 5
 #   bash scripts/pace_ice_walker_suite.sh --num-trials 5 --cpus 32 \

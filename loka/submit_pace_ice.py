@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Queue the Walker suite on PACE-ICE as one CPU job per episode.
+"""Queue the Walker suite on PACE-ICE as one CPU job per baseline trial.
 
 Run this on a PACE-ICE login node. It submits a Slurm array with
 ``--array=0-N%10`` so at most 10 jobs are in flight. Each array task is one
-trial of one baseline on one perturbation. A follow-up job merges the partial
-logs and writes the plots.
+trial of one baseline and runs every perturbation in the suite config. A
+follow-up job merges the partial logs and writes the plots.
 
 Jobs request CPUs only. They do not set ``--gres`` and do not ask for a GPU.
 
@@ -31,16 +31,11 @@ from loka.walker_suite.pipeline import merge_partials, trial_indices
 
 
 def iter_jobs(suite: SuiteConfig) -> list[dict[str, int | str]]:
-    """One job per perturbation, baseline, and trial."""
+    """One job per baseline and trial. Each job still runs every configured test."""
     jobs: list[dict[str, int | str]] = []
-    for test in suite.tests:
-        for baseline in suite.baselines:
-            for trial in trial_indices(suite):
-                jobs.append({
-                    "test": test.name,
-                    "baseline": baseline,
-                    "trial": int(trial),
-                })
+    for baseline in suite.baselines:
+        for trial in trial_indices(suite):
+            jobs.append({"baseline": baseline, "trial": int(trial)})
     return jobs
 
 
@@ -284,13 +279,6 @@ def run_worker(run_dir: Path) -> int:
     suite = load_suite_yaml(run_dir / "config.resolved.yaml")
     suite.baselines = [str(job["baseline"])]
     suite.trial = int(job["trial"])
-    test_name = job.get("test")
-    if test_name:
-        matched = [test for test in suite.tests if test.name == str(test_name)]
-        if len(matched) != 1:
-            print(f"Unknown test {test_name!r} in jobs.json", file=sys.stderr)
-            return 2
-        suite.tests = matched
     suite.run_dir = run_dir
     if suite.num_trials <= suite.trial:
         suite.num_trials = suite.trial + 1
@@ -301,8 +289,8 @@ def run_worker(run_dir: Path) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = build_suite_parser()
     parser.description = (
-        "Submit the Walker suite to PACE-ICE. One CPU job per perturbation, "
-        "baseline, and trial, at most 10 in flight."
+        "Submit the Walker suite to PACE-ICE. One CPU job per baseline trial, "
+        "at most 10 in flight."
     )
     parser.add_argument(
         "--cpus",
