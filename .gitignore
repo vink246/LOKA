@@ -217,5 +217,25 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-#MuJoCo
+# LOKA local artifacts — sim, suite, and session outputs
 MUJOCO_LOG.TXT
+logs/
+recordings/
+results/
+loka_recording.mp4
+*.mp4
+
+# LaTeX build byproducts (keep paper/*.tex and paper/main.pdf)
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.out
+*.toc
+*.bbl
+*.blg
+
+# Local working plans (not for the paper / not committed)
+LOKA_INTEGRATION_PLAN.md
+*_INTEGRATION_PLAN.md
+temp_docs/

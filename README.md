@@ -1,183 +1,230 @@
 # LOKA
 
-**LLM-Orchestrated Kinematic Adaptation** — an immune system for dynamic locomotion on [unitree_mujoco](https://github.com/unitreerobotics/unitree_mujoco) with the Unitree G1.
+**LLM-Orchestrated Kinematic Adaptation** — an immune system for dynamic locomotion, with a Unitree G1 balance controller as the plant.
 
-Foundation models reason about the world in language; bipeds are dynamically unstable and fall easily. Bridging that gap is hard: VLAs struggle to compose novel skills online, Domain Randomization cannot isolate discrete unmodeled faults at runtime, and code-as-policy LLM loops are too slow (and brittle) for balancing underactuated robots. LOKA resolves this latency–stability paradox with a hybrid neuro-symbolic architecture: keep a mathematically transparent controller in the fast loop, and let a language model act as a slow, online system-identification engine that rewrites the controller’s objective landscape and physical self-awareness by mutating typed parameters mid-flight.
+Foundation models reason about the world in language; bipeds are dynamically unstable and fall easily. Bridging that gap is hard: VLAs struggle to compose novel skills online, Domain Randomization cannot isolate discrete unmodeled faults at runtime, and code-as-policy LLM loops are too slow (and brittle) for balancing underactuated robots. LOKA resolves this latency–stability paradox with a hybrid neuro-symbolic architecture: keep a mathematically transparent controller in the fast loop, and let a language model act as a slow, online system-identification engine that rewrites the controller's objective landscape and physical self-awareness by mutating typed parameters mid-flight.
 
-When motors seize, friction collapses, mass shifts, or an operator says *“crouch and walk at 1 m/s”*, LOKA compresses proprioceptive anomalies into semantic tags, diagnoses in the background, and applies surgical edits—cost weights, planner numerics, task goals, mission criteria, even virtual amputations (zero gear on a dead actuator)—so the robot can rediscover a gait before collapse.
+When motors seize, friction collapses, mass shifts, or an operator says *"crouch and walk at 1 m/s"*, LOKA compresses proprioceptive anomalies into semantic tags, diagnoses in the background, and applies surgical edits—cost weights, planner numerics, task goals, mission criteria, even virtual amputations (zero gear on a dead actuator)—so the robot can rediscover a gait before collapse.
 
-### Key Contributions
+## What's here
 
-- **Effort-driven telemetry compression** — monitors torque deficits, energy gradients, and mission error bands; delta-masks nominal behavior into dense semantic tags that fire *before* tracking error dooms the state.
-- **Asynchronous dual-rate execution** — the high-frequency control loop never waits on the LLM; inference runs on a background thread with thread-safe queues while the plant stays under predictive control.
-- **Dynamic kinematic malleability** — a YAML scratchpad turns the LLM into a live system ID engine with authority over costs, planner settings, task targets, `Error_Tracking`, and MJCF-aligned model belief (gear / friction / mass).
+| | Entry point | What it is |
+|---|---|---|
+| **Plant** | `python -m loka.main --stack legacy_dcm` | The G1 locomotion controller. Default stack is centroidal MPC + whole-body QP + DCM footholds. `--stack alip_footstep` keeps that plant and replaces the foothold law. Never waits on anything. |
+| **Manual tuning** | `python -m loka.dashboard` | The same plant with every knob on a slider and the footstep plan drawn in the viewer. No LLM in the loop. |
+| **Orchestration** | `python -m loka.run_loka` | The research loop: telemetry compression → LLM diagnosis → typed parameter mutation, driving that plant. |
 
-## Layout
+All three drive the *same* controller object through the *same* two typed
+surfaces — `update_weights()` for costs and gains, `set_task_targets()` for
+setpoints and gait policy. A knob you can reach by hand in the dashboard is a
+knob the model can reach later, by the same name, with the same clamp.
+
+Standing is solid and measured below. Walking holds 8 s at 0.10–0.30 m/s and
+30 s at 0.10/0.20/0.35/0.50 m/s under `gait_schedule_for_speed` (high
+double-support at a crawl, more swing time at 0.50 m/s). A small heading
+change (+0.3 rad) and mid-walk cadence, width, height and stop/restart
+commands hold. Large turns and turn-in-place still fall. Isolation's duty
+0.65 still falls at ~3 s. Notes: `docs/walking.md`.
+
+## The G1 locomotion controller
+
+Two layers, both quadratic programs, running in one process with MuJoCo, plus a
+classical gait in front of them:
 
 ```text
-LOKA/
-├── unitree_mujoco/   # git submodule: Unitree MuJoCo sim + robot MJCF
-├── sim/              # G1 launcher, DDS interface, demos
-├── loka/             # Orchestrator, telemetry compression, sessions, model mutations
-├── models/           # Task / MJCF assets
-├── paper/            # Optional LaTeX writeup (not required to run)
-├── environment.yml
-└── .gitmodules
+(qpos, qvel) ──► GaitScheduler   (500 Hz) ──► contacts, DCM, swing Bézier
+             ──► ConvexMPC       (50 Hz)  ──► desired contact forces
+             └─► whole-body QP   (500 Hz) ──► 29 joint torques ──► plant
 ```
 
-Suggested sibling layout for DDS deps (any path works):
+`--stack` is shared by `loka.main`, `loka.dashboard`, `loka.run_loka`, `loka.walk_bench`, `loka.evaluate`, `loka.evaluate_loka`, and `loka.diagnose_walk`. The choices are `legacy_dcm` (default) and `alip_footstep`. The latest side-by-side bench is `docs/walk_bench.md`.
+
+The **gait** (Englsberger DCM, Pratt capture point) is the reference a
+short-horizon force plan needs (Galliker et al. 2022). The **MPC** is Di
+Carlo et al. 2018's convex SRBD QP with Sleiman et al. 2021 finite-foot CoP
+constraints (implementation notes and citations in `docs/walking.md`). It
+is not ocs2 centroidal NMPC. The **whole-body QP** runs ten times faster
+and answers a different question: what torques realise those forces while
+keeping the feet planted, the torso upright, and the swing foot on its arc.
+
+The LLM (`python -m loka.run_loka`) mutates `gait.*` Task_Targets and a small
+impedance allowlist on a 0.5–5 s cadence. It never waits in the control
+thread and never sets footholds.
+
+Nothing in `loka/control/` imports MuJoCo for anything but kinematics queries, and
+the controller's interface is `compute_torque(qpos, qvel) -> torque`. Swapping the
+simulator for a hardware bridge does not touch the control code.
+
+### Measured behaviour
+
+From `python -m loka.evaluate` (10 s hold, then disturbance sweeps):
+
+| | |
+|---|---|
+| CoM error, undisturbed | 0.10 mm mean, 0.16 mm max |
+| Torso tilt, undisturbed | 0.007° mean |
+| Peak torque, undisturbed | 6.5 Nm (leg limits run to 139 Nm) |
+| Push recovery, fore/aft | 9.4 / 10.0 N·s |
+| Push recovery, lateral | 18.8 N·s both sides |
+| Crouch tracking, 0.70 → 0.55 m | within 3.2 mm |
+| Solve time | 0.68 ms mean, 1.77 ms p95, against a 2 ms budget |
+
+The honest ceiling for a controller that cannot step is the **capture point**: once
+`c + ċ/ω` leaves the support polygon, no contact force can arrest the fall. With
+this stance that limit is 0.318 m/s of CoM velocity, and the controller absorbs
+0.344 m/s — slightly past the point-mass bound, because the torso and arms
+contribute angular momentum. Recovering meaningfully more would require a stepping
+controller, not better tuning.
+
+### Layout
 
 ```text
-Research/
-├── LOKA/
-├── cyclonedds/              # eclipse-cyclonedds 0.10.x (build → install/)
-└── unitree_sdk2_python/     # pip install -e . into the loka env
+loka/control/
+├── robot.py       # G1 model wrapper: indices, contact sites, dynamics, stance margins
+├── qp.py          # OSQP front-end with pinned sparsity patterns for warm starts
+├── mpc.py         # ConvexMPC: Di Carlo SRBD QP + finite-foot CoP (Sleiman contact idea)
+├── wbc.py         # whole-body QP: accelerations + forces -> torques
+├── gait.py        # gait clock, footstep plan, DCM reference, swing arcs
+├── locomotion.py  # ties them together; the LOKA-facing command surface
+└── tuning.py      # the typed, clamped parameter registry (GUI + LLM)
+loka/agent/       # the slow layer: compress -> diagnose -> typed apply
+loka/sim.py       # MuJoCo loop, scripted pushes, run statistics
+loka/dashboard.py # manual tuning GUI
+loka/viz.py       # viewer overlays: footstep plan, swing arc, pushes, mass
+loka/evaluate.py  # robustness suite (hold / push / crouch)
+loka/config/g1.yaml  # static tuning, mirroring the dataclasses field for field
+models/g1/        # vendored 29-DoF MJCF + stance scene
+docs/             # walking.md (the gait layer), orchestrator.md (the slow layer)
 ```
 
 ## Setup
-
-### 1. Clone with submodule
-
-```bash
-git clone --recurse-submodules <LOKA-url>
-cd LOKA
-```
-
-If you already cloned without submodules:
-
-```bash
-git submodule update --init --recursive
-```
-
-### 2. Conda env
 
 ```bash
 conda env create -f environment.yml
 conda activate loka
 ```
 
-Update later with `conda env update -f environment.yml --prune`.
+`osqp>=1.1` is required — the controller reads `result.info.status_val` to reject
+infeasible solves, and older versions report status differently.
 
-### 3. cyclonedds + unitree_sdk2_python
-
-The Python simulator talks DDS via [unitree_sdk2_python](https://github.com/unitreerobotics/unitree_sdk2_python). Install into the `loka` env (clone anywhere; `~` is only an example):
-
-```bash
-# Build cyclonedds 0.10.x (required if pip cannot find it)
-cd ~
-git clone https://github.com/eclipse-cyclonedds/cyclonedds -b releases/0.10.x
-cd cyclonedds && mkdir -p build install && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=../install
-cmake --build . --target install
-
-# Install unitree_sdk2_python
-cd ~
-git clone https://github.com/unitreerobotics/unitree_sdk2_python.git
-cd unitree_sdk2_python
-export CYCLONEDDS_HOME=~/cyclonedds/install
-conda activate loka
-pip install -e .
-```
-
-If `pip install -e .` fails with `Could not locate cyclonedds`, ensure `CYCLONEDDS_HOME` points at the `install` directory above.
-
-### 4. Enable multicast on loopback (sim DDS)
-
-On many hosts (including WSL), `lo` starts without multicast and the sim/controller never see each other:
+Only the orchestrator needs an API key; the plant and the dashboard run without one:
 
 ```bash
-sudo ip link set lo multicast on
-```
-
-You should no longer see `selected interface "lo" is not multicast-capable` when launching. Re-run after reboot if needed.
-
-### 5. API key (orchestrator)
-
-```bash
-cd LOKA
-cp .env.example .env
-# edit .env and set OPENAI_API_KEY
+cp .env.example .env   # then set OPENAI_API_KEY
 ```
 
 ## Run
 
-Two terminals. Simulation DDS uses **domain id 1** and interface **`lo`** (real robot uses domain `0` and the robot NIC).
-
-### Terminal 1 — simulator
-
 ```bash
-conda activate loka
-cd LOKA
-python sim/run_g1_sim.py
+python -m loka.main                  # interactive viewer
+python -m loka.main --push 4         # shove the pelvis every 3 s
+python -m loka.main --height 0.60    # crouch
+python -m loka.main --headless -T 10 # scripted run, prints a summary
+
+python -m loka.dashboard             # manual tuning GUI + viewer
+python -m loka.dashboard --walk 0.25 # ... starting in a walk
+python -m loka.dashboard --no-robot  # GUI only (faster on software GL)
+
+python -m loka.evaluate              # plant robustness suite
+python -m loka.verify_gait           # gait diagnostics across a parameter matrix
+
+python -m loka.run_loka                          # the orchestration loop
+python -m loka.run_loka --operator "crouch a bit" # ... driven by language
+python -m loka.run_loka --no-llm --fault mass     # ... ablated, plant only
 ```
 
-You should see the MuJoCo viewer with the G1 (29 DoF). Elastic band is enabled for humanoid hang/lift:
+Static tuning lives in `loka/config/g1.yaml`, which mirrors the dataclasses in
+`loka/control/` field for field; the dataclass defaults are what runs when no
+`--config` is passed.
 
-| Key | Action |
-|-----|--------|
-| `9` | Attach / release virtual band |
-| `8` | Lift |
-| `7` | Lower |
+## The tuning surface
 
-### Terminal 2 — control / smoke test
+There are two, and everything that can change at runtime goes through one of
+them. `loka/control/tuning.py` declares the costs and gains — 30 of them, each
+with a range and a one-line rationale — and `loka/control/gait.py` declares the
+`gait.*` policy the same way in `GAIT_KNOBS`. The dashboard renders those
+registries; the orchestrator mutates the same entries by the same names:
 
-```bash
-conda activate loka
-cd LOKA
-python sim/demos/g1_torque_smoke.py          # 1 Nm on all motors
-python sim/demos/g1_torque_smoke.py --zero   # zero torque hold
+```python
+controller.update_weights(**{"wbc.kp_base_position": 30.0, "mpc.friction_mu": 0.35})
+controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25, "height": 0.65})
 ```
 
-Or use the low-level interface directly:
+Footstep coordinates and per-tick contact flags are *not* on either surface.
+Walking geometry stays classical and outside the model's vocabulary; the model
+picks a speed, a cadence and a stance width, and `gait.py` decides where the
+feet go.
+
+Two properties make this the right seam for an LLM:
+
+- **Paths are unambiguous.** `weight_force` and `friction_mu` exist on *both*
+  layers with values three orders of magnitude apart, so a bare field name is
+  not a safe address. Only `mpc.weight_force` and `wbc.weight_force` resolve.
+- **Values are clamped** into a band that keeps the QPs well posed, so a
+  hallucinated exponent degrades the stance instead of destroying the solver.
+
+Applying an update costs ~0.1 ms and rebuilds nothing: both layers re-read
+their weights every solve, and the handful of values baked into a constraint
+matrix are refreshed in place. You can drag a slider while the robot is
+standing on the result. `tuning.catalogue()` renders the whole surface as
+prompt-ready text.
+
+## Tests
 
 ```bash
-python sim/g1_interface.py
+pytest                      # ~3 min (includes 30 s walks)
+pytest -m 'not slow'        # invariants + 8 s walk gates (~1 min)
+pytest -m slow              # 30 s limit-cycle walks + standing recovery
 ```
 
-`LOKA_G1_Interface` publishes `rt/lowcmd` and subscribes `rt/lowstate` with **unitree_hg** messages. Torque-only commands set `kp=kd=0`. CRC is applied on every write. Live IMU in the smoke test is reported as quaternion / gyro / accelerometer (the sim bridge fills those fields).
+The suite splits into physics identities checked at a single state (contact forces
+sum to body weight, torques match the equation of motion, `J̇q̇` agrees with finite
+differences) and short closed-loop runs for drops, tilts, crouches and pushes. The
+capture-point test asserts recovery *and* asserts that a kick 50% past the limit
+still falls, so the suite cannot be satisfied by loosening what counts as a fall.
 
-## Demos
+The closed-loop walk gates live in `tests/test_gait.py`: 8 s at 0.10/0.20/0.30
+and 30 s at 0.10/0.20/0.35/0.50 (`pytest -m slow`). The gait planner's own
+invariants are tested in isolation either way.
 
-| Demo | Command | Notes |
-|------|---------|-------|
-| G1 sim | `python sim/run_g1_sim.py` | G1 29 DoF, elastic band, domain 1 / `lo` |
-| G1 torque smoke | `python sim/demos/g1_torque_smoke.py` | Subscribe lowstate, publish constant torque |
-| Upstream Go2 sim | `cd unitree_mujoco/simulate_python && python unitree_mujoco.py` | Default Go2 `config.py` |
-| Upstream Go2 SDK test | `cd unitree_mujoco/simulate_python && python test/test_unitree_sdk2.py` | Go2 / `unitree_go`; start Go2 sim first |
-| Upstream Go2 stand | `python unitree_mujoco/example/python/stand_go2.py` | No NIC → sim; with NIC → real robot |
+## Notes on the design
 
-Joystick test (optional; needs a gamepad and `USE_JOYSTICK=1` in upstream config):
+A few choices are load-bearing and easy to undo by accident:
 
-```bash
-cd unitree_mujoco/simulate_python
-python test/gamepad_test.py
-```
-
-## Sim to real
-
-| Mode | Domain | Interface |
-|------|--------|-----------|
-| Simulation | `1` | `lo` |
-| Real G1 | `0` | robot NIC, e.g. `enp3s0` |
-
-```bash
-python sim/demos/g1_torque_smoke.py enp3s0
-python sim/g1_interface.py enp3s0
-python unitree_mujoco/example/python/stand_go2.py enp3s0   # Go2 example
-```
-
-Omit the NIC → simulation; pass the NIC → hardware.
-
-## Project map
-
-| Path | Role |
-|------|------|
-| `sim/run_g1_sim.py` | Launch G1 Python sim (unitree_mujoco) |
-| `sim/g1_interface.py` | `LOKA_G1_Interface` (unitree_hg DDS) |
-| `sim/demos/` | Smoke / demo controllers |
-| `unitree_mujoco/` | Submodule: MuJoCo sim, bridges, robot MJCF |
-| `loka/` | Orchestrator, telemetry compression, sessions, model mutations |
-| `models/` | Task / MJCF assets |
-| `system_prompt.txt` | LLM policy for YAML scratchpad edits |
-| `environment.yml` | Conda env for this project |
-| `paper/` | Optional LaTeX writeup (not required to run LOKA) |
+- **Contact detection is absolute, not relative.** A sole point counts as planted
+  when it is near the estimated ground height. Comparing against the *lowest* sole
+  point instead makes an airborne robot read as fully planted, and the QP then
+  computes torques bracing against support that does not exist.
+- **Keeping the feet planted is a cost, not a constraint.** As a heel lands, a hard
+  "hold this point still" row fights the velocity the foot already has and the
+  program can go infeasible in the one millisecond where an answer matters most.
+- **Base position gains are deliberately low.** A planted biped accelerates its CoM
+  only by shifting the centre of pressure inside its soles, capping authority near
+  1.2 m/s². Gains asking for more saturate, turn the PD law bang-bang, and overshoot
+  the robot out of its own support polygon.
+- **The stance keyframe in `models/g1/scene.xml` is tuned, not arbitrary.** Knees
+  are bent clear of the straight-leg singularity, soles are exactly flat, and the
+  legs are pitched forward ~0.0176 rad so the CoM lands mid-sole — which is what
+  makes the forward and backward push margins equal.
+- **Dashboard widget payloads go through DearPyGui's `user_data`.** DearPyGui
+  decides how many arguments to pass by reading `co_argcount`, which counts
+  parameters that merely *have* defaults. The usual Python idiom for capturing
+  a loop variable — `lambda s, v, path=entry.path: ...` — therefore reads as a
+  three-argument callback and gets `path` overwritten with `user_data`. Every
+  callback takes the full `(sender, app_data, user_data)` triple so this cannot
+  recur quietly; `tests/test_dashboard.py` fires each widget through the real
+  dispatch path rather than calling the handlers directly.
+- **The walk plan leads the robot; measurement only nudges it.** Footholds chain
+  off the current support foot, one commanded stride apart, and the CoM
+  reference is the DCM trajectory that chain implies. Measured state enters in
+  exactly two clamped places. The version before this derived the CoM reference
+  from the measured feet while placing the feet relative to the measured CoM —
+  a loop with no term commanding forward progress, which is why it could only
+  shuffle.
+- **The viewer redraws at 60 Hz, not once per control tick.** `viewer.sync()`
+  costs ~3 ms; calling it every 2 ms tick spends more time drawing than
+  simulating and drops the window to 0.41x realtime. Batching a frame's worth of
+  control steps between redraws restores 0.87x. Do not move the physics to a
+  background thread to go faster: `sync()` reading `MjData` mid-write segfaults,
+  and guarding it with `viewer.lock()` contends so badly it lands at 0.59x.
+  `--headless` remains the fast path at 2.4x.
