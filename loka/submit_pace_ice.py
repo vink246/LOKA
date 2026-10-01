@@ -301,8 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mem", default="16G", help="Memory for each trial job (default: 16G).")
     parser.add_argument(
         "--time",
-        default="00:05:00",
-        help="Wall time for each trial job (default: 00:05:00).",
+        default="00:20:00",
+        help="Wall time for each trial job (default: 00:20:00).",
     )
     parser.add_argument(
         "--max-in-flight",

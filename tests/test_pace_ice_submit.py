@@ -114,7 +114,7 @@ class PaceIceSubmitTests(unittest.TestCase):
             self.assertEqual(code, 0)
             script = (run_dir / "slurm" / "worker.sh").read_text(encoding="utf-8")
             self.assertIn("--array=0-3%10", script)
-            self.assertIn("--time=00:05:00", script)
+            self.assertIn("--time=00:20:00", script)
             jobs = json.loads((run_dir / "slurm" / "jobs.json").read_text(encoding="utf-8"))
             self.assertEqual(len(jobs["jobs"]), 4)
             self.assertTrue((run_dir / "slurm" / "merge.sh").is_file())

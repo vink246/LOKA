@@ -33,7 +33,7 @@ from loka.robot_context import (
     format_current_mpc_configuration,
     format_live_model_parameters,
 )
-from loka.session import FailureEpisode, OperatorSession
+from loka.session import FailureEpisode, FixWindow, OperatorSession
 from loka.task_catalog import initial_error_spec, resolve_xml_path
 from loka.walker_suite.faults import (
     PlantFaults,
@@ -256,7 +256,8 @@ class WalkerRuntime:
         self.failure_episode = None
         self.pending_user_turn = None
         self.pending_session = None
-        self.operator_session = OperatorSession()
+        self.fix_window = FixWindow()
+        self.operator_session = OperatorSession(fix_window=self.fix_window)
         self.loka_turns: list[dict] = []
         self.mpc_snapshots: list[dict] = []
         self._record_mpc_snapshot(self.data.time)
@@ -329,6 +330,7 @@ class WalkerRuntime:
         self.failure_episode = None
         self.pending_user_turn = None
         self.pending_session = None
+        self.fix_window.clear()
         self.nominal_buffer.clear()
         self.anomaly_buffer.clear()
 
@@ -473,7 +475,9 @@ class WalkerRuntime:
 
         if self.failure_episode is None:
             self.failure_episode = FailureEpisode(
-                self.data.time, nominal_baseline=list(self.nominal_buffer)
+                self.data.time,
+                nominal_baseline=list(self.nominal_buffer),
+                fix_window=self.fix_window,
             )
 
         telemetry = synthesize_generalized_telemetry(

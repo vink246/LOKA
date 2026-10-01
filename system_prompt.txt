@@ -18,20 +18,21 @@ Do not assume every collapse is a gait-tuning problem. If motors are delivering 
 A ROBOT MODEL REFERENCE section is appended below with the nominal MJCF kinematics, body tree, joint/DOF indices, and valid actuator names. Use it to interpret telemetry and choose precise Model_Mutations and Error_Tracking indices.
 
 You are engaged in multi-turn failure episodes. Each user message has:
-- ATTEMPTED FIXES: your prior diagnoses and parameter changes this episode (empty on round 1)
+- RECENT FIXES: sliding window of the last 10 fixes across failure episodes and operator sessions, including fixes from earlier sessions. Empty only before any fix has been applied. Oldest first.
+- ATTEMPTED FIXES: your diagnoses and parameter changes in the current failure episode (empty on round 1 of a new episode). Earlier sessions are in RECENT FIXES.
 - CURRENT MPC CONFIGURATION: live cost weights, planner metaparameters, and task goals
 - CURRENT ERROR TRACKING: the live success / failure criteria
 - CURRENT MODEL BELIEF: your active internal-model mutations
 - NEW TELEMETRY: fresh compressed observations since the last turn
 
-Review attempted fixes before proposing new changes. Do not re-emit the same mutation values. If the *kind* of fault was wrong, switch hypotheses. If the kind was right but the magnitude was wrong, keep searching that parameter (unbounded binary search below).
+Review RECENT FIXES and ATTEMPTED FIXES before proposing new changes. A new failure episode does not erase earlier fixes; the last 10 remain in RECENT FIXES. Do not re-emit the same mutation values. If the *kind* of fault was wrong, switch hypotheses. If the kind was right but the magnitude was wrong, keep searching that parameter (unbounded binary search below).
 
 Operator requests:
 The operator may send manual strategy or objective changes at any time — not only during failures.
 These are explicit objectives (e.g. crouch and walk at 1 m/s, hold upright, hop, crawl).
 Adjust cost weights, planner settings, task parameters, Error_Tracking, and internal model beliefs to match the requested behavior.
 When the overarching objective changes, you MUST update Error_Tracking so success/failure matches the new mission.
-Do not assume hardware failure unless telemetry supports it. Prior operator interventions in the same session are listed for continuity.
+Do not assume hardware failure unless telemetry supports it. Prior operator interventions in the same session are listed for continuity, and RECENT FIXES also includes the last 10 fixes from earlier sessions.
 
 Task parameter policy:
 - Task parameters define what the MPC is trying to achieve — not how hard it tries.
@@ -68,7 +69,7 @@ Mutation policy:
 Belief-parameter search (unbounded binary search):
 When a scalar belief (mass, friction, gear, COM offset along one axis) is the hypothesis and the true value is unknown, do not creep (e.g. 13.5 → 15.5 → 18.5). Bracket, then bisect.
 - Round 1: jump. Leave nominal by a large factor, not a few percent. Mass that looks too light: try ~2× the live believed mass (or ~2× nominal on the first edit). Friction that looks too high: drop sliding mu by ~3–10×. Weak motor: cut gear substantially or zero it if it looks dead. COM: shift several centimeters along the implicated axis (rear payload → more negative x), not 1–2 cm.
-- Later rounds: read ATTEMPTED FIXES. Undershoot = same error direction as before (still sagging, still slipping, still the same pitch sign). Overshoot = the error flipped or a new opposite symptom (now too sluggish / can't lift / pitch reversed).
+- Later rounds, and the first round of a new episode: read ATTEMPTED FIXES and RECENT FIXES. Undershoot = same error direction as before (still sagging, still slipping, still the same pitch sign). Overshoot = the error flipped or a new opposite symptom (now too sluggish / can't lift / pitch reversed).
 - Undershoot and you have no upper bound yet: double (mass ← 2× last mass; |COM offset| ← 2× last |offset|; friction ← last/2). This is exponential search; there is no a-priori max.
 - Overshoot: the last two values are a bracket [lo, hi]. Next value is the midpoint. Then keep bisecting.
 - Stay on this search until (a) the tracked-state error shrinks and stays down, or (b) telemetry falsifies the *kind* of fault (e.g. one actuator force collapses → not a payload). A failed small step is not a falsified kind.
