@@ -131,7 +131,7 @@ python -m loka.run_walker_suite \
 
 Other flags: `--tests`, `--baselines`, `--goal-distance`, `--perturbation-time`, `--timeout`, `--speed-goal`, `--seed`, `--init-noise`, `--dr-rl-checkpoint`, `--dr-rl-config`, `--output-dir`, `--trial`, `--run-dir`, `--no-record`. Config defaults live in `loka/config/walker_suite.yaml`.
 
-On a PACE-ICE login node, one Slurm job per baseline trial (every perturbation in that trial), CPU only, at most 10 jobs in flight:
+On a PACE-ICE login node, one Slurm job per perturbation, baseline, and trial, CPU only, at most 10 jobs in flight:
 
 ```bash
 bash scripts/pace_ice_walker_suite.sh --num-trials 5 --cpus 32 \
