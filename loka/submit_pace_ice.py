@@ -9,7 +9,8 @@ follow-up job merges the partial logs and writes the plots.
 Jobs request CPUs only. They do not set ``--gres`` and do not ask for a GPU.
 
     bash scripts/pace_ice_walker_suite.sh --num-trials 5
-    bash scripts/pace_ice_walker_suite.sh --num-trials 5 --partition cpu --cpus 32
+    bash scripts/pace_ice_walker_suite.sh --num-trials 5 --cpus 32 \\
+        --conda-prefix /home/hice1/vkulkarni46/scratch/envs/loka
 """
 
 from __future__ import annotations
@@ -76,33 +77,51 @@ def _sbatch_headers(
     return lines
 
 
-def _preamble(repo: Path, conda_env: str) -> list[str]:
+def _preamble(repo: Path, conda_env: str, conda_prefix: str | None = None) -> list[str]:
     """Activate the PACE conda env and refuse any other interpreter.
 
-    The login shell on a dev machine often has the ``mjpc`` env on ``PATH``.
-    Jobs must run ``$CONDA_PREFIX/bin/python`` from the named env (``loka``).
+    ``conda_prefix`` is a directory (``conda activate /path/to/env``). A named
+    env is used only when no prefix is given. Prefix installs set
+    ``CONDA_DEFAULT_ENV`` to the folder name, so the check compares
+    ``CONDA_PREFIX`` to that directory.
     """
     repo_q = shlex.quote(str(repo))
-    env_q = shlex.quote(conda_env)
-    return [
+    target = conda_prefix if conda_prefix else conda_env
+    target_q = shlex.quote(target)
+    lines = [
         "set -euo pipefail",
         "if command -v module >/dev/null 2>&1; then",
         "  module load anaconda3 >/dev/null 2>&1 || module load anaconda >/dev/null 2>&1 || true",
         "fi",
         "if ! command -v conda >/dev/null 2>&1; then",
-        f'  echo "conda is not on PATH; cannot activate {env_q}" >&2',
+        f'  echo "conda is not on PATH; cannot activate {target_q}" >&2',
         "  exit 1",
         "fi",
         'source "$(conda info --base)/etc/profile.d/conda.sh"',
-        f"conda activate {env_q}",
-        f'if [ "${{CONDA_DEFAULT_ENV:-}}" != {env_q} ]; then',
-        f'  echo "expected conda env {env_q}, got ${{CONDA_DEFAULT_ENV:-none}}" >&2',
-        "  exit 1",
-        "fi",
+        f"conda activate {target_q}",
+    ]
+    if conda_prefix:
+        lines += [
+            f'expected="$(cd {target_q} && pwd)"',
+            'actual="$(cd "$CONDA_PREFIX" && pwd)"',
+            'if [ "$actual" != "$expected" ]; then',
+            '  echo "expected conda prefix $expected, got ${CONDA_PREFIX:-none}" >&2',
+            "  exit 1",
+            "fi",
+        ]
+    else:
+        lines += [
+            f'if [ "${{CONDA_DEFAULT_ENV:-}}" != {target_q} ]; then',
+            f'  echo "expected conda env {target_q}, got ${{CONDA_DEFAULT_ENV:-none}}" >&2',
+            "  exit 1",
+            "fi",
+        ]
+    lines += [
         f"cd {repo_q}",
         "export OMP_NUM_THREADS=1",
         "export MKL_NUM_THREADS=1",
     ]
+    return lines
 
 
 def render_worker_script(
@@ -110,6 +129,7 @@ def render_worker_script(
     run_dir: Path,
     repo: Path,
     conda_env: str,
+    conda_prefix: str | None = None,
     n_jobs: int,
     cpus: int,
     mem: str,
@@ -142,7 +162,7 @@ def render_worker_script(
     )
     lines += [
         "# CPU only. This script does not request a GPU.",
-        *_preamble(repo, conda_env),
+        *_preamble(repo, conda_env, conda_prefix),
         f'"$CONDA_PREFIX/bin/python" -m loka.submit_pace_ice --worker --run-dir {run_q}',
         "",
     ]
@@ -154,6 +174,7 @@ def render_merge_script(
     run_dir: Path,
     repo: Path,
     conda_env: str,
+    conda_prefix: str | None = None,
     partition: str | None = None,
     account: str | None = None,
     qos: str | None = None,
@@ -174,7 +195,7 @@ def render_merge_script(
     )
     lines += [
         "# CPU only. This script does not request a GPU.",
-        *_preamble(repo, conda_env),
+        *_preamble(repo, conda_env, conda_prefix),
         f'"$CONDA_PREFIX/bin/python" -m loka.submit_pace_ice --merge {run_q}',
         "",
     ]
@@ -195,7 +216,7 @@ def _sbatch(script: Path, extra: list[str] | None = None) -> str:
     return text.split(marker, 1)[1].split()[0].strip()
 
 
-def prepare_run(suite: SuiteConfig, run_dir: Path, *, repo: Path, conda_env: str, cpus: int, mem: str, time: str, max_in_flight: int, partition: str | None, account: str | None, qos: str | None, constraint: str | None) -> tuple[Path, Path, list[dict]]:
+def prepare_run(suite: SuiteConfig, run_dir: Path, *, repo: Path, conda_env: str, conda_prefix: str | None, cpus: int, mem: str, time: str, max_in_flight: int, partition: str | None, account: str | None, qos: str | None, constraint: str | None) -> tuple[Path, Path, list[dict]]:
     from loka.walker_suite.pipeline import _write_resolved_config
 
     jobs = iter_jobs(suite)
@@ -215,6 +236,7 @@ def prepare_run(suite: SuiteConfig, run_dir: Path, *, repo: Path, conda_env: str
             run_dir=run_dir,
             repo=repo,
             conda_env=conda_env,
+            conda_prefix=conda_prefix,
             n_jobs=len(jobs),
             cpus=cpus,
             mem=mem,
@@ -233,6 +255,7 @@ def prepare_run(suite: SuiteConfig, run_dir: Path, *, repo: Path, conda_env: str
             run_dir=run_dir,
             repo=repo,
             conda_env=conda_env,
+            conda_prefix=conda_prefix,
             partition=partition,
             account=account,
             qos=qos,
@@ -298,7 +321,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--conda-env",
         default="loka",
-        help="Conda env activated on the compute node (default: loka).",
+        help="Named conda env activated on the compute node (default: loka). Ignored when --conda-prefix is set.",
+    )
+    parser.add_argument(
+        "--conda-prefix",
+        default=None,
+        help="Path of the conda env to activate, for example ~/scratch/envs/loka. Overrides --conda-env.",
     )
     parser.add_argument(
         "--dry-run",
@@ -337,6 +365,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cpus < 1 or args.max_in_flight < 1:
         print("--cpus and --max-in-flight must be >= 1", file=sys.stderr)
         return 2
+    conda_prefix = None
+    if args.conda_prefix:
+        prefix = Path(args.conda_prefix).expanduser()
+        if not prefix.is_dir():
+            print(f"--conda-prefix is not a directory: {prefix}", file=sys.stderr)
+            return 2
+        conda_prefix = str(prefix)
 
     repo = Path(__file__).resolve().parent.parent
     if args.run_dir:
@@ -350,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             run_dir,
             repo=repo,
             conda_env=args.conda_env,
+            conda_prefix=conda_prefix,
             cpus=args.cpus,
             mem=args.mem,
             time=args.time,

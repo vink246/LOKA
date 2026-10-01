@@ -181,6 +181,16 @@ def prepare_offscreen_env() -> str:
         headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
         backend = "osmesa" if headless else "egl"
         os.environ["MUJOCO_GL"] = backend
+    if backend == "osmesa":
+        os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+        # ctypes looks up libOSMesa.so by the dynamic linker path. Conda
+        # keeps that library in $CONDA_PREFIX/lib, which ld.so does not search.
+        prefix = os.environ.get("CONDA_PREFIX", "").strip()
+        lib = os.path.join(prefix, "lib") if prefix else ""
+        if lib and os.path.isdir(lib):
+            current = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]
+            if lib not in current:
+                os.environ["LD_LIBRARY_PATH"] = ":".join([lib, *current])
 
     config_dir = os.environ.get("MPLCONFIGDIR", "").strip()
     if not config_dir:

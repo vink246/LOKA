@@ -134,10 +134,11 @@ Other flags: `--tests`, `--baselines`, `--goal-distance`, `--perturbation-time`,
 On a PACE-ICE login node, one Slurm job per baseline trial (every perturbation in that trial), CPU only, at most 10 jobs in flight:
 
 ```bash
-bash scripts/pace_ice_walker_suite.sh --num-trials 5 --cpus 32
+bash scripts/pace_ice_walker_suite.sh --num-trials 5 --cpus 32 \
+    --conda-prefix /home/hice1/vkulkarni46/scratch/envs/loka
 ```
 
-Pass `--partition`, `--account`, `--qos`, or `--constraint` when the default partition is not the CPU node you want. `sinfo -o "%P %c %f"` lists partitions, CPU counts, and features. A later job merges the partials and writes the plots into `results/walker/pace_<timestamp>/`.
+`--conda-prefix` is the env directory to activate on the login node and on every job. Pass `--partition`, `--account`, `--qos`, or `--constraint` when the default partition is not the CPU node you want. `sinfo -o "%P %c %f"` lists partitions, CPU counts, and features. A later job merges the partials and writes the plots into `results/walker/pace_<timestamp>/`.
 
 `command_latency` holds the motor command back by `delay_steps` control updates (10 ms each; `8` is 80 ms, the same count as TWIST `action_buf_len`). The planner and the policy still emit the latest command. Only the plant input is late, and it holds that delayed command across the physics steps until the next update. The shipped test turns the lag on at `perturbation_time_s: 0`. `action_buf_len` is accepted as an alias for `delay_steps`.
 

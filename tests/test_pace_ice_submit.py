@@ -69,6 +69,27 @@ class PaceIceSubmitTests(unittest.TestCase):
         self.assertIn('"$CONDA_PREFIX/bin/python"', script)
         self.assertNotIn("mjpc", script)
 
+    def test_conda_prefix_is_activated_by_path(self):
+        script = render_worker_script(
+            run_dir=Path("/tmp/pace_run"),
+            repo=Path("/tmp/LOKA"),
+            conda_env="loka",
+            conda_prefix="/home/hice1/vkulkarni46/scratch/envs/loka",
+            n_jobs=1,
+            cpus=4,
+            mem="16G",
+            time="00:05:00",
+            max_in_flight=10,
+        )
+        self.assertIn(
+            "conda activate /home/hice1/vkulkarni46/scratch/envs/loka",
+            script,
+        )
+        self.assertIn('expected="$(cd /home/hice1/vkulkarni46/scratch/envs/loka && pwd)"', script)
+        self.assertNotIn('CONDA_DEFAULT_ENV:-}}" !=', script)
+        self.assertIn("#SBATCH --output=/tmp/pace_run/slurm/walker_%A_%a.out", script)
+        self.assertIn("#SBATCH --error=/tmp/pace_run/slurm/walker_%A_%a.err", script)
+
     def test_dry_run_writes_scripts_without_sbatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
