@@ -20,8 +20,8 @@ init_noise: 0.005
 # DR-RL baseline only. Null falls through to LOKA_DR_RL_CHECKPOINT / LOKA_DR_RL_CONFIG,
 # then loka/dr_rl/config.yaml. Checkpoint may be a zip or a directory that contains one.
 # The config YAML must match the checkpoint (observation size and normalization).
-dr_rl_checkpoint: results/dr_rl/checkpoints/ppo_walker_750000_steps.zip
-dr_rl_config: loka/dr_rl/config.yaml
+dr_rl_checkpoint: results/dr_rl_gym/best/best_model.zip
+dr_rl_config: loka/dr_rl/config_gym.yaml
 
 defaults:
   goal_distance_m: 10.0
@@ -39,8 +39,16 @@ tests:
   - name: ice
     perturbation: {kind: friction, mu: 0.001}
   - name: backpack
-    perturbation: {kind: mass, mass_frac: 1.5, body: torso}
+    perturbation: {kind: mass, mass_frac: 1.25, body: torso}
   - name: shove_back
     perturbation: {kind: force, force_frac: 0.5, direction: backward, duration_s: 0.2}
   - name: box
     perturbation: {kind: obstacle, size: [0.25, 0.50, 0.30], x: 4.0}
+  # Planner and policy still emit the latest command. The plant applies the
+  # command from delay_steps control updates earlier (10 ms each, so 8 is
+  # 80 ms) and holds it across the physics steps in between. Same mechanism
+  # as TWIST action_delay / action_buf_len. Starts at t=0 so the lag is on
+  # for the whole walk; raise perturbation_time_s to switch it on later.
+  - name: command_latency
+    perturbation_time_s: 2.0
+    perturbation: {kind: command_latency, delay_steps: 8}

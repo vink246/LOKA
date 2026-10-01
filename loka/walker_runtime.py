@@ -679,7 +679,8 @@ class WalkerRuntime:
         qpos_before = self.data.qpos.copy()
         # Plan against belief (nominal XML + LOKA mutations). The C++ agent
         # holds a serialized copy of belief_model; plant faults never enter it.
-        if self.data.time >= self.last_planner_time:
+        new_command = self.data.time >= self.last_planner_time
+        if new_command:
             self.agent.set_state(
                 time=self.data.time,
                 qpos=self.data.qpos,
@@ -698,7 +699,11 @@ class WalkerRuntime:
         # Physics overlay lives only on the plant model / data.
         self.plant.apply_physics(self.data.time)
         self.assert_mpc_unaware_of_plant()
-        self.data.ctrl[:] = raw_actions
+        # Command latency lags the plant input. The planner still sees its
+        # own latest action; only data.ctrl is delayed.
+        self.data.ctrl[:] = self.plant.delay_command(
+            raw_actions, new_command=new_command
+        )
         mujoco.mj_step(self.model, self.data)
         joint_delta = np.abs(self.data.qpos - qpos_before)
         # MuJoCo actuator_force is pre-gear (equals ctrl for these motors).

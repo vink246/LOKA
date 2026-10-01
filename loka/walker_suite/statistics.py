@@ -107,21 +107,53 @@ def time_to_recovery(
     return float(longest)
 
 
+def time_not_fallen(
+    times: list[float] | np.ndarray,
+    fallen: list[float] | np.ndarray,
+    t_end: float | None = None,
+) -> float:
+    """Seconds the walker is upright, integrated from the log.
+
+    A sample counts as fallen when ``fallen`` is above 0.5. Each gap takes the
+    state of its left sample. The span before the first sample and the span
+    from the last sample to ``t_end`` use the nearest sample.
+    """
+    t = np.asarray(times, dtype=float)
+    down = np.asarray(fallen, dtype=float) > 0.5
+    if t.size == 0:
+        return 0.0
+    dt = np.diff(t)
+    upright = float(np.sum(dt[~down[:-1]])) if dt.size else 0.0
+    if t[0] > 0.0 and not bool(down[0]):
+        upright += float(t[0])
+    end = float(t[-1] if t_end is None else t_end)
+    tail = max(end - float(t[-1]), 0.0)
+    if not bool(down[-1]):
+        upright += tail
+    return upright
+
+
 def metrics_from_log(
     rows: list[dict[str, Any]],
     *,
     speed_goal: float,
     height_goal: float = HEIGHT_GOAL_M,
+    t_end: float | None = None,
 ) -> dict[str, float | None]:
     """Scalar tracking and recovery metrics for one logged episode."""
+    empty = {
+        "rms_height_m": None,
+        "rms_pitch_rad": None,
+        "rms_speed_mps": None,
+        "rms_tracking": None,
+        "time_to_recovery_s": None,
+        "time_not_fallen_s": None,
+        "avg_grf_mag_n": None,
+        "avg_grf_horizontal_n": None,
+        "nonfoot_contact_fraction": None,
+    }
     if not rows:
-        return {
-            "rms_height_m": None,
-            "rms_pitch_rad": None,
-            "rms_speed_mps": None,
-            "rms_tracking": None,
-            "time_to_recovery_s": None,
-        }
+        return empty
     rms = trajectory_rms(
         [row["height"] for row in rows],
         [row["vel_x"] for row in rows],
@@ -133,13 +165,60 @@ def metrics_from_log(
         [row["t"] for row in rows],
         [_is_failed(row) for row in rows],
     )
+    upright = (
+        time_not_fallen(
+            [row["t"] for row in rows],
+            [row.get("fallen", 0.0) for row in rows],
+            t_end,
+        )
+        if "fallen" in rows[0]
+        else None
+    )
     return {
         "rms_height_m": rms["rms_height_m"],
         "rms_pitch_rad": rms["rms_pitch_rad"],
         "rms_speed_mps": rms["rms_speed_mps"],
         "rms_tracking": rms["rms_tracking"],
         "time_to_recovery_s": recovery,
+        "time_not_fallen_s": upright,
+        "avg_grf_mag_n": _column_mean(rows, "grf_mag"),
+        "avg_grf_horizontal_n": _column_mean(rows, "grf_horizontal"),
+        "nonfoot_contact_fraction": _column_mean(rows, "nonfoot_floor"),
     }
+
+
+def touched_nonfoot_geoms(rows: list[dict[str, Any]]) -> list[str]:
+    """Non-foot geoms that touched the floor, in first-seen order.
+
+    Reads the ``floor_<geom>`` flags written at log time.
+    """
+    touched: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key, value in row.items():
+            if not str(key).startswith("floor_"):
+                continue
+            try:
+                flagged = float(value) > 0.0
+            except (TypeError, ValueError):
+                flagged = False
+            if not flagged:
+                continue
+            name = str(key)[len("floor_") :]
+            if name and name not in seen:
+                seen.add(name)
+                touched.append(name)
+    return touched
+
+
+def _column_mean(rows: list[dict[str, Any]], key: str) -> float | None:
+    if not rows or key not in rows[0]:
+        return None
+    arr = np.asarray([row.get(key, np.nan) for row in rows], dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return float(arr.mean())
 
 
 def _mean_std(values: list[float]) -> tuple[float | None, float | None]:
@@ -187,6 +266,18 @@ def aggregate_condition(trials: list[dict[str, Any]]) -> dict[str, Any]:
     rms_c, rms_c_std = _mean_std(
         [_finite_or_none(row.get("rms_tracking")) for row in trials]
     )
+    upright, upright_std = _mean_std(
+        [_finite_or_none(row.get("time_not_fallen_s")) for row in trials]
+    )
+    grf, grf_std = _mean_std(
+        [_finite_or_none(row.get("avg_grf_mag_n")) for row in trials]
+    )
+    grf_h, grf_h_std = _mean_std(
+        [_finite_or_none(row.get("avg_grf_horizontal_n")) for row in trials]
+    )
+    nonfoot, nonfoot_std = _mean_std(
+        [_finite_or_none(row.get("nonfoot_contact_fraction")) for row in trials]
+    )
     return {
         "test": trials[0]["test"] if trials else None,
         "baseline": trials[0]["baseline"] if trials else None,
@@ -206,6 +297,14 @@ def aggregate_condition(trials: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_rms_speed_std_mps": rms_v_std,
         "avg_rms_tracking": rms_c,
         "avg_rms_tracking_std": rms_c_std,
+        "avg_time_not_fallen_s": upright,
+        "avg_time_not_fallen_std_s": upright_std,
+        "avg_grf_mag_n": grf,
+        "avg_grf_mag_std_n": grf_std,
+        "avg_grf_horizontal_n": grf_h,
+        "avg_grf_horizontal_std_n": grf_h_std,
+        "avg_nonfoot_contact_fraction": nonfoot,
+        "avg_nonfoot_contact_fraction_std": nonfoot_std,
     }
 
 
@@ -252,11 +351,15 @@ def format_condition_line(condition: dict[str, Any]) -> str:
         f"({condition['n_success']}/{condition['n_trials']}), "
         f"completion {_fmt(condition['avg_completion_time_s'], unit='s')}, "
         f"recovery {_fmt(condition['avg_time_to_recovery_s'], unit='s')}, "
+        f"upright {_fmt(condition.get('avg_time_not_fallen_s'), unit='s')}, "
         f"rms h/p/v/track "
         f"{_fmt(condition['avg_rms_height_m'])}/"
         f"{_fmt(condition['avg_rms_pitch_rad'])}/"
         f"{_fmt(condition['avg_rms_speed_mps'])}/"
-        f"{_fmt(condition['avg_rms_tracking'])}"
+        f"{_fmt(condition['avg_rms_tracking'])}, "
+        f"grf {_fmt(condition.get('avg_grf_mag_n'), unit='N')} "
+        f"(horiz {_fmt(condition.get('avg_grf_horizontal_n'), unit='N')}), "
+        f"nonfoot {_fmt(condition.get('avg_nonfoot_contact_fraction'), 2)}"
     )
 
 
@@ -279,6 +382,14 @@ _STAT_FIELDS = (
     "avg_rms_speed_std_mps",
     "avg_rms_tracking",
     "avg_rms_tracking_std",
+    "avg_time_not_fallen_s",
+    "avg_time_not_fallen_std_s",
+    "avg_grf_mag_n",
+    "avg_grf_mag_std_n",
+    "avg_grf_horizontal_n",
+    "avg_grf_horizontal_std_n",
+    "avg_nonfoot_contact_fraction",
+    "avg_nonfoot_contact_fraction_std",
 )
 
 

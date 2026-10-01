@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,7 +19,15 @@ from loka.model_state import (
 FORBIDDEN_RAW_KEYS = frozenset({"delta_kg", "magnitude"})
 FORCE_DIRECTIONS = frozenset({"forward", "backward"})
 PERTURBATION_KINDS = frozenset(
-    {"none", "actuator_dead", "friction", "mass", "force", "obstacle"}
+    {
+        "none",
+        "actuator_dead",
+        "friction",
+        "mass",
+        "force",
+        "obstacle",
+        "command_latency",
+    }
 )
 BACKPACK_VISIBLE_RGBA = np.array([0.18, 0.32, 0.62, 1.0], dtype=float)
 ICE_FLOOR_RGBA = np.array([0.72, 0.88, 0.98, 1.0], dtype=float)
@@ -60,6 +69,7 @@ class ResolvedPerturbation:
     obstacle_pos: np.ndarray | None = None
     obstacle_size: np.ndarray | None = None
     friction_geom_ids: tuple[int, ...] = ()
+    delay_steps: int = 0
 
 
 def walker_total_mass(model: mujoco.MjModel) -> float:
@@ -272,6 +282,81 @@ def restore_plant_snapshot(
         recompute_mass_constants(model)
 
 
+def _as_delay_steps(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be an integer")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{label} must be an integer")
+    steps = int(value)
+    if steps < 0:
+        raise ValueError(f"{label} must be >= 0")
+    return steps
+
+
+def command_delay_steps(raw: dict[str, Any]) -> int:
+    """Lag in control updates for a ``command_latency`` perturbation.
+
+    ``delay_steps`` is the number of planner or policy updates the plant waits
+    before it applies a command. ``action_buf_len`` is the TWIST name for the
+    same count (the action-history length those envs index with
+    ``history[-delay - 1]``). Walker control updates are 10 ms apart, so 8
+    steps is 80 ms.
+    """
+    has_delay = "delay_steps" in raw
+    has_buf = "action_buf_len" in raw
+    if not has_delay and not has_buf:
+        raise ValueError(
+            "command_latency requires delay_steps "
+            "(TWIST action_buf_len; control updates of lag)"
+        )
+    delay = _as_delay_steps(raw["delay_steps"], "delay_steps") if has_delay else None
+    buf = _as_delay_steps(raw["action_buf_len"], "action_buf_len") if has_buf else None
+    if delay is not None and buf is not None and delay != buf:
+        raise ValueError(
+            f"command_latency delay_steps ({delay}) and action_buf_len ({buf}) disagree"
+        )
+    if delay is not None:
+        return delay
+    if buf is None:
+        raise ValueError("command_latency requires delay_steps")
+    return buf
+
+
+class CommandDelay:
+    """Hold control commands back by a fixed number of control updates.
+
+    The buffer starts full of ``hold`` (zeros at spawn, the command already
+    in flight if latency turns on later). Each new control update pushes the
+    latest command and applies the one that has waited ``delay_steps``
+    updates. Calls between updates keep that applied command.
+    """
+
+    def __init__(self, nu: int, delay_steps: int, hold: np.ndarray | None = None):
+        self.delay_steps = _as_delay_steps(delay_steps, "delay_steps")
+        self._nu = int(nu)
+        if hold is None:
+            held = np.zeros(self._nu, dtype=float)
+        else:
+            held = np.asarray(hold, dtype=float).reshape(self._nu).copy()
+        self._queue: deque[np.ndarray] = deque(
+            held.copy() for _ in range(self.delay_steps)
+        )
+        self._out = held.copy()
+
+    def push(self, command: np.ndarray) -> np.ndarray:
+        cmd = np.asarray(command, dtype=float).reshape(self._nu).copy()
+        if self.delay_steps <= 0:
+            self._out = cmd
+            return self._out.copy()
+        self._queue.append(cmd)
+        self._out = np.asarray(self._queue.popleft(), dtype=float).copy()
+        return self._out.copy()
+
+    @property
+    def held(self) -> np.ndarray:
+        return self._out.copy()
+
+
 def _reject_raw_si(raw: dict[str, Any]) -> None:
     bad = FORBIDDEN_RAW_KEYS.intersection(raw)
     if bad:
@@ -372,6 +457,12 @@ def resolve_perturbation(
         resolved.obstacle_size = size_arr
         resolved.obstacle_pos = np.array([x, 0.0, float(size_arr[2])], dtype=float)
 
+    elif kind == "command_latency":
+        steps = command_delay_steps(raw)
+        resolved.delay_steps = steps
+        resolved.params["delay_steps"] = steps
+        resolved.params.pop("action_buf_len", None)
+
     return resolved
 
 
@@ -397,6 +488,8 @@ def perturbation_metadata(resolved: ResolvedPerturbation) -> dict[str, Any]:
     if resolved.obstacle_pos is not None:
         meta["obstacle_pos"] = resolved.obstacle_pos.tolist()
         meta["obstacle_size"] = resolved.obstacle_size.tolist()
+    if resolved.kind == "command_latency":
+        meta["delay_steps"] = int(resolved.delay_steps)
     return meta
 
 
@@ -461,6 +554,11 @@ def apply_resolved_fault(
             size=fault.obstacle_size,
             geom_id=fault.obstacle_id,
         )
+        return
+
+    if kind == "command_latency":
+        # Lag lives on the command path (PlantFaults.delay_command), not the MJCF.
+        return
 
 
 class PlantFaults:
@@ -476,11 +574,13 @@ class PlantFaults:
         self.snapshot = capture_plant_snapshot(model)
         self.active: ResolvedPerturbation | None = None
         self.activated_at: float | None = None
+        self.command_delay: CommandDelay | None = None
 
     def clear(self) -> None:
         restore_plant_snapshot(self.model, self.data, self.snapshot, set_const=True)
         self.active = None
         self.activated_at = None
+        self.command_delay = None
 
     @property
     def is_active(self) -> bool:
@@ -489,6 +589,12 @@ class PlantFaults:
     def activate(self, fault: ResolvedPerturbation, sim_time: float) -> None:
         self.active = fault
         self.activated_at = float(sim_time)
+        if fault.kind == "command_latency":
+            self.command_delay = CommandDelay(
+                self.model.nu, fault.delay_steps, hold=self.data.ctrl
+            )
+        else:
+            self.command_delay = None
         apply_resolved_fault(
             self.model,
             self.data,
@@ -520,6 +626,19 @@ class PlantFaults:
             self.snapshot,
             recompute_mass_const=False,
         )
+
+    def delay_command(self, command: np.ndarray, *, new_command: bool) -> np.ndarray:
+        """Apply command latency when that fault is active.
+
+        ``new_command`` is true on planner or policy updates (10 ms). Physics
+        steps in between reuse the delayed command already in flight.
+        """
+        delay = self.command_delay
+        if delay is None:
+            return np.asarray(command, dtype=float)
+        if new_command:
+            return delay.push(command)
+        return delay.held
 
     def obstacle_overlay(self) -> dict[str, Any] | None:
         overlay = self.visual_overlay()

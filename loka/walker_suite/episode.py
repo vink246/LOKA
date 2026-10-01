@@ -10,7 +10,7 @@ from loka.walker_suite.config import EpisodeDefaults, SuiteConfig, TestCase
 from loka.walker_suite.faults import perturbation_metadata, resolve_perturbation
 from loka.walker_suite.logging import EpisodeLogger
 from loka.walker_suite.outcomes import classify_outcome, has_fallen, pos_x, world_height
-from loka.walker_suite.statistics import metrics_from_log
+from loka.walker_suite.statistics import metrics_from_log, touched_nonfoot_geoms
 from loka.walker_suite.stochastic import trial_seed
 
 
@@ -113,7 +113,11 @@ def run_episode(
     finally:
         print()
         wall = time.perf_counter() - wall0
-        log_metrics = metrics_from_log(logger.rows, speed_goal=params.speed_goal)
+        log_metrics = metrics_from_log(
+            logger.rows,
+            speed_goal=params.speed_goal,
+            t_end=float(runtime.data.time),
+        )
         metadata = {
             "test": test.name,
             "baseline": baseline,
@@ -137,6 +141,7 @@ def run_episode(
             "llm_turn_count": len(runtime.loka_turns),
             "wall_s": wall,
             "fault_injected": injected,
+            "nonfoot_geoms": ",".join(touched_nonfoot_geoms(logger.rows)),
             **log_metrics,
             "dr_rl_policy_path": (
                 str(runtime.policy.policy_path) if baseline == "dr_rl" else None

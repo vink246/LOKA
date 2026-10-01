@@ -15,7 +15,7 @@ from loka.walker_suite.config import DEFAULT_CONFIG_PATH, load_suite_config
 from loka.walker_suite.pipeline import run_pipeline
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the Walker LOKA vs fixed-MJPC vs DR-RL perturbation pipeline.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -69,11 +69,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument(
+        "--trial",
+        type=int,
+        default=None,
+        help="Run only this 0-based trial (seed + trial). Default: every trial.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Write into this directory instead of a new timestamp folder.",
+    )
+    parser.add_argument(
         "--no-record",
         action="store_true",
         help="Skip episode videos (time series are still written).",
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:

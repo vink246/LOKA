@@ -10,6 +10,11 @@ from typing import Any
 import numpy as np
 
 from loka.recording import QposClipSampler, render_qpos_clip
+from loka.walker_suite.forces import (
+    ground_reaction_channels,
+    nonfoot_geom_names,
+    sample_floor_contacts,
+)
 from loka.walker_suite.outcomes import has_fallen, pitch, pos_x, world_height
 
 ACTUATOR_FALLBACK = (
@@ -63,6 +68,7 @@ class EpisodeLogger:
         self.actuator_names = list(actuator_names or ACTUATOR_FALLBACK)
         self.sampler = QposClipSampler(self.record_fps) if self.record else None
         self.rows: list[dict[str, Any]] = []
+        self._nonfoot_names: tuple[str, ...] | None = None
 
     def maybe_log(self, runtime, step) -> None:
         data = runtime.data
@@ -79,6 +85,11 @@ class EpisodeLogger:
         if torque is None:
             torque = data.actuator_force * runtime.model.actuator_gear[:, 0]
         torque = np.asarray(torque, dtype=float)
+        if self._nonfoot_names is None:
+            self._nonfoot_names = nonfoot_geom_names(runtime.model)
+        force, touching = sample_floor_contacts(runtime.model, data)
+        touching_set = set(touching)
+        grf = ground_reaction_channels(force)
         row: dict[str, Any] = {
             "t": float(data.time),
             "pitch": pitch(data),
@@ -89,7 +100,13 @@ class EpisodeLogger:
             "tracking_error": float(step.error),
             "in_failure": int(step.in_failure),
             "fallen": int(has_fallen(data)),
+            "grf_mag": grf["grf_mag"],
+            "grf_vertical": grf["grf_vertical"],
+            "grf_horizontal": grf["grf_horizontal"],
+            "nonfoot_floor": int(bool(touching_set)),
         }
+        for name in self._nonfoot_names:
+            row[f"floor_{name}"] = int(name in touching_set)
         n_act = min(
             len(self.actuator_names),
             qpos.size - 3,

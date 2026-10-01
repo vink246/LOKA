@@ -128,14 +128,19 @@ class DrRlRuntime:
         )
 
     def step(self) -> DrRlStep:
-        if self._policy_hold <= 0:
+        new_command = self._policy_hold <= 0
+        if new_command:
             self._last_action = self.policy.predict(self._obs())
             self._policy_hold = self.frame_skip
         self._policy_hold -= 1
 
         qpos_before = self.data.qpos.copy()
         self.plant.apply_physics(float(self.data.time))
-        self.data.ctrl[:] = self._last_action
+        # Observation still uses the policy's latest action. Latency only
+        # delays the torque command the plant receives.
+        self.data.ctrl[:] = self.plant.delay_command(
+            self._last_action, new_command=new_command
+        )
         mujoco.mj_step(self.model, self.data)
 
         delivered_torque = self.data.actuator_force * self.model.actuator_gear[:, 0]

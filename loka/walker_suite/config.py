@@ -8,7 +8,11 @@ from typing import Any
 
 import yaml
 
-from loka.walker_suite.faults import FORBIDDEN_RAW_KEYS, PERTURBATION_KINDS
+from loka.walker_suite.faults import (
+    FORBIDDEN_RAW_KEYS,
+    PERTURBATION_KINDS,
+    command_delay_steps,
+)
 
 DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "walker_suite.yaml"
@@ -68,6 +72,10 @@ class SuiteConfig:
     init_noise: float = 0.005
     dr_rl_checkpoint: str | None = None
     dr_rl_config: str | None = None
+    # When set, run only this 0-based trial (seed + trial) instead of 0..num_trials-1.
+    trial: int | None = None
+    # When set, write this directory directly instead of output_dir/<timestamp>.
+    run_dir: Path | None = None
     defaults: EpisodeDefaults = field(default_factory=EpisodeDefaults)
     baselines: list[str] = field(default_factory=lambda: ["loka", "fixed_mpc"])
     tests: list[TestCase] = field(default_factory=list)
@@ -75,6 +83,8 @@ class SuiteConfig:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["output_dir"] = str(self.output_dir)
+        if self.run_dir is not None:
+            payload["run_dir"] = str(self.run_dir)
         return payload
 
 
@@ -114,7 +124,15 @@ def _validate_perturbation(raw: dict[str, Any], test_name: str) -> dict[str, Any
         raise ValueError(f"Test '{test_name}' mass perturbation needs mass_frac")
     if kind == "force" and "force_frac" not in raw:
         raise ValueError(f"Test '{test_name}' force perturbation needs force_frac")
-    return dict(raw)
+    cleaned = dict(raw)
+    if kind == "command_latency":
+        try:
+            steps = command_delay_steps(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"Test '{test_name}': {exc}") from exc
+        cleaned["delay_steps"] = steps
+        cleaned.pop("action_buf_len", None)
+    return cleaned
 
 
 def parse_suite_dict(raw: dict[str, Any]) -> SuiteConfig:
@@ -271,6 +289,16 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
     if getattr(args, "dr_rl_config", None):
         dr_rl_config = _optional_str(args.dr_rl_config)
 
+    trial = config.trial
+    if getattr(args, "trial", None) is not None:
+        trial = _as_int(args.trial, "--trial")
+        if trial < 0 or trial >= num_trials:
+            raise ValueError(f"--trial must be in 0..{num_trials - 1}")
+
+    run_dir = config.run_dir
+    if getattr(args, "run_dir", None):
+        run_dir = Path(args.run_dir)
+
     return SuiteConfig(
         output_dir=output_dir,
         record=record,
@@ -284,6 +312,8 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
         init_noise=init_noise,
         dr_rl_checkpoint=dr_rl_checkpoint,
         dr_rl_config=dr_rl_config,
+        trial=trial,
+        run_dir=run_dir,
         defaults=defaults,
         baselines=baselines,
         tests=tests,

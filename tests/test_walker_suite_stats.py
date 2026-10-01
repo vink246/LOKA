@@ -14,7 +14,9 @@ from loka.walker_suite.statistics import (
     aggregate_condition,
     metrics_from_log,
     summarize_run,
+    time_not_fallen,
     time_to_recovery,
+    touched_nonfoot_geoms,
     trajectory_rms,
     write_statistics,
 )
@@ -126,6 +128,7 @@ class MetricTests(unittest.TestCase):
         metrics = metrics_from_log(rows, speed_goal=1.0)
         self.assertAlmostEqual(metrics["rms_height_m"], 0.0)
         self.assertAlmostEqual(metrics["time_to_recovery_s"], 2.0)
+        self.assertAlmostEqual(metrics["time_not_fallen_s"], 3.5)
 
         trials = [
             {"test": "ice", "baseline": "loka", "outcome": "success", "t_end": 10.0, **metrics},
@@ -146,6 +149,13 @@ class MetricTests(unittest.TestCase):
         self.assertAlmostEqual(summary["avg_completion_time_s"], 10.0)
         self.assertAlmostEqual(summary["avg_time_to_recovery_s"], 3.0)
         self.assertAlmostEqual(summary["avg_rms_height_m"], 0.1)
+
+    def test_time_not_fallen_stops_at_the_fall_and_keeps_the_tail(self):
+        times = [0.0, 1.0, 2.0, 3.0]
+        fallen = [0.0, 0.0, 1.0, 1.0]
+        self.assertAlmostEqual(time_not_fallen(times, fallen, t_end=4.0), 2.0)
+        self.assertAlmostEqual(time_not_fallen([0.0, 1.0], [0.0, 0.0], t_end=1.5), 1.5)
+        self.assertAlmostEqual(time_not_fallen([0.2, 1.0], [0.0, 0.0], t_end=1.0), 1.0)
 
     def test_rolling_rms_window(self):
         times = np.array([0.0, 0.1, 0.2, 0.3])
@@ -170,6 +180,12 @@ class PlotTests(unittest.TestCase):
                     failed = np.zeros_like(times)
                     if baseline == "fixed_mpc":
                         failed[10:25] = 1.0
+                    grf = np.full_like(times, 400.0 if baseline == "fixed_mpc" else 280.0)
+                    grf_h = np.full_like(times, 80.0 if baseline == "fixed_mpc" else 20.0)
+                    nonfoot = np.ones_like(times) if baseline == "fixed_mpc" else np.zeros_like(times)
+                    knee = np.array(
+                        [1.0 if baseline == "fixed_mpc" and i >= 10 else 0.0 for i in range(times.size)]
+                    )
                     np.savez_compressed(
                         directory / "timeseries.npz",
                         t=times,
@@ -177,6 +193,10 @@ class PlotTests(unittest.TestCase):
                         vel_x=speed,
                         in_failure=failed,
                         fallen=np.zeros_like(times),
+                        grf_mag=grf,
+                        grf_horizontal=grf_h,
+                        nonfoot_floor=nonfoot,
+                        floor_right_leg=knee,
                     )
                     rows = [
                         {
@@ -185,17 +205,24 @@ class PlotTests(unittest.TestCase):
                             "vel_x": float(v),
                             "in_failure": int(f),
                             "fallen": 0,
+                            "grf_mag": float(g),
+                            "grf_horizontal": float(gh),
+                            "nonfoot_floor": float(nf),
+                            "floor_right_leg": float(k),
                         }
-                        for t, h, v, f in zip(times, height, speed, failed)
+                        for t, h, v, f, g, gh, nf, k in zip(
+                            times, height, speed, failed, grf, grf_h, nonfoot, knee
+                        )
                     ]
-                    metrics = metrics_from_log(rows, speed_goal=1.0)
+                    t_end = 8.0 if baseline == "loka" else 20.0
+                    metrics = metrics_from_log(rows, speed_goal=1.0, t_end=t_end)
                     results.append(
                         {
                             "test": "ice",
                             "baseline": baseline,
                             "trial": trial,
                             "outcome": "success" if baseline == "loka" else "timeout",
-                            "t_end": 8.0 if baseline == "loka" else 20.0,
+                            "t_end": t_end,
                             "speed_goal": 1.0,
                             "episode_dir": str(directory),
                             **metrics,
@@ -208,10 +235,38 @@ class PlotTests(unittest.TestCase):
             self.assertTrue((run / "statistics.csv").is_file())
             self.assertEqual(
                 {path.name for path in paths},
-                {"ice_metrics.png", "ice_rms_over_time.png"},
+                {
+                    "ice_metrics.png",
+                    "ice_rms_over_time.png",
+                    "nonfoot_floor_contacts.png",
+                },
             )
             for path in paths:
                 self.assertGreater(path.stat().st_size, 1000)
+            by_baseline = {
+                row["baseline"]: row for row in stats["conditions"] if row["test"] == "ice"
+            }
+            self.assertAlmostEqual(by_baseline["loka"]["avg_time_not_fallen_s"], 8.0)
+            self.assertAlmostEqual(by_baseline["fixed_mpc"]["avg_time_not_fallen_s"], 20.0)
+            self.assertAlmostEqual(by_baseline["fixed_mpc"]["avg_grf_mag_n"], 400.0)
+            self.assertAlmostEqual(by_baseline["loka"]["avg_grf_mag_n"], 280.0)
+            self.assertAlmostEqual(by_baseline["fixed_mpc"]["avg_grf_horizontal_n"], 80.0)
+            self.assertGreater(
+                by_baseline["fixed_mpc"]["avg_grf_mag_n"],
+                by_baseline["loka"]["avg_grf_mag_n"],
+            )
+            self.assertAlmostEqual(by_baseline["fixed_mpc"]["avg_nonfoot_contact_fraction"], 1.0)
+            self.assertAlmostEqual(by_baseline["loka"]["avg_nonfoot_contact_fraction"], 0.0)
+            self.assertEqual(
+                touched_nonfoot_geoms(
+                    [
+                        {"floor_right_leg": 0, "floor_torso": 0},
+                        {"floor_right_leg": 1, "floor_torso": 0},
+                        {"floor_right_leg": 1, "floor_torso": 1},
+                    ]
+                ),
+                ["right_leg", "torso"],
+            )
 
 
 if __name__ == "__main__":

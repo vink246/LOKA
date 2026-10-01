@@ -18,6 +18,7 @@ from loka.walker_suite.config import (
 )
 from loka.model_state import apply_loka_mutations
 from loka.walker_suite.faults import (
+    CommandDelay,
     PlantFaults,
     assert_belief_isolated,
     plant_friction_geom_ids,
@@ -25,6 +26,13 @@ from loka.walker_suite.faults import (
     sanitize_belief_worldview,
     walker_gravity,
     walker_total_mass,
+)
+from loka.walker_suite.forces import (
+    FOOT_GEOM_NAMES,
+    ground_reaction_channels,
+    ground_reaction_force,
+    sample_floor_contacts,
+    walker_ground_geom_ids,
 )
 from loka.walker_suite.logging import EpisodeLogger
 from loka.walker_suite.outcomes import (
@@ -217,13 +225,57 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.num_trials, 1)
         self.assertEqual(config.seed, 0)
         self.assertAlmostEqual(config.init_noise, 0.005)
-        self.assertIsNone(config.dr_rl_checkpoint)
-        self.assertIsNone(config.dr_rl_config)
+        self.assertEqual(config.dr_rl_checkpoint, "results/dr_rl_gym/best_model.zip")
+        self.assertEqual(config.dr_rl_config, "loka/dr_rl/config_gym.yaml")
         self.assertNotIn("delta_kg", backpack.perturbation)
         ice = next(t for t in config.tests if t.name == "ice")
         self.assertLessEqual(ice.perturbation["mu"], 0.01)
         box = next(t for t in config.tests if t.name == "box")
         self.assertAlmostEqual(box.perturbation["size"][2], 0.30)
+        latency = next(t for t in config.tests if t.name == "command_latency")
+        self.assertEqual(latency.perturbation["kind"], "command_latency")
+        self.assertEqual(latency.perturbation["delay_steps"], 8)
+        self.assertEqual(latency.perturbation_time_s, 2.0)
+
+    def test_command_latency_config(self):
+        config = parse_suite_dict(
+            _minimal_suite_dict(
+                tests=[
+                    {
+                        "name": "lag",
+                        "perturbation": {"kind": "command_latency", "action_buf_len": 8},
+                    }
+                ]
+            )
+        )
+        self.assertEqual(config.tests[0].perturbation["delay_steps"], 8)
+        self.assertNotIn("action_buf_len", config.tests[0].perturbation)
+        with self.assertRaises(ValueError):
+            parse_suite_dict(
+                _minimal_suite_dict(
+                    tests=[
+                        {
+                            "name": "lag",
+                            "perturbation": {"kind": "command_latency"},
+                        }
+                    ]
+                )
+            )
+        with self.assertRaises(ValueError):
+            parse_suite_dict(
+                _minimal_suite_dict(
+                    tests=[
+                        {
+                            "name": "lag",
+                            "perturbation": {
+                                "kind": "command_latency",
+                                "delay_steps": 4,
+                                "action_buf_len": 8,
+                            },
+                        }
+                    ]
+                )
+            )
 
 
 class OutcomeTests(unittest.TestCase):
@@ -367,6 +419,78 @@ class FaultTests(unittest.TestCase):
         self.assertEqual(int(model.geom_conaffinity[box.obstacle_id]), 1)
         plant.clear()
         self.assertAlmostEqual(float(_obstacle_world_pos(model, box.obstacle_id)[2]), -5.0)
+
+    def test_command_latency_delays_ctrl_and_leaves_the_model(self):
+        mujoco, model, data = _load_walker()
+        plant = PlantFaults(model, data)
+        snap_gear = model.actuator_gear[:, 0].copy()
+        snap_mass = model.body_mass.copy()
+        fault = resolve_perturbation(
+            {"kind": "command_latency", "delay_steps": 2}, model
+        )
+        self.assertEqual(fault.delay_steps, 2)
+        plant.activate(fault, 0.0)
+        np.testing.assert_array_equal(model.actuator_gear[:, 0], snap_gear)
+        np.testing.assert_array_equal(model.body_mass, snap_mass)
+
+        applied = []
+        for cmd in (0.2, 0.4, 0.6, 0.8):
+            vector = np.full(model.nu, cmd)
+            applied.append(float(plant.delay_command(vector, new_command=True)[0]))
+            held = plant.delay_command(vector, new_command=False)
+            self.assertAlmostEqual(float(held[0]), applied[-1])
+        self.assertAlmostEqual(applied[0], 0.0)
+        self.assertAlmostEqual(applied[1], 0.0)
+        self.assertAlmostEqual(applied[2], 0.2)
+        self.assertAlmostEqual(applied[3], 0.4)
+
+        passthrough = CommandDelay(model.nu, 0)
+        fresh = np.arange(model.nu, dtype=float)
+        np.testing.assert_allclose(passthrough.push(fresh), fresh)
+
+        plant.clear()
+        self.assertIsNone(plant.command_delay)
+        echoed = plant.delay_command(np.full(model.nu, 0.3), new_command=True)
+        np.testing.assert_allclose(echoed, np.full(model.nu, 0.3))
+
+    def test_ground_reaction_includes_knees_and_torso(self):
+        mujoco, model, data = _load_walker()
+        names = {
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            for geom_id in walker_ground_geom_ids(model)
+        }
+        self.assertIn("right_foot", names)
+        self.assertIn("left_foot", names)
+        self.assertIn("right_leg", names)
+        self.assertIn("left_leg", names)
+        self.assertIn("torso", names)
+        self.assertNotIn("floor", names)
+        self.assertNotIn("obstacle", names)
+
+        for _ in range(800):
+            data.ctrl[:] = 0.0
+            mujoco.mj_step(model, data)
+        touching = set()
+        for i in range(int(data.ncon)):
+            pair = (
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom1),
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom2),
+            )
+            if "floor" in pair:
+                touching.add(pair[0] if pair[1] == "floor" else pair[1])
+        self.assertTrue(
+            touching.intersection({"torso", "right_leg", "left_leg"}),
+            f"expected a non-foot ground contact, got {touching}",
+        )
+        force, nonfoot = sample_floor_contacts(model, data)
+        self.assertTrue(set(nonfoot).intersection({"torso", "right_leg", "left_leg"}))
+        self.assertFalse(set(nonfoot).intersection(FOOT_GEOM_NAMES))
+        np.testing.assert_allclose(force, ground_reaction_force(model, data))
+        channels = ground_reaction_channels(force)
+        weight = walker_total_mass(model) * walker_gravity(model)
+        self.assertAlmostEqual(channels["grf_vertical"], weight, delta=0.15 * weight)
+        self.assertGreaterEqual(channels["grf_mag"], channels["grf_vertical"])
+        self.assertGreaterEqual(channels["grf_mag"], channels["grf_horizontal"])
 
     def test_dead_actuator_zeros_torque_not_mpc_command(self):
         mujoco, model, data = _load_walker()
@@ -693,13 +817,17 @@ class FaultTests(unittest.TestCase):
         for _ in range(250):
             plant.apply_physics(float(data.time))
             mujoco.mj_step(model, data)
-        for i in range(int(data.ncon)):
-            names = (
-                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom1),
-                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom2),
-            )
-            if "obstacle" in names:
-                hits += 1
+            for i in range(int(data.ncon)):
+                names = (
+                    mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom1
+                    ),
+                    mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_GEOM, data.contact[i].geom2
+                    ),
+                )
+                if "obstacle" in names:
+                    hits += 1
         self.assertGreater(hits, 0, "walker should be in contact with the box")
         self.assertLess(float(data.qpos[1]), 4.05, "walker walked through the wall")
 

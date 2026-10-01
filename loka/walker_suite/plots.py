@@ -60,26 +60,40 @@ def _load_curve(episode_dir: Path, speed_goal: float, height_goal: float):
             pitch = np.asarray(blob["pitch"], dtype=float)
         else:
             pitch = np.zeros_like(times)
+        grf_mag = (
+            np.asarray(blob["grf_mag"], dtype=float) if "grf_mag" in blob.files else None
+        )
+        grf_horizontal = (
+            np.asarray(blob["grf_horizontal"], dtype=float)
+            if "grf_horizontal" in blob.files
+            else None
+        )
     if times.size == 0:
         return None
     height_err = height - float(height_goal)
     pitch_err = pitch
     speed_err = speed - float(speed_goal)
     combined = np.sqrt(height_err**2 + pitch_err**2 + speed_err**2)
-    return {
+    curve = {
         "t": times,
         "rms_height": rolling_rms(height_err, times),
         "rms_pitch": rolling_rms(pitch_err, times),
         "rms_speed": rolling_rms(speed_err, times),
         "rms_tracking": rolling_rms(combined, times),
     }
+    if grf_mag is not None and grf_mag.shape == times.shape:
+        curve["grf_mag"] = grf_mag
+    if grf_horizontal is not None and grf_horizontal.shape == times.shape:
+        curve["grf_horizontal"] = grf_horizontal
+    return curve
 
 
 def _mean_on_grid(curves: list[dict[str, np.ndarray]], key: str, grid: np.ndarray):
-    if not curves or grid.size == 0:
+    usable = [curve for curve in curves if key in curve]
+    if not usable or grid.size == 0:
         return np.array([]), np.array([])
     stacked = []
-    for curve in curves:
+    for curve in usable:
         stacked.append(
             np.interp(grid, curve["t"], curve[key], left=np.nan, right=np.nan)
         )
@@ -121,7 +135,7 @@ def _bar_values(condition: dict[str, Any] | None, mean_key: str, std_key: str):
 
 
 def plot_run(run_dir: Path, results: list[dict[str, Any]], stats: dict[str, Any]) -> list[Path]:
-    """Write one metrics bar chart and one RMS line chart per perturbation."""
+    """Write per-perturbation charts plus one suite-wide non-foot contact chart."""
     import matplotlib
 
     matplotlib.use("Agg", force=True)
@@ -143,6 +157,10 @@ def plot_run(run_dir: Path, results: list[dict[str, Any]], stats: dict[str, Any]
         written.append(
             _plot_rms(plt, plot_dir, test, baselines, results, height_goal)
         )
+    if tests and baselines:
+        written.append(
+            _plot_nonfoot_contacts(plt, plot_dir, tests, baselines, conditions)
+        )
     return written
 
 
@@ -152,12 +170,18 @@ def _plot_bars(plt, plot_dir: Path, test: str, baselines: list[str], conditions)
         ("Task completion time", "avg_completion_time_s", "avg_completion_time_std_s", None),
         ("Time to recovery", "avg_time_to_recovery_s", "avg_time_to_recovery_std_s", None),
     )
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.5), constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=(10.5, 11.0), constrained_layout=True)
     flat = axes.ravel()
     x = np.arange(len(baselines))
     colors = [baseline_color(name, i) for i, name in enumerate(baselines)]
+    grf_panels = (
+        ("Mean |GRF| (N)", "avg_grf_mag_n", "avg_grf_mag_std_n", None),
+        ("Time not fallen (s)", "avg_time_not_fallen_s", "avg_time_not_fallen_std_s", None),
+    )
+    simple_axes = (flat[0], flat[1], flat[2], flat[4], flat[5])
+    simple_panels = panels + grf_panels
 
-    for ax, (title, mean_key, std_key, ylim) in zip(flat[:3], panels):
+    for ax, (title, mean_key, std_key, ylim) in zip(simple_axes, simple_panels):
         means = []
         stds = []
         for name in baselines:
@@ -239,13 +263,6 @@ def _plot_rms(
     results: list[dict[str, Any]],
     height_goal: float,
 ) -> Path:
-    fig, axes = plt.subplots(4, 1, figsize=(10.5, 10.5), sharex=True, constrained_layout=True)
-    keys = (
-        ("rms_height", "Height RMS (m)"),
-        ("rms_pitch", "Pitch RMS (rad)"),
-        ("rms_speed", "Speed RMS (m/s)"),
-        ("rms_tracking", "Combined RMS"),
-    )
     grouped: dict[str, list[dict[str, np.ndarray]]] = {name: [] for name in baselines}
     for row in results:
         if row.get("test") != test or row.get("baseline") not in grouped:
@@ -256,6 +273,23 @@ def _plot_rms(
         curve = _load_curve(episode_dir, float(row.get("speed_goal", 1.0)), height_goal)
         if curve is not None:
             grouped[row["baseline"]].append(curve)
+
+    keys = [
+        ("rms_height", "Height RMS (m)"),
+        ("rms_pitch", "Pitch RMS (rad)"),
+        ("rms_speed", "Speed RMS (m/s)"),
+        ("rms_tracking", "Combined RMS"),
+    ]
+    loaded = [curve for curves in grouped.values() for curve in curves]
+    if any("grf_mag" in curve for curve in loaded):
+        keys.append(("grf_mag", "GRF magnitude (N)"))
+    if any("grf_horizontal" in curve for curve in loaded):
+        keys.append(("grf_horizontal", "Horizontal GRF (N)"))
+    fig, axes = plt.subplots(
+        len(keys), 1, figsize=(10.5, 2.6 * len(keys)), sharex=True, constrained_layout=True
+    )
+    if len(keys) == 1:
+        axes = [axes]
 
     t_end = 0.0
     for curves in grouped.values():
@@ -284,8 +318,56 @@ def _plot_rms(
             ax.legend(frameon=False, loc="upper right")
 
     axes[-1].set_xlabel("Time (s)")
-    fig.suptitle(f"{test}  ({ROLLING_WINDOW_S:g} s rolling RMS)")
+    fig.suptitle(
+        f"{test}  (error traces use a {ROLLING_WINDOW_S:g} s rolling RMS)"
+    )
     path = plot_dir / f"{test}_rms_over_time.png"
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return path
+
+
+def _plot_nonfoot_contacts(
+    plt, plot_dir: Path, tests: list[str], baselines: list[str], conditions
+) -> Path:
+    """Every perturbation on one axes. Each baseline is a bar in the group."""
+    fig_w = max(8.0, 1.15 * len(tests) + 0.4 * len(baselines))
+    fig, ax = plt.subplots(figsize=(fig_w, 4.8), constrained_layout=True)
+    x = np.arange(len(tests))
+    width = 0.8 / max(len(baselines), 1)
+    for i, name in enumerate(baselines):
+        means = []
+        stds = []
+        for test in tests:
+            mean, std = _bar_values(
+                conditions.get((test, name)),
+                "avg_nonfoot_contact_fraction",
+                "avg_nonfoot_contact_fraction_std",
+            )
+            means.append(mean)
+            stds.append(std)
+        means_arr = np.asarray(means, dtype=float)
+        stds_arr = np.asarray(stds, dtype=float)
+        stds_arr = np.where(np.isfinite(means_arr), stds_arr, 0.0)
+        offset = (i - (len(baselines) - 1) / 2.0) * width
+        ax.bar(
+            x + offset,
+            means_arr,
+            width=width,
+            label=name,
+            color=baseline_color(name, i),
+            yerr=stds_arr,
+            capsize=3,
+            ecolor="#333333",
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(tests, rotation=20, ha="right")
+    ax.set_ylabel("Fraction of episode")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_title("Non-foot floor contact")
+    ax.legend(frameon=False)
+    ax.grid(True, axis="y", alpha=0.3)
+    path = plot_dir / "nonfoot_floor_contacts.png"
     fig.savefig(path, dpi=120)
     plt.close(fig)
     return path
