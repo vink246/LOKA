@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
+from loka.recording import prepare_offscreen_env
 from loka.walker_suite.plots import plot_run, rolling_rms
 from loka.walker_suite.statistics import (
     HEIGHT_GOAL_M,
@@ -267,6 +269,27 @@ class PlotTests(unittest.TestCase):
                 ),
                 ["right_leg", "torso"],
             )
+
+
+class OffscreenEnvTests(unittest.TestCase):
+    def test_headless_node_uses_osmesa(self):
+        saved = {key: os.environ.get(key) for key in ("MUJOCO_GL", "DISPLAY", "WAYLAND_DISPLAY", "MPLCONFIGDIR", "HOME")}
+        try:
+            os.environ.pop("MUJOCO_GL", None)
+            os.environ.pop("DISPLAY", None)
+            os.environ.pop("WAYLAND_DISPLAY", None)
+            os.environ.pop("MPLCONFIGDIR", None)
+            os.environ["HOME"] = tempfile.gettempdir()
+            backend = prepare_offscreen_env()
+            self.assertEqual(backend, "osmesa")
+            self.assertEqual(os.environ["MUJOCO_GL"], "osmesa")
+            self.assertTrue(os.path.isdir(os.environ["MPLCONFIGDIR"]))
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

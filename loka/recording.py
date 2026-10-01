@@ -168,9 +168,35 @@ def _apply_visual_overlay(mujoco, model, overlay: dict | None, sim_time: float) 
         _apply_ice_overlay(mujoco, model, visible, overlay["ice"]["floor_rgba"])
 
 
+def prepare_offscreen_env() -> str:
+    """Pick a GL backend and a writable Matplotlib config dir.
+
+    A spawned render process imports MuJoCo while loading the suite, and MuJoCo
+    locks its GL backend at import. The choice has to be in the environment
+    before that process starts. CPU nodes have no ``DISPLAY``; EGL needs a GPU,
+    so those nodes use OSMesa.
+    """
+    backend = os.environ.get("MUJOCO_GL", "").strip()
+    if not backend:
+        headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
+        backend = "osmesa" if headless else "egl"
+        os.environ["MUJOCO_GL"] = backend
+
+    config_dir = os.environ.get("MPLCONFIGDIR", "").strip()
+    if not config_dir:
+        home = os.environ.get("HOME") or ""
+        if home and home != "/":
+            config_dir = os.path.join(home, ".cache", "matplotlib")
+        else:
+            config_dir = os.path.join(tempfile.gettempdir(), "matplotlib")
+        os.makedirs(config_dir, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = config_dir
+    return backend
+
+
 def _render_clip_worker(job: dict) -> None:
     """Child-process entry: load model, render buffered qpos, write mp4."""
-    os.environ["MUJOCO_GL"] = "egl"
+    prepare_offscreen_env()
     import mediapy as media_worker
     import mujoco
 
@@ -243,6 +269,7 @@ def render_qpos_clip(
         save_kwargs["times"] = np.asarray(times, dtype=np.float64)
     np.savez_compressed(frames_path, **save_kwargs)
 
+    prepare_offscreen_env()
     job = {
         "model_path": str(model_path),
         "frames_path": frames_path,
