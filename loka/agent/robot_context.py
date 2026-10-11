@@ -60,7 +60,7 @@ def format_primary_objective_block(objective: str) -> str:
     return (
         "PRIMARY OBJECTIVE\n"
         f"{objective.strip()}\n"
-        "All MPC targets and Error_Tracking criteria should serve this objective."
+        "Task targets and listeners should serve this objective."
     )
 
 
@@ -140,7 +140,7 @@ def build_robot_model_context(model, xml_path):
 
     lines.extend([
         "",
-        "Joint / DOF layout (maps to qpos/qvel; use these indices in Error_Tracking):",
+        "Joint / DOF layout (maps to qpos/qvel):",
     ])
     for joint_id in range(model.njnt):
         joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
@@ -164,8 +164,7 @@ def build_robot_model_context(model, xml_path):
     lines.append("")
     lines.append(
         "Note: for slide joints parented under a body with non-zero mjcf_pos, "
-        "world-frame position is often mjcf_pos[axis] + qpos[index]. "
-        "Use Error_Tracking.offset when you need world-frame values."
+        "world-frame position is often mjcf_pos[axis] + qpos[index]."
     )
 
     lines.extend(["", "Actuators (exact lowercase names for Model_Mutations):"])

@@ -3,254 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import numpy as np
 
-from loka.agent.anomaly import assess_stand_anomaly
-from loka.agent.error_spec import ErrorSpec, ErrorTerm
+from loka.agent.loka_config import loka_config
 
+_SESSION = loka_config()["session"]
 #: Seconds of frames summarised in a report.
-TELEMETRY_WINDOW_S = 2.0
-#: Seconds the runtime keeps collecting after an anomaly trips, before it
-#: compresses and hands the window to the model.
-ANOMALY_COLLECTION_S = 1.0
-
-CAPTURE_MARGIN_WARN = 0.02  # m of support left before critical
-SLIP_SPEED = 0.15  # m/s at a loaded contact
-SAT_UTIL = 0.92
-SAT_VEL = 0.05  # rad/s
-
-
-@dataclass(frozen=True)
-class StandTelemetrySections:
-    section_0_state: bool = True
-    section_1_balance: bool = True
-    section_2_motor_load: bool = True
-    section_3_directive: bool = True
-
-
-DEFAULT_SECTIONS = StandTelemetrySections()
+TELEMETRY_WINDOW_S = float(_SESSION["telemetry_window_s"])
 
 
 def _window_frames(buffer: Sequence[dict], control_dt: float) -> list[dict]:
     if not buffer:
         return []
     n = max(1, int(TELEMETRY_WINDOW_S / max(control_dt, 1e-3)))
-    # deques (runtime anomaly/baseline buffers) do not support slicing
+    # recent_frames is a deque and does not support slicing
     frames = list(buffer)
     return frames[-n:]
-
-
-def _mean_term_value(frames: Sequence[dict], term: ErrorTerm) -> float | None:
-    if not frames:
-        return None
-    return float(np.mean([term.read_frame(frame) for frame in frames]))
-
-
-def _term_status(term: ErrorTerm, value: float) -> str:
-    excess = term.excess(value)
-    if excess <= 0.0:
-        return "[NOMINAL]"
-    if excess * term.weight > 0.5:
-        return f"[ERR: {term.name.upper()} CRITICAL]"
-    return f"[ERR: {term.name.upper()} OUT OF BAND]"
-
-
-def format_tracked_state_section(
-    anom_slice: Sequence[dict],
-    nominal_buffer: Sequence[dict],
-    has_baseline: bool,
-    error_spec: ErrorSpec,
-    *,
-    nominal_label: str = "Nominal",
-) -> str:
-    """The Error_Tracking terms, each against its own band and baseline."""
-    if not anom_slice or not error_spec.terms:
-        return ""
-
-    lines = [
-        "0. TRACKED STATE (Error_Tracking terms)",
-        "Values use each term's formula: offset + signal[index].",
-        f"Window = mean over recent {TELEMETRY_WINDOW_S:.1f}s anomaly frames; "
-        "Snapshot = value at trigger instant.",
-    ]
-    if has_baseline:
-        lines.append(
-            f"{nominal_label} = healthy telemetry under the *current* mission "
-            "(re-baselined after Task_Targets / Error_Tracking changes)."
-        )
-    else:
-        lines.append(
-            f"{nominal_label} unavailable (waiting to re-baseline under the "
-            "current mission)."
-        )
-    lines.append("")
-
-    snapshot_frame = anom_slice[-1]
-    for term in error_spec.terms:
-        current = _mean_term_value(anom_slice, term)
-        snap = term.read_frame(snapshot_frame)
-        if current is None:
-            continue
-
-        status = _term_status(term, current)
-        band = (
-            f"mode={term.mode} target={term.target:.3g} "
-            f"tol={term.tolerance:.3g} weight={term.weight:.3g}"
-        )
-        if has_baseline:
-            nominal = _mean_term_value(nominal_buffer, term)
-            if nominal is not None:
-                lines.append(
-                    f"- {term.name}: {nominal_label} {nominal:.3g} | "
-                    f"Current {current:.3g} | Snapshot {snap:.3g}  {status}"
-                )
-                lines.append(f"  ({band})")
-                continue
-
-        lines.append(
-            f"- {term.name}: Current {current:.3g} | Snapshot {snap:.3g}  {status}"
-        )
-        lines.append(f"  ({band})")
-
-    return "\n".join(lines) + "\n\n"
-
-
-def _semantic_tags(frame: dict) -> list[str]:
-    tags: list[str] = []
-    rpy = np.asarray(frame.get("rpy", (0.0, 0.0, 0.0)), dtype=float)
-    com_error = np.asarray(frame.get("com_error", (0.0, 0.0, 0.0)), dtype=float)
-    margin = np.asarray(frame.get("support_margin", (0.08, 0.08, 0.1, 0.1)), dtype=float)
-    contact_vel = float(frame.get("contact_speed_max", 0.0))
-    mask = np.asarray(frame.get("contact_mask", ()), dtype=bool)
-
-    if float(margin[:2].min()) < CAPTURE_MARGIN_WARN:
-        tags.append("[CAPTURE_MARGIN_LOW]")
-    if contact_vel > SLIP_SPEED and mask.any():
-        tags.append("[SLIP]")
-    if abs(rpy[1]) > np.deg2rad(8.0) or com_error[0] > 0.03:
-        tags.append("[LEAN_FORWARD]" if (rpy[1] > 0 or com_error[0] > 0) else "[LEAN_BACK]")
-    if abs(rpy[0]) > np.deg2rad(8.0) or abs(com_error[1]) > 0.03:
-        tags.append("[LEAN_LEFT]" if (rpy[0] < 0 or com_error[1] > 0) else "[LEAN_RIGHT]")
-    if mask.any() and mask.sum() <= 2:
-        tags.append("[SINGLE_SUPPORT_RISK]")
-
-    util = frame.get("joint_util")
-    qvel = frame.get("qvel")
-    if util is not None and qvel is not None:
-        util = np.asarray(util, dtype=float)
-        rates = np.asarray(qvel[6:6 + len(util)], dtype=float)
-        for i, (u, rate) in enumerate(zip(util, rates)):
-            if u >= SAT_UTIL and abs(rate) < SAT_VEL:
-                tags.append(f"[SATURATED_SEIZED:joint{i}]")
-            elif u >= SAT_UTIL and abs(rate) > 1.0:
-                tags.append(f"[SATURATED_FLAILING:joint{i}]")
-    return tags
-
-
-def _force_mismatch(des: np.ndarray, got: np.ndarray) -> float | None:
-    """Net force error, summed per foot when both arrays are the eight sole sites."""
-    if des.shape != got.shape or des.size == 0:
-        return None
-    if des.ndim == 2 and des.shape[0] == 8:
-        err = 0.0
-        for foot in (0, 1):
-            sl = slice(foot * 4, (foot + 1) * 4)
-            err += float(np.linalg.norm(des[sl].sum(axis=0) - got[sl].sum(axis=0)))
-        return err
-    return float(np.linalg.norm(des - got))
-
-
-def format_balance_section(frames: Sequence[dict]) -> str:
-    if not frames:
-        return "1. BALANCE / CONTACTS\n  (no frames)\n"
-    latest = frames[-1]
-    com_err = np.asarray(latest.get("com_error", np.zeros(3)), dtype=float)
-    rpy = np.asarray(latest.get("rpy", np.zeros(3)), dtype=float)
-    margin = np.asarray(latest.get("support_margin", np.zeros(4)), dtype=float)
-    mask = np.asarray(latest.get("contact_mask", ()), dtype=bool)
-    des = np.asarray(latest.get("desired_forces", np.zeros((1, 3))), dtype=float)
-    got = np.asarray(latest.get("contact_forces", np.zeros((1, 3))), dtype=float)
-    force_err = _force_mismatch(des, got)
-    force_text = "n/a" if force_err is None else f"{force_err:.1f} N"
-
-    com_errs = [float(np.linalg.norm(f.get("com_error", np.zeros(3)))) for f in frames]
-    tilts = [float(np.linalg.norm(f.get("rpy", np.zeros(3))[:2])) for f in frames]
-
-    lines = [
-        "1. BALANCE / CONTACTS",
-        f"  CoM error xyz [mm]: {com_err[0]*1e3:+.1f} {com_err[1]*1e3:+.1f} {com_err[2]*1e3:+.1f}"
-        f"  | window mean {np.mean(com_errs)*1e3:.1f} max {np.max(com_errs)*1e3:.1f}",
-        f"  torso rpy [deg]: roll {np.degrees(rpy[0]):+.1f}  pitch {np.degrees(rpy[1]):+.1f}"
-        f"  yaw {np.degrees(rpy[2]):+.1f}  | tip mean {np.degrees(np.mean(tilts)):.1f}",
-        f"  support margin [mm] back/fwd/rightneg/leftpos: "
-        f"{margin[0]*1e3:.0f}/{margin[1]*1e3:.0f}/{margin[2]*1e3:.0f}/{margin[3]*1e3:.0f}",
-        f"  contacts planted: {int(mask.sum())}/8"
-        f"  contact speed max: {float(latest.get('contact_speed_max', 0.0)):.3f} m/s",
-        f"  force tracking ||f*-f||: {force_text}",
-        "  mpc_cost: "
-        + (
-            "n/a"
-            if latest.get("mpc_cost") is None
-            else f"{float(latest.get('mpc_cost')):.3g}"
-        ),
-        f"  qp_fail wbc/mpc: "
-        f"{latest.get('wbc_failures_total', latest.get('wbc_failures', 0))}/"
-        f"{latest.get('mpc_failures_total', latest.get('mpc_failures', 0))}"
-        f" (Δtick {latest.get('wbc_failures', 0)}/{latest.get('mpc_failures', 0)})",
-        f"  command: height={latest.get('cmd_height')} lean_x={latest.get('cmd_lean_x')}"
-        f" lean_y={latest.get('cmd_lean_y')} yaw={latest.get('cmd_yaw')}",
-    ]
-    tags = []
-    for frame in frames[-5:]:
-        tags.extend(_semantic_tags(frame))
-        early = assess_stand_anomaly(frame)
-        tags.extend(early.clues)
-        if frame.get("anomaly_clues"):
-            tags.extend(frame["anomaly_clues"])
-    # unique, preserve order
-    seen: set[str] = set()
-    uniq = []
-    for tag in tags:
-        if tag not in seen:
-            seen.add(tag)
-            uniq.append(tag)
-    if uniq:
-        lines.append("  tags: " + " ".join(uniq))
-    latest_early = assess_stand_anomaly(latest)
-    if latest_early.score > 0:
-        lines.append(
-            f"  early anomaly score: {latest_early.score:.2f} "
-            f"(trigger if sustained ≥ ~0.12)"
-        )
-    lines.append("")
-    return "\n".join(lines)
-
-
-def format_motor_section(frames: Sequence[dict]) -> str:
-    if not frames:
-        return "2. MOTOR LOAD\n  (no frames)\n"
-    latest = frames[-1]
-    torque = np.asarray(latest.get("torque", ()), dtype=float)
-    util = np.asarray(latest.get("joint_util", np.zeros_like(torque)), dtype=float)
-    if torque.size == 0:
-        return "2. MOTOR LOAD\n  (no torque)\n"
-    peak_i = int(np.argmax(np.abs(torque)))
-    lines = [
-        "2. MOTOR LOAD",
-        f"  |tau| mean {float(np.mean(np.abs(torque))):.1f} Nm  "
-        f"peak {float(np.max(np.abs(torque))):.1f} Nm at joint {peak_i}",
-        f"  util mean {float(np.mean(util)):.2f}  peak {float(np.max(util)):.2f}",
-    ]
-    hot = np.flatnonzero(util >= 0.8)
-    if hot.size:
-        lines.append(
-            "  hot joints (util>=0.8): "
-            + ", ".join(f"j{i}:{util[i]:.2f}" for i in hot[:8])
-        )
-    lines.append("")
-    return "\n".join(lines)
 
 
 def _gait_band_line(stack: str = "legacy_dcm") -> str:
@@ -329,18 +98,18 @@ def _progress_lines(latest: dict, qpos: np.ndarray, qvel: np.ndarray) -> list[st
 def format_full_state_section(frames: Sequence[dict]) -> str:
     """Attitude, position, and velocity at the trigger, plus the gait command."""
     if not frames:
-        return "4. FULL STATE\n  (no frames)\n"
+        return "FULL STATE\n  (no frames)\n"
     latest = frames[-1]
     qpos = np.asarray(latest.get("qpos", np.zeros(7)), dtype=float)
     qvel = np.asarray(latest.get("qvel", np.zeros(6)), dtype=float)
     rpy = np.asarray(latest.get("rpy", np.zeros(3)), dtype=float)
     quat = qpos[3:7] if qpos.size >= 7 else np.zeros(4)
     lines = [
-        "4. FULL STATE (snapshot at this invoke)",
+        "FULL STATE (snapshot at this invoke)",
         f"  t={float(latest.get('time', 0.0)):.2f}s",
-        f"  pelvis xyz [m]: {qpos[0]:+.3f} {qpos[1]:+.3f} {qpos[2]:+.3f}",
-        f"  attitude rpy [deg]: {np.degrees(rpy[0]):+.1f} {np.degrees(rpy[1]):+.1f} "
-        f"{np.degrees(rpy[2]):+.1f}",
+        f"  pelvis xyz [m] (x is pitch, y is roll, z is height): {qpos[0]:+.3f} {qpos[1]:+.3f} {qpos[2]:+.3f}",
+        f"  attitude [deg] roll=y pitch=x yaw=heading: {np.degrees(rpy[0]):+.1f} "
+        f"{np.degrees(rpy[1]):+.1f} {np.degrees(rpy[2]):+.1f}",
         f"  quat wxyz: {quat[0]:+.3f} {quat[1]:+.3f} {quat[2]:+.3f} {quat[3]:+.3f}",
         f"  linear vel xyz [m/s]: {qvel[0]:+.3f} {qvel[1]:+.3f} {qvel[2]:+.3f}",
         f"  angular vel xyz [rad/s]: {qvel[3]:+.3f} {qvel[4]:+.3f} {qvel[5]:+.3f}",
@@ -359,48 +128,82 @@ def format_full_state_section(frames: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
+_EFFORT_NOTE = (
+    "Plant bias force minus the belief-model bias force, resolved into actuators through the foot contacts. "
+    "Zero means the believed dynamics match the plant. "
+    "A persistent positive value means the plant outweighs the belief along that joint (mass or COM too low). "
+    "A persistent negative value means the belief overshoots the plant. "
+    "A correct mass or COM edit drives these values to zero; if the sign flips, the last edit went too far. "
+    "|bias| is the sum of the absolute per-actuator values. "
+    "consecutive out of bounds is how many control steps in a row |bias| has stayed above the standing or walking threshold, "
+    "written as the live count over the configured streak length. "
+    "A difference of more than 2 Nm between symmetric left/right actuators indicates an asymmetric payload or COM offset. "
+    "A roll residual is a com y search. A pitch residual is a com x search. Height is a com z search."
+)
+
+
+def format_effort_section(observer) -> str:
+    """Per-actuator effort deviation, largest magnitude first."""
+    lines = ["EFFORT DEVIATION [Nm]", f"  {_EFFORT_NOTE}"]
+    if observer is None or observer.joint_bias is None:
+        lines.append("  (no samples)")
+        return "\n".join(lines) + "\n"
+    bias = np.asarray(observer.joint_bias, dtype=float)
+    names = list(observer.names or tuple(str(i) for i in range(bias.size)))
+    mode = "walking" if observer.is_walking else "standing"
+    threshold = (
+        observer.walk_threshold_nm if observer.is_walking else observer.stand_threshold_nm
+    )
+    lines.append(
+        f"  |bias|={float(np.sum(np.abs(bias))):.2f}  mode={mode}"
+        f"  threshold={threshold:.1f}"
+    )
+    lines.append(
+        f"  consecutive out of bounds: {observer.consecutive_out_of_bounds}"
+        f" / {observer.consecutive_steps}"
+    )
+    ranked = sorted(
+        (
+            (abs(float(bias[i])), float(bias[i]), names[i])
+            for i in range(min(len(names), bias.size))
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    for _magnitude, value, name in ranked:
+        lines.append(f"  {name}: {value:+.2f}")
+    return "\n".join(lines) + "\n"
+
+
+def format_cost_section(observer) -> str:
+    """Per-component MPC state cost, averaged over the observer window."""
+    from loka.agent.anomaly import _COST_NAMES
+
+    lines = ["STATE COST"]
+    if observer is None or observer.avg_cost is None:
+        lines.append("  (no samples)")
+        return "\n".join(lines) + "\n"
+    cost = np.atleast_1d(np.asarray(observer.avg_cost, dtype=float))
+    for index, name in enumerate(_COST_NAMES):
+        value = float(cost[index]) if index < cost.size else 0.0
+        lines.append(f"  {name}: {value:.4g}")
+    return "\n".join(lines) + "\n"
+
+
 def synthesize_stand_telemetry(
-    nominal_baseline: Sequence[dict],
-    anomaly_buffer: Sequence[dict],
+    frames: Sequence[dict],
     *,
     control_dt: float,
-    error_spec: ErrorSpec | None = None,
-    sections: StandTelemetrySections = DEFAULT_SECTIONS,
-    directive: str | None = None,
+    observer=None,
 ) -> str:
-    """Compress recent stand frames into an LLM-facing report."""
-    anom = _window_frames(anomaly_buffer or nominal_baseline, control_dt)
-    if not anom:
+    """Current state, per-actuator effort deviation, and per-component state cost."""
+    window = _window_frames(frames, control_dt)
+    if not window:
         return "No telemetry available.\n"
-
-    blocks: list[str] = []
-    if sections.section_0_state and error_spec is not None:
-        blocks.append(
-            format_tracked_state_section(
-                anom,
-                list(nominal_baseline),
-                bool(nominal_baseline),
-                error_spec,
-                nominal_label="MissionNominal",
-            )
-        )
-    if sections.section_1_balance:
-        blocks.append(format_balance_section(anom))
-    if sections.section_2_motor_load:
-        blocks.append(format_motor_section(anom))
-    blocks.append(format_full_state_section(anom))
-    if sections.section_3_directive:
-        blocks.append(
-            "3. DIRECTIVE\n"
-            + (
-                directive
-                or (
-                    "Update the YAML scratchpad. Task_Targets include height, lean, yaw, "
-                    "and gait.* . Error_Tracking if the success criteria should shift. "
-                    "Model_Mutations for belief (gear, friction, mass, com). "
-                    "Listeners to choose the next wake, with a message. "
-                    "Locked mission directives cannot be edited.\n"
-                )
-            )
-        )
-    return "\n".join(blocks)
+    return "\n".join(
+        [
+            format_full_state_section(window),
+            format_effort_section(observer),
+            format_cost_section(observer),
+        ]
+    )

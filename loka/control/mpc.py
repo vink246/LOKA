@@ -48,7 +48,9 @@ class MPCConfig:
     fz_max: float = 400.0
     #: Diagonal state cost over [roll, pitch, yaw, x, y, z, ωx, ωy, ωz, vx, vy, vz].
     weight_orientation: Sequence[float] = (500.0, 500.0, 300.0)
-    weight_position: Sequence[float] = (120.0, 120.0, 1000.0)
+    #: xy is 0 so a CoM that runs ahead of the plan is not pulled backwards.
+    #: Height stays stiff; forward progress is the velocity reference.
+    weight_position: Sequence[float] = (0.0, 0.0, 1000.0)
     weight_angular_velocity: Sequence[float] = (10.0, 10.0, 10.0)
     weight_linear_velocity: Sequence[float] = (60.0, 60.0, 60.0)
     #: Force-effort weight. Must stay tiny: the forces are O(100 N) so their
@@ -128,6 +130,8 @@ class ConvexMPC:
         self.last_forces = self._gravity_share()
         self._last_horizon = np.tile(self.last_forces, (config.horizon, 1, 1))
         self.cost = 0.0
+        # Weighted squared residual of each state channel, summed over the horizon.
+        self.cost_components = np.zeros(12)
 
     # -- setup ------------------------------------------------------------
 
@@ -445,7 +449,9 @@ class ConvexMPC:
         self.last_forces = forces
         self._last_horizon = horizon_forces
         residual = drift + b_qp @ solution
-        self.cost = float(residual @ (state_w * residual))
+        weighted = state_w * np.square(residual)
+        self.cost = float(np.sum(weighted))
+        self.cost_components = weighted.reshape(n, STATE_DIM).sum(axis=0)[:12].copy()
         return forces
 
 

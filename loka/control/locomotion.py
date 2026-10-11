@@ -537,14 +537,26 @@ class LocomotionController:
                 self.command.com_offset_xy[0] * forward
                 + self.command.com_offset_xy[1] * left
             )
+            # Along the plan's facing, track the ramped speed command. The DCM
+            # rate can point backwards when the plan lags; its lateral part is
+            # the step orbit and has to stay. The opening orbit commands about
+            # 0.25 m/s sideways before the stride exists. The closed loop is
+            # late reversing that, so the first two footholds step right. Hold
+            # the pelvis over the feet until both of those steps are done.
+            lateral = float(np.dot(gait_out.com_vel_ref, left))
+            com_xy = np.asarray(gait_out.com_ref_xy, dtype=float).copy()
+            if self.gait.step_index < 3:
+                lateral = 0.0
+                com_xy = com_xy + float(np.dot(dynamics.com[:2] - com_xy, left)) * left
             com_ref = np.array(
                 [
-                    gait_out.com_ref_xy[0] + lean[0],
-                    gait_out.com_ref_xy[1] + lean[1],
+                    com_xy[0] + lean[0],
+                    com_xy[1] + lean[1],
                     ground_z + height,
                 ]
             )
-            com_vel_ref = np.array([gait_out.com_vel_ref[0], gait_out.com_vel_ref[1], 0.0])
+            travel = float(self.gait.cmd_speed) * forward + lateral * left
+            com_vel_ref = np.array([travel[0], travel[1], 0.0])
             face_yaw = float(gait_out.yaw_ref)
             yaw_rate_ref = float(gait_out.yaw_rate_ref)
         else:

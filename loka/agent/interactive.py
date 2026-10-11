@@ -5,6 +5,7 @@ Rendering of the resulting pushes and masses lives in :mod:`loka.viz`.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -139,9 +140,9 @@ def parse_fault_command(line: str) -> FaultSpec | str | None:
 
     if cmd in {"scale", "weak", "weaken"}:
         # scale [actuator] [fraction]   /   weak [actuator]
-        # scale 0.5 right_knee          /   scale right_knee 0.5
+        # scale 0.75 right_knee         /   scale right_knee 0.75
         actuator = "right_knee"
-        scale = 0.5
+        scale = 0.75
         args = parts[1:]
         if args and not _is_float(args[0]):
             actuator = args[0]
@@ -161,6 +162,23 @@ def parse_fault_command(line: str) -> FaultSpec | str | None:
     return None
 
 
+_GOAL_CMD = re.compile(
+    r"^(?:goal|go\s+to|goto)\s+"
+    r"(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)"
+    r"(?:\s+(-?\d+(?:\.\d+)?))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_goal_command(line: str) -> tuple[float, float, float | None] | None:
+    """Parse ``goal x y`` or ``go to x,y`` into world coordinates and an optional speed."""
+    match = _GOAL_CMD.match(line.strip())
+    if match is None:
+        return None
+    speed = float(match.group(3)) if match.group(3) is not None else None
+    return float(match.group(1)), float(match.group(2)), speed
+
+
 def _is_float(token: str) -> bool:
     try:
         float(token)
@@ -178,17 +196,28 @@ Interactive commands (type then Enter):
                                  dir: forward|back|left|right  or  fx fy
   dead [actuator]                zero actuator (default right_knee)
   scale [actuator] [fraction]    deliver that fraction of nominal torque
-  weak [actuator]                same as scale, default right_knee at 0.5
+  weak [actuator]                same as scale, default right_knee at 0.75
   clear                          restore mass / friction / actuator edits
   help                           this text
+  search mass [body]             unbounded mass search (default torso)
+  search com <x|y|z> [body]      unbounded COM search on one axis
+  search friction [geom]         friction search (default floor)
+  search gear <actuator>         gear search
+  search stop                    cancel the search and restore the belief
+  goal x y [speed]               walk to that world point (also with --no-llm)
+  go to x,y                      same as goal
   <any other text>               locked mission directive (LLM pursues it)
 
 Viewer keys (run_loka and the dashboard MuJoCo window, or the dashboard GUI):
-  2  right knee at 50% torque       3  push forward
+  2  right knee at 75% torque       3  push forward
   4  ice                            5  +5 kg on the left shoulder
   6  +5 kg on the torso             7  +5 kg on the right shoulder
   8  clear plant edits              H  help
-  Repeating 5/6/7 stacks another 5 kg. Repeating 2 stays at 50% (does not halve again).
+  Repeating 5/6/7 stacks another 5 kg. Repeating 2 stays at 75% (does not scale again).
+
+run_loka viewer keys (belief search, not the dashboard):
+  M  search torso mass              X/Y/Z  search torso COM on that axis
+  Searches edit the belief model only. They do not call the orchestrator.
 """
 
 
@@ -226,7 +255,7 @@ def fault_for_keycode(keycode: int) -> FaultSpec | str | None:
         )
     if digit == "2":
         return FaultSpec(
-            "actuator_scale", 0.0, {"actuator": "right_knee", "scale": 0.5}
+            "actuator_scale", 0.0, {"actuator": "right_knee", "scale": 0.75}
         )
     if digit == "3":
         return FaultSpec(
@@ -311,7 +340,7 @@ def commit_fault(sim, viz: FaultVizState, fault: FaultSpec) -> tuple[bool, str]:
         viz.actuator_scales.pop(viz.dead_actuator, None)
     elif backup.kind == "actuator_scale":
         name = str(backup.payload.get("name", "?"))
-        scale = float(backup.payload.get("scale", 0.5))
+        scale = float(backup.payload.get("scale", 0.75))
         viz.actuator_scales[name] = scale
         if viz.dead_actuator == name:
             viz.dead_actuator = None

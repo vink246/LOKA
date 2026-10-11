@@ -9,7 +9,6 @@ import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from loka.agent.error_spec import format_error_spec
 from loka.agent.robot_context import format_primary_objective_block
 from loka.agent.context import format_stand_capabilities_block
 
@@ -24,7 +23,6 @@ def load_stand_system_prompt(
     robot_context: str | None = None,
     objective: str | None = None,
     capabilities: dict | None = None,
-    error_spec=None,
 ) -> str:
     system_prompt = _PROMPT_PATH.read_text(encoding="utf-8").rstrip()
     plant = (
@@ -38,8 +36,6 @@ def load_stand_system_prompt(
         blocks.append(format_primary_objective_block(objective))
     if capabilities:
         blocks.append(format_stand_capabilities_block(capabilities))
-    if error_spec is not None:
-        blocks.append("## CURRENT ERROR TRACKING\n" + format_error_spec(error_spec))
     if robot_context:
         blocks.append(robot_context)
     return "\n\n".join(blocks)
@@ -53,7 +49,7 @@ def stand_llm_worker(api_messages, result_queue) -> None:
         response = client.chat.completions.create(
             model=os.environ.get("LOKA_STAND_MODEL", "gpt-5.4-mini"),
             messages=api_messages,
-            temperature=0.1,
+            # temperature=0.1,
         )
         yaml_text = response.choices[0].message.content or ""
         yaml_text = yaml_text.replace("```yaml", "").replace("```", "").strip()

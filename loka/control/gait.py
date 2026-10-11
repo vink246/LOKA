@@ -214,6 +214,13 @@ STEP_SWING_RATE_MAX = 1.25  # fastest swing clock; v1 only ever shortens a step
 
 #: Extra steps after a stop request before the feet-square test loosens.
 STOP_RELAX_STEPS = 4
+#: Don't enter stand while the heading speed is still above this [m/s], or
+#: while the pelvis sits this far from the foot midpoint [m]. The step orbit
+#: itself is about 0.10 m/s at a boundary, so the bar sits just above that.
+#: Command speed hits zero in about one step; standing before the body has
+#: arrived tips it.
+STOP_SPEED = 0.12
+STOP_OFFSET = 0.06
 
 #: Plant-side go-to-point (``gait.goal_*``). The scheduler re-aims
 #: ``heading`` at the goal and sets ``speed`` every tick, so the orchestrator
@@ -619,6 +626,10 @@ class GaitScheduler:
         # Goal state survives reset(): arriving ends the walk, which resets.
         self._goal_arrived = False
         self._goal_cruise = GOAL_DEFAULT_SPEED
+        self._goal_cmd = None
+        self._goal_point = None
+        # Set by the runtime while |bias| is above the mode threshold.
+        self.block_walk = False
         self._step_qp = QP(
             "step_adjust",
             hessian_pattern=Sparsity.diagonal(5),
@@ -687,6 +698,8 @@ class GaitScheduler:
         cfg = self.config
         if self._stop_requested and self._active:
             return True
+        if self._goal_arrived and float(cfg.goal_active) >= 0.5:
+            return False
         if float(cfg.mode) < MODE_WALK:
             return False
         if float(cfg.mode) == MODE_TREAD:
@@ -715,6 +728,12 @@ class GaitScheduler:
             try:
                 if field_name == "mode":
                     value = parse_gait_mode(raw_value)
+                    if self.block_walk and value >= MODE_WALK:
+                        print(
+                            "     * [WARN] gait.mode=walk ignored: "
+                            "|bias| is above the threshold"
+                        )
+                        continue
                 else:
                     value = float(raw_value)
             except (TypeError, ValueError):
@@ -756,42 +775,76 @@ class GaitScheduler:
             applied["gait.goal_active"] = float(cfg.goal_active)
         if not active:
             self._goal_arrived = False
+            self._goal_point = None
             return
-        if moved or not was_active:
+        point = (round(float(cfg.goal_x), 4), round(float(cfg.goal_y), 4))
+        if (moved or not was_active) and point != self._goal_point:
             self._goal_arrived = False
+            self._goal_point = point
         if "gait.speed" in applied:
             self._goal_cruise = float(applied["gait.speed"])
         elif not was_active:
             speed = float(cfg.speed)
             self._goal_cruise = speed if speed > 1e-4 else GOAL_DEFAULT_SPEED
         if float(cfg.mode) < MODE_WALK and "gait.mode" not in applied:
-            cfg.mode = MODE_WALK
-            applied["gait.mode"] = MODE_WALK
+            if self.block_walk:
+                print(
+                    "     * [WARN] gait.mode=walk ignored: "
+                    "|bias| is above the threshold"
+                )
+            else:
+                cfg.mode = MODE_WALK
+                applied["gait.mode"] = MODE_WALK
 
     def _steer_to_goal(self, com_xy: np.ndarray) -> None:
-        """Write ``heading`` and ``speed`` toward the active goal."""
+        """Aim heading at the goal and command the approach speed.
+
+        ``gait.speed`` stays the cruise the operator set. The approach speed is
+        ``_goal_cmd``. Inside the tolerance the walk stops and the mode becomes
+        stand; the goal stays armed so a later push can walk back.
+        """
         cfg = self.config
         mode = float(cfg.mode)
-        if float(cfg.goal_active) < 0.5 or mode < MODE_WALK or mode == MODE_TREAD:
+        if float(cfg.goal_active) < 0.5 or mode == MODE_TREAD:
+            self._goal_cmd = None
             return
         delta = np.array([float(cfg.goal_x), float(cfg.goal_y)]) - com_xy
         dist = float(np.hypot(delta[0], delta[1]))
         tol = float(cfg.goal_tolerance)
         if self._goal_arrived:
+            if self._active:
+                self._goal_cmd = 0.0
+                self._stop_requested = True
+                return
             if dist < GOAL_REENGAGE * tol:
-                cfg.speed = 0.0
+                self._goal_cmd = 0.0
+                cfg.mode = MODE_STAND
                 return
             self._goal_arrived = False
+            if self.block_walk:
+                self._goal_cmd = 0.0
+                cfg.mode = MODE_STAND
+                return
+            cfg.mode = MODE_WALK
         if dist <= tol:
             self._goal_arrived = True
-            cfg.speed = 0.0
+            self._goal_cmd = 0.0
             cfg.heading = self._stance_yaw()
+            if self._active:
+                self._stop_requested = True
+            else:
+                cfg.mode = MODE_STAND
             return
+        if mode < MODE_WALK:
+            if self.block_walk:
+                self._goal_cmd = 0.0
+                return
+            cfg.mode = MODE_WALK
         if dist > max(GOAL_HEADING_FREEZE, 1.5 * tol):
             bearing = float(np.arctan2(delta[1], delta[0]))
             if abs(wrap_angle(bearing - float(cfg.heading))) > GOAL_HEADING_DEADBAND:
                 cfg.heading = bearing
-        cfg.speed = float(
+        self._goal_cmd = float(
             min(max(GOAL_SLOW_GAIN * (dist - tol), GOAL_MIN_SPEED), self._goal_cruise)
         )
 
@@ -1051,7 +1104,7 @@ class GaitScheduler:
     def _velocity_command(self, dt: float) -> float:
         """Ramped scalar speed [m/s], already cut for heading error and limp."""
         cfg = self.config
-        target = float(cfg.speed)
+        target = float(self._goal_cmd) if self._goal_cmd is not None else float(cfg.speed)
         if cfg.mode == MODE_TREAD or self._stop_requested:
             target = 0.0
         elif cfg.mode == MODE_LIMP:
@@ -1417,6 +1470,14 @@ class GaitScheduler:
         saturated = norm > MAX_DCM_CORRECTION
         if saturated:
             correction *= MAX_DCM_CORRECTION / norm
+        # The opening weight shift is not a sideways step. Lateral capture on
+        # the first two swings walks the second foot out to the right before
+        # the stride is going forward. Keep the forward correction.
+        if int(self._step) < 3:
+            support = self._steps.get(self._step)
+            if support is not None:
+                forward, _ = heading_frame(float(support.yaw))
+                correction = float(np.dot(correction, forward)) * forward
         pos = target.nominal + correction
         # Late-swing only: remaining Bézier time is how far the target may
         # still travel. Early swing keeps the full capture (isolation tests
@@ -1527,7 +1588,6 @@ class GaitScheduler:
     def _begin(self, *, feet_xy: np.ndarray, com_xy: np.ndarray, foot_yaws: np.ndarray) -> None:
         """Seed the plan from the current stance."""
         stance = 1  # right supports first, so the left steps out
-        swing = 1 - stance
         yaw = float(foot_yaws[stance])
         self._com_ref = com_xy.copy()
         self._com_vel_ref = np.zeros(2)
@@ -1536,10 +1596,12 @@ class GaitScheduler:
         self._swing = SwingState()
         self._initial_feet = feet_xy.copy()
         self._initial_yaws = np.asarray(foot_yaws, dtype=float).reshape(2).copy()
-        # Opening contact is still both feet. The DCM ZMP slides from the
-        # midpoint onto the upcoming swing-foot inset (APA); the stored
-        # footstep is the stance so the chain after it is coherent.
+        # Opening contact is still both feet. The DCM ZMP sits on the upcoming
+        # swing-foot inset (APA). A midpoint ZMP never loads the orbit; a
+        # stance-foot ZMP reverses the first lift. The stored footstep is the
+        # stance so the chain after it is coherent.
         left = heading_frame(yaw)[1]
+        swing = 1 - stance
         swing_inset = feet_xy[swing] - _side(swing) * ZMP_INSET * left
         self._opening_zmp = swing_inset
         self._steps = {
@@ -1558,8 +1620,16 @@ class GaitScheduler:
         self._stop_extra = 0
         self._latch_step_params(exact=True)
 
-    def _may_stop(self, *, t_step: float) -> bool:
-        """True once halting would leave the feet square and level.
+    def _may_stop(
+        self,
+        *,
+        com_xy: np.ndarray,
+        feet_xy: np.ndarray,
+        feet: np.ndarray,
+        ground_z: float,
+        measured_mask: np.ndarray,
+    ) -> bool:
+        """True once halting would leave the feet square and the body over them.
 
         Called only at a step boundary, so stopping always completes the step
         in progress rather than freezing a leg in mid-air.
@@ -1567,6 +1637,15 @@ class GaitScheduler:
         if float(self.config.mode) == MODE_TREAD and not self._stop_requested:
             return False
         if self._cmd_speed > 1e-3:
+            return False
+        # Command speed is not the body's speed. The lateral part of this
+        # reading is the step orbit, so only the heading component has to be
+        # gone. A shortened foothold can still leave the pelvis ahead of the
+        # feet, or behind them once the body has started back.
+        if self._stop_requested and (
+            abs(float(self._meas_speed)) > STOP_SPEED
+            or float(np.linalg.norm(com_xy - feet_xy.mean(axis=0))) > STOP_OFFSET
+        ):
             return False
         here = self._steps.get(self._step)
         nxt = self._steps.get(self._step + 1)
@@ -1581,11 +1660,25 @@ class GaitScheduler:
         forward, _ = heading_frame(float(here.yaw))
         stride_ok = abs(float(np.dot(nxt.pos - here.pos, forward))) < stride_tol
         yaw_ok = abs(wrap_angle(float(nxt.yaw) - float(here.yaw))) < yaw_tol
-        if stride_ok and yaw_ok:
+        if stride_ok and yaw_ok and self._stance_planted(feet, ground_z, measured_mask):
             return True
         if self._stop_requested:
             self._stop_extra += 1
         return False
+
+    def _stance_planted(self, feet, ground_z, measured_mask) -> bool:
+        """Both soles down, and the lateral gap at least the stance width."""
+        feet = np.asarray(feet, dtype=float).reshape(2, 3)
+        mask = np.asarray(measured_mask, dtype=bool).reshape(-1)
+        for leg, rows in ((0, slice(0, 4)), (1, slice(4, 8))):
+            if float(feet[leg, 2] - ground_z) > TOUCHDOWN_HEIGHT:
+                return False
+            if mask.size >= 8 and not mask[rows].any():
+                return False
+        _, left = heading_frame(self._stance_yaw())
+        gap = abs(float(np.dot(feet[0, :2] - feet[1, :2], left)))
+        width = float(self._width if self._latch_valid else self.config.stance_width)
+        return gap + 1e-4 >= width
 
     def _stand_output(self, measured_mask: np.ndarray, feet_xy: np.ndarray) -> GaitOutput:
         mask = np.asarray(measured_mask, dtype=bool).copy()
@@ -1679,10 +1772,15 @@ class GaitScheduler:
             self._tau = span
         if self._tau >= span:
             support = self._steps.get(self._step)
+            foot_down = (
+                True
+                if support is None or support.initial
+                else self._swing_foot_down(feet, ground_z, measured_mask)
+            )
             waiting = (
                 support is not None
                 and not support.initial
-                and not self._swing_foot_down(feet, ground_z, measured_mask)
+                and not foot_down
                 and self._touchdown_hold < MAX_TOUCHDOWN_HOLD
             )
             if waiting:
@@ -1698,7 +1796,15 @@ class GaitScheduler:
                 # next nominal, not leave a ZMP in the air.
                 cleared = self._swing_cleared
                 self._swing_cleared = False
-                if self._may_stop(t_step=t_step):
+                # A touchdown timeout leaves the swing foot in the air.
+                # Standing then treats that foot as support.
+                if foot_down and self._may_stop(
+                    com_xy=com_xy,
+                    feet_xy=feet_xy,
+                    feet=feet,
+                    ground_z=ground_z,
+                    measured_mask=measured_mask,
+                ):
                     yaw = self._stance_yaw()
                     self.reset()
                     self._stand_yaw = yaw

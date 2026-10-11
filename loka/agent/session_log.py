@@ -16,6 +16,14 @@ SESSION_LOG_NAME = "session.log"
 SESSION_JSONL_NAME = "session.jsonl"
 
 
+def _log_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Drop the system prompt, which also carries the robot model reference."""
+    if message.get("role") == "system":
+        size = len(str(message.get("content") or ""))
+        return {"role": "system", "content": f"(omitted, {size} chars)"}
+    return message
+
+
 def default_log_dir(log_dir: Path | None = None) -> Path:
     root = Path(log_dir) if log_dir is not None else DEFAULT_LOG_DIR
     root.mkdir(parents=True, exist_ok=True)
@@ -85,25 +93,29 @@ class StandSessionLog:
         reason: str,
         user_content: str,
         system_prompt: str | None = None,
+        messages: list | None = None,
     ) -> None:
-        body = (
-            f"reason: {reason}\n\n"
-            f"--- USER TURN (compressor + context sent to LLM) ---\n"
-            f"{user_content.rstrip()}\n"
-        )
-        if system_prompt:
-            body += (
-                f"\n--- SYSTEM PROMPT ({len(system_prompt)} chars; truncated in .log) ---\n"
-                f"{system_prompt[:2000]}{'…' if len(system_prompt) > 2000 else ''}\n"
-            )
-        self.event("DISPATCH", body, sim_time=sim_time)
+        """Log the user turn. The system prompt and robot model reference are not written."""
+        sent = list(messages) if messages else []
+        if not sent:
+            if system_prompt:
+                sent.append({"role": "system", "content": system_prompt})
+            sent.append({"role": "user", "content": user_content})
+        logged = [_log_message(message) for message in sent]
+        parts = [f"reason: {reason}", ""]
+        for index, message in enumerate(logged):
+            role = message.get("role", "?")
+            content = str(message.get("content") or "")
+            parts.append(f"--- MESSAGE {index} role={role} ({len(content)} chars) ---")
+            parts.append(content.rstrip())
+            parts.append("")
+        self.event("DISPATCH", "\n".join(parts), sim_time=sim_time)
         self._jsonl(
             {
                 "kind": "dispatch",
                 "sim_time": sim_time,
                 "reason": reason,
-                "user_content": user_content,
-                "system_prompt": system_prompt,
+                "messages": logged,
                 "wall_utc": datetime.now(timezone.utc).isoformat(),
             }
         )
