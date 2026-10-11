@@ -219,3 +219,16 @@ __marimo__/
 
 #MuJoCo
 MUJOCO_LOG.TXT
+
+# Local run outputs (sessions, benches, videos, trained checkpoints)
+/logs/
+/recordings/
+/results/
+/temp_docs/
+
+# LaTeX editor sync data. The paper source and the committed PDF stay tracked.
+*.synctex.gz
+*.synctex\(busy\)
+
+# Windows alternate-data-stream sidecars copied onto WSL
+*:Zone.Identifier
