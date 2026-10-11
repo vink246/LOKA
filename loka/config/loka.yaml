@@ -38,5 +38,5 @@ session:
   cooldown_s: 2.0
   heartbeat_s: 15.0
   telemetry_window_s: 2.0
-  max_turns: 5
-  max_memory: 5
+  max_turns: 6
+  max_memory: 3
