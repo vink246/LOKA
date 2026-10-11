@@ -6,7 +6,17 @@ dependencies:
   - python=3.10
   - pip
   - pip:
-      # Core sim (unitree_sdk2_python is installed separately from source)
       - mujoco>=3.2
       - numpy>=1.24
-      - pygame>=2.5
+      - scipy>=1.10
+      - pyyaml>=6.0
+      # QP solver behind both control layers. osqp>=1.0 is required: the
+      # controller reads result.info.status_val to reject infeasible solves.
+      - osqp>=1.1
+      - pytest>=7.4
+      # Manual tuning dashboard (python -m loka.dashboard).
+      - dearpygui>=1.11
+      # The orchestrator (python -m loka.run_loka) only. Everything else in
+      # the repo runs without an API key.
+      - openai>=1.30
+      - python-dotenv>=1.0

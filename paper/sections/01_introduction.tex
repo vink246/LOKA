@@ -1,28 +1,29 @@
 \section{Introduction}
 \label{sec:introduction}
 
-The pursuit of artificial general intelligence within the physical realm has catalyzed a transition from narrow control loops to broad, multi-modal generalist policies.
-At the forefront of this evolution is the integration of foundation models into robotic control architectures.
-However, recent evaluations reveal that current VLMs' physical reasoning skills remain prone to causal hallucination and tracking drift~\cite{PhysionGap}.
-Safely translating high-level cognitive reasoning into the continuous, high-frequency control signals required for dynamically balancing underactuated humanoids remains a formidable engineering challenge.
+Humanoid robots are dynamically unstable and underactuated: balance lives on a timescale of tens of milliseconds, while foundation-model inference lives on a timescale of seconds.
+Safely coupling language-level reasoning to locomotion therefore cannot mean putting an LLM in the torque loop.
+Yet discrete, unmodeled events---a payload shift, an ice patch, a seized actuator---and sparse operator requests (``crouch and limp left'') routinely exceed what a fixed MPC cost schedule or an offline Domain-Randomization (DR) policy was prepared for~\cite{TobinDR}.
 
-Current paradigms attempting to bridge this gap exhibit severe shortcomings.
-Monolithic Vision-Language-Action (VLA) models map perception directly to actions, yet they struggle to generalize behavior compositionally and fail when confronted with novel combinations of familiar skills, making them highly prone to compounding errors during long-horizon execution~\cite{OpenVLA, ACT_VLA}.
-Conversely, traditional trajectory optimization and Model Predictive Control (MPC) yield precise execution and constraint satisfaction over short horizons, but they are inherently rigid and lack global semantic awareness~\cite{MPC_Rigidity}.
-When an out-of-distribution physical shift occurs during live deployment, standard controllers fail to re-plan appropriately because their internal models are mathematically blind to the structural modification.
+Existing paradigms leave a characteristic gap.
+Vision-Language-Action (VLA) models map perception to actions but struggle with compositional generalization and long-horizon compounding error~\cite{OpenVLA, ACT_VLA}.
+Unsupervised and language-guided \emph{skill discovery} (DIAYN, LSD, LGSD) builds diverse behavioral repertoires offline~\cite{DIAYN, LSD, LGSD}; Eureka-style systems search over reward \emph{code} before reinforcement learning~\cite{Eureka, Lang2Reward}.
+These lines excel at repertoire learning, not at mid-flight surgical retuning of a certified balancer.
+Hierarchical and capture-point MPC stacks push recovery impulse and step timing to the state of the art~\cite{HierarchicalPushMPC, ALIPWalkMPC}, but they do not natively interpret operator language or rewrite mission success criteria when the body itself changes.
+Code-as-policy LLM loops~\cite{Lang2Reward, Eureka} are expressive yet latently and syntactically unsafe for bipeds: a single invalid program in the catch window is catastrophic~\cite{CodeAsPolicyBrittleness}.
 
-To handle these variations, state-of-the-art systems rely heavily on Domain Randomization (DR)~\cite{TobinDR}.
-DR is an offline robustification technique.
-While it accommodates bounded Gaussian noise in simulation, it cannot dynamically isolate and adapt to discrete, unmodeled physical variations during runtime.
-Recent online integration efforts utilize foundation models to synthesize reward functions via code generation~\cite{Lang2Reward}.
-Yet, even if code generation is moved outside the synchronous control loop to mitigate latency, the code-as-policy paradigm remains inherently brittle; ensuring syntactic and mathematical correctness without catastrophic failure remains a critical vulnerability~\cite{CodeAsPolicyBrittleness}.
+\paragraph{Positioning.}
+We introduce \textbf{LOKA}---LLM-Orchestrated Kinematic Adaptation---as an \emph{online immune system} for certified humanoid locomotion controllers.
+The fast plant (reduced-order MPC, whole-body QP, and optional classical reflexes) never waits on the language model.
+The LLM is a slow system-identification and mission layer: it compresses proprioceptive anomalies into semantic tags and emits a typed YAML scratchpad that mutates allowlisted impedance and friction knobs, task and gait setpoints, \texttt{Error\_Tracking} success criteria, and a private MuJoCo \emph{belief} model distinct from the hidden plant.
+Millisecond recovery remains classical; LOKA is evaluated on post-event adaptation quality, operator mission retargeting, and cessation of unproductive retuning when residuals plateau.
+Relative to skill discovery, LOKA does not learn latent skills \(\pi(a{\mid}s,z)\); relative to hierarchical MPC, it does not claim larger recoverable impulses; relative to code-as-policy, it forbids free-form programs in the balance loop.
 
-To resolve the latency-stability paradox, this paper introduces LLM-Orchestrated Kinematic Adaptation (LOKA).
-LOKA moves the field away from high-latency code synthesis and toward real-time parameter and structural model mutation.
-The key contributions of this research are:
+The key contributions are:
 \begin{itemize}
-\item \textbf{Effort-Driven Telemetry Compression:} An intermediate middleware node that continuously monitors actuator torque deficits, energy gradients, and mission error criteria.
-It delta-masks nominal behavior and synthesizes complex physical anomalies into compressed semantic strings, triggering the cognitive model before tracking errors lead to collapse.
-\item \textbf{Asynchronous Dual-Rate Execution:} A hardware-capable architecture that completely isolates the high-frequency physical execution loop from the low-frequency inference time of the language model using thread-safe background processing queues.
-\item \textbf{Dynamic Kinematic Malleability:} A structured YAML scratchpad interface that enables the language model to act as a real-time system identification engine, granting it direct authority to mutate cost weights, planner numerics, task goals, success criteria, and the active controller's physical self-awareness on the fly.
+\item \textbf{Dual-rate immune contract:} A hardware-capable architecture that isolates high-frequency physical execution from LLM inference, with an explicit rule that anything required in ${<}300\,\mathrm{ms}$ cannot wait on language.
+\item \textbf{Typed plant$\neq$belief adaptation:} A YAML scratchpad that mutates costs, gait policy, tasks, mission criteria, and kinematic belief---never code---through hard allowlists and affordance clamps suited to underactuated bipeds.
+\item \textbf{Semantic telemetry compression:} Effort, contact, force-tracking, and mission excess compressed into tags that trigger multi-turn failure episodes without privileged fault labels.
+\item \textbf{Residual intelligence:} Intervention caps and plateau detection that accept a stable mismatch as a new operating point (lean, belief, re-baselined mission nominal) rather than thrashing gains.
+\item \textbf{Framework shape:} A plant-agnostic orchestrator intended to harden \emph{any} locomotion stack exposing torque control, a typed parameter surface, and telemetry---with a Unitree~G1 stand/walk reference implementation.
 \end{itemize}

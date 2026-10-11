@@ -39,18 +39,17 @@ sehoonha@gatech.edu}
 \maketitle
 
 \begin{abstract}
-Translating the semantic reasoning capabilities of foundation models into the high-frequency control signals required for robotic systems remains a critical challenge.
-Existing paradigms face significant architectural barriers: monolithic Vision-Language-Action (VLA) models struggle to adapt to novel task combinations in long-horizon domains; offline Domain Randomization (DR) leaves a persistent deployment gap under unexpected physical alterations; and autoregressive Large Language Model (LLM) code-generation frameworks introduce latencies that are fatal to dynamic bipedal balancing.
-This paper introduces LLM-Orchestrated Kinematic Adaptation (LOKA), a hybrid neuro-symbolic control architecture for real-time humanoid stabilization and gait discovery.
-LOKA decouples low-frequency semantic reasoning from high-frequency physical optimization through an asynchronous dual-rate execution engine.
-An intermediate Telemetry Compressor monitors motor effort and mission criteria, filtering raw high-frequency data into dense semantic trend tags.
-Upon detecting internal or environmental anomalies or an operator language request, a language model acts as an online system-identification engine via a structured YAML scratchpad.
-Rather than generating high-latency policy code, the orchestrator mutates the objective landscape, task targets, success criteria, and kinematic assumptions referenced by an active Model Predictive Controller (MPC).
-By bridging qualitative inference with quantitative optimal control, LOKA targets zero-shot physical adaptation under structural degradation and extreme environmental transitions.
+Foundation models reason fluently about missions and failures; humanoid balance does not tolerate their latency.
+Domain randomization and offline skill discovery build broad policies, yet struggle to isolate discrete mid-mission faults or accept operator language as a change to objectives and success criteria.
+Code-as-policy LLM loops are too slow---and brittle---for underactuated bipeds.
+We present \textbf{LOKA} (LLM-Orchestrated Kinematic Adaptation), a dual-rate \emph{immune architecture} for humanoid locomotion: a certified fast plant (centroidal MPC, whole-body quadratic control, and classical reflexes) owns millisecond survival, while a language model acts as a slow, auditable adapter that rewrites the plant's objective landscape, gait policy, physical self-belief, and mission criteria through typed interfaces.
+Streaming proprioception is compressed into semantic tags; multi-turn episodes diagnose unmodeled change without privileged fault labels; interventions are improvement-gated and capped so stable residuals become new operating points rather than endless retuning.
+LOKA does not invent footholds or compete with hierarchical push-recovery MPC on impulse magnitude; it targets \emph{mission continuity under discrete change}---payload, friction, actuator loss, and operator intent---where offline skill libraries and free-form code generation are poorly matched.
+The same immune loop is framed as a plant-agnostic framework via typed adapters, with a Unitree~G1 stand/walk stack as the reference embodiment.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Vision-Language Models, Embodied AI, Kinematic Adaptation, Model Predictive Control, Humanoid Robotics
+Humanoid Locomotion, Model Predictive Control, Large Language Models, Online Adaptation, Fault Recovery, Immune Architecture
 \end{IEEEkeywords}
 
 \input{sections/01_introduction}

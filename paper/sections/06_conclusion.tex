@@ -1,6 +1,6 @@
 \section{Conclusion}
 \label{sec:conclusion}
 
-LOKA couples an LLM semantic orchestrator with MuJoCo MPC to adapt costs, planner settings, task goals, mission criteria, and internal-model belief under faults and operator intent.
-By compressing telemetry, isolating inference on a slow thread, and requiring multi-turn hypothesis revision through a typed YAML interface, LOKA aims to make adaptive locomotion both interpretable and operator-addressable---without the latency and brittleness of online code generation.
-Future work includes completing the evaluation matrix, multi-embodiment tasks, stronger verification of proposed mutations, closed-loop hardware trials, and richer dynamics-parameter identification within the same orchestration loop.
+LOKA couples an LLM semantic orchestrator with a certified humanoid locomotion plant to adapt costs, gait policy, task goals, mission criteria, and internal-model belief under faults and operator intent---without placing language models in the millisecond catch path.
+By compressing telemetry, isolating inference on a slow thread, gating unproductive retuning, and requiring multi-turn hypothesis revision through a typed YAML interface, LOKA aims to make adaptive locomotion both interpretable and operator-addressable, and theoretically more robust than code-as-policy solutions for underactuated bipeds.
+Future work includes classical reflex catalogs with immune memory promotion, multi-embodiment adapters, stronger verification of proposed mutations, closed-loop hardware trials, and richer dynamics-parameter identification within the same orchestration loop.

@@ -60,3 +60,18 @@ For manipulation, the IROSA framework maps user prompts to the operational param
 
 To handle complex contact profiles, the CompliantVLA-adaptor and GenCHiP frameworks inject language-derived force compliance, variable impedance values, and compliance boundaries directly into manipulation matrices to ensure safety during physical interaction~\cite{CompliantVLA, GenCHiP}.
 LOKA generalizes this mapping philosophy to the full-body locomotion of underactuated bipeds, utilizing a structured YAML configuration block to map semantic objectives directly into high-degree-of-freedom tracking priorities.
+Unlike SayTap's contact-matrix interface for quadrupeds~\cite{SayTap}, LOKA exposes \emph{high-level} gait policy knobs (mode, speed, cadence, swing height, heading) while classical capture-point / Raibert logic retains foothold geometry---keeping the QP well-posed.
+
+\subsection{Skill Discovery, Hierarchical MPC, and Where LOKA Competes}
+\label{sec:related-skills}
+
+Unsupervised skill discovery maximizes mutual information or state-space coverage to learn latent skills without task rewards~\cite{DIAYN, LSD, CSD}.
+Language Guided Skill Discovery (LGSD) further steers semantic diversity of the repertoire via LLM prompts~\cite{LGSD}.
+Eureka and related systems evolve reward \emph{code} offline before RL~\cite{Eureka, DrEureka}.
+These methods address \emph{what behaviors exist}; LOKA addresses \emph{how a certified plant continues a mission after a discrete mid-flight change}.
+We deliberately avoid the ``skill discovery'' label for adaptation memory: stored objects are fault-class$\rightarrow$parameter bundles, not $\pi(a{\mid}s,z)$.
+
+On the control side, hierarchical MPC adapts gait frequency and step timing for push recovery and robust walking~\cite{HierarchicalPushMPC, ALIPWalkMPC}, and RL-augmented MPC improves agility~\cite{RLaugmentedMPC}.
+LOKA is complementary: it does not replace step adjustment in the catch window.
+Its comparative advantage appears when (i)~the plant survives but the \emph{mission} fails without retuning (asymmetric payload, operator crouch/limp), (ii)~discrete hardware faults require symbolic belief and limp gait policy after a classical sat-disable / slip reflex, and (iii)~repeat fault classes should need fewer orchestrator turns via immune memory.
+VLM agents with modular skill libraries~\cite{Being0, UniHSI} target long-horizon household interaction; LOKA targets the locomotion immune layer beneath such planners.
