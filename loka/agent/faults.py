@@ -77,7 +77,7 @@ def apply_plant_fault(model: mujoco.MjModel, fault: FaultSpec) -> _FaultBackup |
                     "name": name,
                 },
             )
-        scale = float(p.get("scale", 0.5))
+        scale = float(p.get("scale", 0.75))
         applied = previous_gear * scale
         model.actuator_gear[act_id, 0] = applied
         # Motor torque is gear * ctrl, so this is the fraction of the torque

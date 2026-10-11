@@ -9,9 +9,27 @@ from loka.control.locomotion import LocomotionController
 from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
 from loka.agent.compress import synthesize_stand_telemetry
-from loka.agent.error_defaults import default_stand_error_spec
 from loka.agent.faults import FaultSpec, apply_plant_fault, clear_plant_faults
 from loka.agent.runtime import LokaConfig, LokaRuntime
+
+
+def test_lowercase_scratchpad_sections_are_accepted():
+    controller = LocomotionController()
+    loka_state = {
+        "mutations": [],
+        "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
+    }
+    scratchpad = {
+        "semantic_state": {
+            "hypothesis": "torso_link com y",
+            "analysis": "waist_roll dominates",
+        },
+        "belief_searches": [{"kind": "com", "name": "torso_link", "axis": "y"}],
+    }
+    summary = apply_stand_scratchpad(controller, scratchpad, loka_state)
+    assert summary["ok"] is True
+    assert scratchpad["Semantic_State"]["Hypothesis"] == "torso_link com y"
+    assert scratchpad["Belief_Searches"][0]["axis"] == "y"
 
 
 def test_lean_and_height_are_clamped():
@@ -30,7 +48,6 @@ def test_apply_scratchpad_task_and_weights():
     loka_state = {
         "mutations": [],
         "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
-        "error_spec": default_stand_error_spec(),
     }
     scratchpad = {
         "Semantic_State": {
@@ -97,109 +114,18 @@ def test_apply_locks_robot_tuned_mpc_weights():
     assert "wbc.kp_base_position" in summary["controller_targets"]
 
 
-def test_walk_scratchpad_drops_world_origin_drift():
-    """A go-to must not keep the standing 'stay at world y = 0' test."""
-    from loka.agent.error_spec import ErrorTerm, get_tracking_error
-
-    controller = LocomotionController()
-    loka_state = {
-        "mutations": [],
-        "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
-        "error_spec": default_stand_error_spec(),
-    }
-    stand = default_stand_error_spec()
-    # A term aimed at the goal y is a real criterion and stays.
-    stand.terms.append(
-        ErrorTerm(
-            name="goal_y",
-            signal="qpos",
-            index=1,
-            mode="abs_deviation",
-            target=4.0,
-            tolerance=0.25,
-            weight=1.0,
-        )
-    )
-    scratchpad = {
-        "Semantic_State": {"Hypothesis": "go to 4,4", "Analysis": "walk"},
-        "Task_Targets": {
-            "gait.mode": "walk",
-            "gait.speed": 0.2,
-            "gait.goal_x": 4.0,
-            "gait.goal_y": 4.0,
-        },
-        "Error_Tracking": stand.to_dict(),
-    }
-    apply_stand_scratchpad(controller, scratchpad, loka_state)
-    spec = loka_state["error_spec"]
-    names = [term.name for term in spec.terms]
-    assert "lateral_drift" not in names
-    assert "forward_drift" not in names
-    assert "heading_error" in names
-    assert "cross_track" in names
-    assert "pelvis_height" in names
-    assert "goal_y" in names
-    assert loka_state["error_spec_owner"] == "loka"
-    # At the goal, world y is 4 m. The standing lateral_drift term (target 0,
-    # tol 0.15) would already be past the 0.25 trigger. Heading and
-    # cross-track from the logged turn are inside the walk bands.
-
-    class _Data:
-        qpos = np.array([4.0, 4.0, 0.78])
-        qvel = np.zeros(6)
-
-    frame = {"heading_error": 0.0, "cross_track": 0.01}
-    assert get_tracking_error(_Data(), spec, frame) < spec.trigger_threshold
-
-
-def test_walk_transition_drops_origin_drift_owned_by_loka():
-    sim = Simulation()
-    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
-    runtime.loka_state["error_spec_owner"] = "loka"
-    runtime.loka_state["error_spec"] = default_stand_error_spec()
-    runtime._was_walking = False
-    runtime._sync_gait_mission(1.0, True)
-    names = [term.name for term in runtime.loka_state["error_spec"].terms]
-    assert "lateral_drift" not in names
-    assert "forward_drift" not in names
-    assert "heading_error" in names
-    assert "cross_track" in names
-    assert "pelvis_height" in names
-    assert runtime.loka_state["error_spec_owner"] == "loka"
-
-
-def test_stand_scratchpad_keeps_origin_drift():
-    controller = LocomotionController()
-    loka_state = {
-        "mutations": [],
-        "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
-        "error_spec": default_stand_error_spec(),
-    }
-    scratchpad = {
-        "Semantic_State": {"Hypothesis": "stand", "Analysis": "hold"},
-        "Error_Tracking": default_stand_error_spec().to_dict(),
-    }
-    apply_stand_scratchpad(controller, scratchpad, loka_state)
-    names = [term.name for term in loka_state["error_spec"].terms]
-    assert "lateral_drift" in names
-    assert "forward_drift" in names
-    assert "heading_error" not in names
-
-
-def test_compressor_emits_balance_section():
+def test_compressor_emits_state_effort_and_cost():
     sim = Simulation()
     runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
     for _ in range(50):
         runtime.step()
     text = synthesize_stand_telemetry(
-        runtime.nominal_baseline,
-        list(runtime.nominal_baseline),
+        runtime.recent_frames,
         control_dt=sim.config.control_dt,
-        error_spec=runtime.loka_state["error_spec"],
     )
-    assert "BALANCE" in text
-    assert "MOTOR LOAD" in text
-    assert "DIRECTIVE" in text
+    assert "FULL STATE" in text
+    assert "EFFORT DEVIATION" in text
+    assert "STATE COST" in text
 
 
 def test_mass_fault_injection_changes_plant_not_belief():
@@ -272,13 +198,13 @@ def test_interactive_fault_commands_parse():
     weak = parse_fault_command("weak")
     assert weak.kind == "actuator_scale"
     assert weak.params["actuator"] == "right_knee"
-    assert weak.params["scale"] == pytest.approx(0.5)
+    assert weak.params["scale"] == pytest.approx(0.75)
     scaled = parse_fault_command("scale left_knee 0.25")
     assert scaled.params["actuator"] == "left_knee"
     assert scaled.params["scale"] == pytest.approx(0.25)
 
 
-def test_number_keys_add_shoulder_mass_and_halve_knee_torque():
+def test_number_keys_add_shoulder_mass_and_scale_knee_torque():
     import mujoco
 
     from loka.agent.interactive import InteractivePlant, fault_for_keycode
@@ -312,7 +238,7 @@ def test_number_keys_add_shoulder_mass_and_halve_knee_torque():
     # GLFW keypad codes: KP_5 = 325, KP_2 = 322.
     assert fault_for_keycode(325).params["body"] == "left_shoulder_roll_link"
     assert fault_for_keycode(322).kind == "actuator_scale"
-    assert fault_for_keycode(322).params["scale"] == pytest.approx(0.5)
+    assert fault_for_keycode(322).params["scale"] == pytest.approx(0.75)
 
     plant.handle_key(ord("5"))
     assert sim.model.body_mass[shoulder] == pytest.approx(mass0 + 5.0)
@@ -322,15 +248,15 @@ def test_number_keys_add_shoulder_mass_and_halve_knee_torque():
     assert sim.controller.robot.model.body_mass[shoulder] == pytest.approx(belief_mass)
 
     plant.handle_key(ord("2"))
-    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.5 * gear0)
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.75 * gear0)
     plant._keys.interval = 0.0
     plant.handle_key(ord("2"))
-    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.5 * gear0)
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.75 * gear0)
     assert sim.controller.robot.model.actuator_gear[knee, 0] == pytest.approx(belief_gear)
     assert sim.model.actuator_ctrlrange[knee, 1] == pytest.approx(139.0)
 
     mujoco.mj_forward(sim.model, data)
-    assert float(data.qfrc_actuator[dof]) == pytest.approx(0.5 * full, rel=1e-5)
+    assert float(data.qfrc_actuator[dof]) == pytest.approx(0.75 * full, rel=1e-5)
 
     plant.handle_key(ord("8"))
     assert sim.model.body_mass[shoulder] == pytest.approx(mass0)
@@ -358,261 +284,6 @@ def test_inject_and_clear_faults_update_viz():
     assert runtime.viz.friction_mu is None
 
 
-def test_mission_baseline_rebases_after_task_change():
-    sim = Simulation()
-    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
-    while not runtime._baseline_full:
-        runtime.step()
-    standing_z = float(np.mean([f["qpos"][2] for f in runtime.nominal_baseline]))
-    assert standing_z > 0.7
-
-    runtime.controller.set_task_targets({"height": 0.55})
-    runtime._invalidate_mission_baseline(
-        float(sim.data.time),
-        reason="test crouch",
-        close_failure_episode=False,
-    )
-    assert not runtime._baseline_full
-    assert runtime._baseline_stale
-
-    # Advance through settle + re-baseline window.
-    t_end = float(sim.data.time) + 8.0
-    while sim.data.time < t_end:
-        runtime.step()
-        if not runtime._baseline_stale and runtime._baseline_full:
-            break
-    assert runtime._baseline_full
-    assert not runtime._baseline_stale
-    crouched_z = float(np.mean([f["qpos"][2] for f in runtime.nominal_baseline]))
-    assert crouched_z < standing_z - 0.05
-
-
-def test_early_anomaly_fires_on_shoulder_mass_not_quiet_stand():
-    from loka.agent.anomaly import assess_stand_anomaly
-
-    quiet = {
-        "com_error": np.zeros(3),
-        "rpy": np.zeros(3),
-        "support_margin": np.array([0.08, 0.08, 0.1, 0.1]),
-        "desired_forces": np.zeros((8, 3)),
-        "contact_forces": np.zeros((8, 3)),
-        "contact_mask": np.ones(8, dtype=bool),
-        "contact_speed_max": 0.0,
-        "joint_util": np.zeros(29),
-    }
-    assert not assess_stand_anomaly(quiet).triggered
-
-    # Healthy deep crouch: large fore-aft CoM residual, planted, low tilt — not a fault.
-    crouch = {
-        **quiet,
-        "com_error": np.array([-0.025, 0.0, 0.011]),
-        "rpy": np.array([0.0, np.deg2rad(0.4), 0.0]),
-    }
-    crouch_a = assess_stand_anomaly(crouch)
-    assert crouch_a.balance_healthy
-    assert not crouch_a.triggered
-
-    # Asymmetric shoulder mass: lateral CoM bias should fire.
-    loaded = {
-        **quiet,
-        "com_error": np.array([0.01, 0.03, 0.005]),
-        "rpy": np.array([0.02, 0.0, 0.0]),
-    }
-    assessment = assess_stand_anomaly(loaded)
-    assert assessment.triggered
-    assert any("COM_BIAS" in c for c in assessment.clues)
-
-    # Push-like distress: elevated tilt even with moderate CoM.
-    tipped = {
-        **quiet,
-        "com_error": np.array([0.015, 0.0, 0.0]),
-        "rpy": np.array([0.0, np.deg2rad(2.5), 0.0]),
-    }
-    assert assess_stand_anomaly(tipped).triggered
-
-    # Nominal walk telemetry must not look like a plant fault.
-    walk = {
-        **quiet,
-        "walking": True,
-        "com_error": np.array([-0.042, 0.012, 0.012]),
-        "rpy": np.array([np.deg2rad(0.8), np.deg2rad(0.5), 0.0]),
-        "contact_speed_max": 0.13,
-        "desired_forces": np.ones((8, 3)) * 40.0,
-        "contact_forces": np.ones((8, 3)) * 10.0,  # ‖Δf‖ large but below walk bar
-        "contact_mask": np.array([1, 1, 1, 1, 0, 0, 0, 0], dtype=bool),
-        "wbc_failures": 1,
-    }
-    walk_a = assess_stand_anomaly(walk)
-    assert not walk_a.triggered
-
-    # Cumulative-style failures used to permanently arm QP_FALLBACK; per-tick
-    # delta of 1 while standing still counts.
-    qp = {**quiet, "wbc_failures": 1}
-    assert assess_stand_anomaly(qp).triggered
-
-
-def test_plateau_improvement_and_stop_reasons():
-    from loka.agent.plateau import (
-        EpisodeMetrics,
-        is_improved,
-        should_stop_episode,
-    )
-
-    mild = EpisodeMetrics(
-        anomaly_score=0.27,
-        com_xy_m=0.02,
-        com_lat_m=0.015,
-        com_error=(0.0, 0.015, -0.02),
-        force_mismatch_n=60.0,
-        tilt_rad=0.02,
-        mpc_cost=5.0,
-    )
-    worse = EpisodeMetrics(
-        anomaly_score=0.45,
-        com_xy_m=0.04,
-        com_lat_m=0.03,
-        com_error=(0.0, 0.03, -0.04),
-        force_mismatch_n=70.0,
-        tilt_rad=0.03,
-        mpc_cost=12.0,
-    )
-    better = EpisodeMetrics(
-        anomaly_score=0.10,
-        com_xy_m=0.008,
-        com_lat_m=0.005,
-        com_error=(0.0, 0.005, -0.01),
-        force_mismatch_n=35.0,
-        tilt_rad=0.005,
-        mpc_cost=2.0,
-    )
-    assert not is_improved(worse, mild)
-    assert is_improved(better, mild)
-    assert should_stop_episode(
-        n_interventions=5,
-        stall_count=0,
-        max_interventions=5,
-        plateau_min_interventions=2,
-        plateau_stall_rounds=2,
-    ) == "max_interventions"
-    assert should_stop_episode(
-        n_interventions=2,
-        stall_count=2,
-        max_interventions=5,
-        plateau_min_interventions=2,
-        plateau_stall_rounds=2,
-    ) == "plateau"
-    assert (
-        should_stop_episode(
-            n_interventions=1,
-            stall_count=2,
-            max_interventions=5,
-            plateau_min_interventions=2,
-            plateau_stall_rounds=2,
-        )
-        is None
-    )
-
-
-def test_accept_residual_updates_mass_belief_and_lean():
-    from loka.agent.session import FailureEpisode
-    from loka.agent.plateau import EpisodeMetrics
-
-    sim = Simulation()
-    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
-    while not runtime._baseline_full:
-        runtime.step()
-
-    body = "right_shoulder_roll_link"
-    import mujoco
-
-    body_id = mujoco.mj_name2id(
-        runtime.controller.robot.model, mujoco.mjtObj.mjOBJ_BODY, body
-    )
-    before = float(runtime.controller.robot.model.body_mass[body_id])
-
-    metrics = EpisodeMetrics(
-        anomaly_score=0.40,
-        com_xy_m=0.035,
-        com_lat_m=0.030,
-        com_error=(-0.01, -0.030, -0.04),  # RIGHT bias (com_y < 0)
-        force_mismatch_n=68.0,
-        tilt_rad=0.03,
-        mpc_cost=10.0,
-    )
-    runtime.failure_episode = FailureEpisode(
-        started_at=float(sim.data.time),
-        nominal_baseline=list(runtime.nominal_baseline),
-    )
-    # Pretend two stalled interventions already happened.
-    runtime.failure_episode.interventions = [{}, {}]
-    runtime.failure_episode.stall_count = 2
-
-    runtime._accept_residual(
-        metrics,
-        reason="plateau",
-        now=float(sim.data.time),
-        live_pelvis_z=float(sim.data.qpos[2]),
-    )
-
-    after = float(runtime.controller.robot.model.body_mass[body_id])
-    assert after > before + 0.5
-    snap = runtime.controller.task_snapshot()
-    assert snap["lean_y"] < 0.0  # lean toward right (heavy) side
-    assert runtime.failure_episode is None
-    assert runtime._residual_floor is not None
-    assert runtime._baseline_stale
-
-
-def test_gate_failure_dispatch_detects_plateau():
-    from loka.agent.session import FailureEpisode
-    from loka.agent.plateau import EpisodeMetrics
-
-    sim = Simulation()
-    runtime = LokaRuntime(
-        sim,
-        LokaConfig(
-            enable_llm=False,
-            max_interventions_per_episode=5,
-            plateau_min_interventions=2,
-            plateau_stall_rounds=2,
-        ),
-    )
-    episode = FailureEpisode(started_at=0.0)
-    episode.interventions = [{}, {}]  # two prior fixes
-    runtime.failure_episode = episode
-
-    mild = EpisodeMetrics(
-        anomaly_score=0.25,
-        com_xy_m=0.02,
-        com_lat_m=0.015,
-        com_error=(0.0, 0.015, -0.02),
-        force_mismatch_n=55.0,
-        tilt_rad=0.02,
-        mpc_cost=4.0,
-    )
-    worse = EpisodeMetrics(
-        anomaly_score=0.35,
-        com_xy_m=0.03,
-        com_lat_m=0.025,
-        com_error=(0.0, 0.025, -0.03),
-        force_mismatch_n=65.0,
-        tilt_rad=0.025,
-        mpc_cost=8.0,
-    )
-    worse2 = EpisodeMetrics(
-        anomaly_score=0.40,
-        com_xy_m=0.035,
-        com_lat_m=0.028,
-        com_error=(0.0, 0.028, -0.035),
-        force_mismatch_n=70.0,
-        tilt_rad=0.03,
-        mpc_cost=11.0,
-    )
-    assert runtime._gate_failure_dispatch(mild) is None
-    assert runtime._gate_failure_dispatch(worse) is None  # stall=1
-    assert runtime._gate_failure_dispatch(worse2) == "plateau"
-
-
 def test_session_log_rewrites_each_session(tmp_path):
     from loka.agent.session_log import StandSessionLog
 
@@ -625,11 +296,20 @@ def test_session_log_rewrites_each_session(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "FIRST" not in text
     assert "rewritten each run" in text
-    log2.dispatch(sim_time=2.0, reason="operator", user_content="SECOND")
+    log2.dispatch(
+        sim_time=2.0,
+        reason="operator",
+        user_content="SECOND",
+        system_prompt="SYSTEM PROMPT\n\nROBOT MODEL REFERENCE\nbody tree",
+    )
     text = path.read_text(encoding="utf-8")
     assert "SECOND" in text
     assert "FIRST" not in text
-    assert path.with_name("session.jsonl").exists()
+    assert "SYSTEM PROMPT" not in text
+    assert "ROBOT MODEL REFERENCE" not in text
+    jsonl = path.with_name("session.jsonl").read_text(encoding="utf-8")
+    assert "SYSTEM PROMPT" not in jsonl
+    assert "ROBOT MODEL REFERENCE" not in jsonl
 
 
 def test_com_and_mass_mutations_reset_from_nominal():
@@ -680,7 +360,6 @@ def test_scratchpad_cannot_rewrite_a_locked_directive():
     loka_state = {
         "mutations": [],
         "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy(),
-        "error_spec": default_stand_error_spec(),
         "mission_directives": [
             MissionDirective("go to 10,10", 1.0, (10.0, 10.0))
         ],
@@ -718,7 +397,6 @@ def test_near_listener_and_directive_registration():
 
     sim = Simulation()
     runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, heartbeat_s=30.0))
-    runtime._baseline_full = True
     runtime.submit_operator("go to 10,10")
     runtime.step()
     assert runtime.loka_state["mission_directives"][0].goal_xy == (10.0, 10.0)
@@ -741,6 +419,18 @@ def test_near_listener_and_directive_registration():
     assert not listener_fired(runtime.loka_state["listeners"][0], far)
     near = {"qpos": np.array([8.8, 9.1, 0.7]), "time": 2.0}
     assert listener_fired(runtime.loka_state["listeners"][0], near)
+    from loka.agent.directives import Listener
+
+    bias_listener = Listener(
+        message="Bias is back in bounds. Walk to the goal.",
+        kind="bias_under_threshold",
+    )
+    assert not listener_fired(bias_listener, {"bias_nm": 8.0, "bias_threshold_nm": 5.0})
+    assert not listener_fired(
+        bias_listener,
+        {"bias_nm": 1.0, "bias_threshold_nm": 5.0, "belief_search_busy": True},
+    )
+    assert listener_fired(bias_listener, {"bias_nm": 1.0, "bias_threshold_nm": 5.0})
     fired = runtime._consume_listeners(near)
     assert len(fired) == 1
     assert runtime.loka_state["listeners"] == []
@@ -749,13 +439,10 @@ def test_near_listener_and_directive_registration():
 def test_compressor_includes_full_state():
     sim = Simulation()
     runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))
-    runtime._baseline_full = True
     frame = runtime.step()
     text = synthesize_stand_telemetry(
         [frame],
-        [frame],
         control_dt=sim.config.control_dt,
-        error_spec=runtime.loka_state["error_spec"],
     )
     assert "FULL STATE" in text
     assert "pelvis xyz" in text
@@ -788,3 +475,137 @@ def test_full_state_flags_walking_away_from_the_goal():
     assert "MOVING AWAY FROM GOAL" in text
     assert "along heading" in text
     assert "closing speed" in text
+
+
+def test_max_memory_drops_prior_turns_and_cannot_exceed_max_turns():
+    from loka.agent.session import FailureEpisode, OperatorSession
+
+    with pytest.raises(AssertionError, match="max_memory"):
+        LokaConfig(max_turns=2, max_memory=3)
+
+    episode = FailureEpisode(0.0)
+    episode.append_exchange("see the torso mass fix", "queued mass")
+    episode.record_intervention(
+        1.0,
+        {
+            "Semantic_State": {"Hypothesis": "torso mass", "Analysis": "heavy"},
+            "Model_Mutations": [{
+                "object_type": "body",
+                "name": "torso_link",
+                "attribute": "mass",
+                "value": 14.4,
+            }],
+        },
+    )
+    assert episode.prior_turn_count == 1
+    forgotten = episode.build_user_turn(
+        "telemetry",
+        {"primary_objective": "stand"},
+        2.0,
+        "cfg",
+        max_turns=5,
+        max_memory=1,
+    )
+    assert "torso mass" not in forgotten
+    assert "torso_link" not in forgotten
+    assert "see the torso mass fix" not in forgotten
+    assert "Earlier orchestrator turns are omitted" in forgotten
+    assert "remain in effect" in forgotten
+    blank = episode.compose_api_messages("system", forgotten, max_memory=1)
+    assert [item["role"] for item in blank] == ["system", "user"]
+
+    remembered = episode.build_user_turn(
+        "telemetry",
+        {"primary_objective": "stand"},
+        2.0,
+        "cfg",
+        max_turns=5,
+        max_memory=2,
+    )
+    assert "torso mass" in remembered
+    assert "torso_link" in remembered
+    full = episode.compose_api_messages("system", remembered, max_memory=2)
+    assert any(item["content"] == "see the torso mass fix" for item in full)
+
+    session = OperatorSession()
+    session.append_exchange("go to 3,3", "walking")
+    request = session.build_request_turn(
+        "go to 4,4", "telemetry", {}, 3.0, "cfg", max_memory=1
+    )
+    assert "go to 3,3" not in request
+    assert "Earlier turns in this session are not included" in request
+    operator_messages = session.compose_api_messages("system", request, max_memory=1)
+    assert [item["role"] for item in operator_messages] == ["system", "user"]
+
+
+def test_failure_episode_turn_cap_resets_when_bias_recovers():
+    sim = Simulation()
+    runtime = LokaRuntime(
+        sim,
+        LokaConfig(
+            enable_llm=True,
+            cooldown_s=0.0,
+            max_turns=2,
+            max_memory=2,
+            print_compressor=False,
+        ),
+    )
+    calls = []
+
+    def fake_dispatch(session, user, *, reason="unknown"):
+        del session, reason
+        calls.append(user)
+        return True
+
+    runtime._dispatch = fake_dispatch
+    obs = runtime.effort_observer
+
+    def hold_fault(*_args, **_kwargs):
+        obs.consecutive_out_of_bounds = obs.consecutive_steps
+        obs.consecutive_in_bounds = 0
+        return 0.0, np.zeros(1), np.zeros(12)
+
+    def hold_clear(*_args, **_kwargs):
+        obs.consecutive_out_of_bounds = 0
+        obs.consecutive_in_bounds = 10**6
+        return 0.0, np.zeros(1), np.zeros(12)
+
+    obs.update = hold_fault
+    for _ in range(4):
+        runtime.step()
+    assert len(calls) == 2
+    assert "turn 1 of 2" in calls[0]
+    assert "turn 2 of 2" in calls[1]
+    assert "last turn" in calls[1]
+    assert runtime.failure_episode is not None
+    assert runtime.failure_episode.turns_sent == 2
+
+    obs.update = hold_clear
+    runtime.step()
+    assert runtime.failure_episode is None
+
+    obs.update = hold_fault
+    runtime.step()
+    assert len(calls) == 3
+    assert "turn 1 of 2" in calls[2]
+
+
+def test_walk_is_blocked_while_bias_is_above_threshold():
+    controller = LocomotionController()
+    controller.gait.block_walk = True
+    applied = controller.set_task_targets(
+        {
+            "gait.mode": "walk",
+            "gait.speed": 0.25,
+            "gait.goal_x": 3.0,
+            "gait.goal_y": 3.0,
+        }
+    )
+    assert float(controller.gait.config.mode) == 0.0
+    assert applied.get("gait.mode", 0.0) == 0.0
+    controller.gait._steer_to_goal(np.zeros(2))
+    assert float(controller.gait.config.mode) == 0.0
+
+    controller.gait.block_walk = False
+    applied = controller.set_task_targets({"gait.mode": "walk", "gait.speed": 0.25})
+    assert applied["gait.mode"] == 1.0

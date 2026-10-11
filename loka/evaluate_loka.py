@@ -32,7 +32,6 @@ class ScenarioResult:
     fell: bool
     duration: float
     com_error_max: float
-    tracking_error_max: float
     final_height: float
     final_lean_x: float
     final_lean_y: float
@@ -84,7 +83,6 @@ def _run(
         fell=sim.fell,
         duration=float(sim.data.time),
         com_error_max=float(max((h["com_error"] for h in hist), default=0.0)),
-        tracking_error_max=float(max((h["tracking_error"] for h in hist), default=0.0)),
         final_height=tasks["height"],
         final_lean_x=tasks["lean_x"],
         final_lean_y=tasks["lean_y"],
@@ -194,7 +192,6 @@ def scenario_mass_fault_scripted_recovery() -> ScenarioResult:
         fell=sim.fell,
         duration=float(sim.data.time),
         com_error_max=float(max((h["com_error"] for h in hist), default=0.0)),
-        tracking_error_max=float(max((h["tracking_error"] for h in hist), default=0.0)),
         final_height=tasks["height"],
         final_lean_x=tasks["lean_x"],
         final_lean_y=tasks["lean_y"],

@@ -1,0 +1,42 @@
+# LOKA session settings. The plant (MPC, WBC, gait) stays in g1.yaml.
+# One control step is runtime.step (control_dt, 0.002 s).
+
+# |bias| is the sum of absolute per-actuator effort deviations [Nm].
+# Each value is plant bias minus belief bias, with the floating-base wrench
+# resolved through the foot contacts. A matched model sits at 0. A +5 kg
+# torso error is about 8 Nm, so the thresholds sit just above the noise floor.
+# A step is out of bounds when |bias| is above the threshold for the mode.
+# consecutive_steps is how many steps in a row must be out of bounds before
+# a failure episode opens. The live count resets on the first in-bounds step
+# and when the robot switches between standing and walking.
+# clear_below_s is how long |bias| must stay at or below the mode threshold
+# before that failure episode closes. A shorter dip does not close it.
+# stand_window_steps is the standing average (walking uses two step periods).
+# stand_on_fault: true commands gait.mode=stand when a walking bias fault
+# opens and the LLM is on. --no-llm never stands for a bias fault.
+# false leaves the robot walking through the fault.
+effort_bias:
+  consecutive_steps: 250
+  stand_threshold_nm: 5.0
+  walk_threshold_nm: 5.0
+  stand_window_steps: 100
+  clear_below_s: 0.5
+  stand_on_fault: true
+
+# cooldown_s starts when an orchestrator edit is applied. No LLM call
+# (effort episode, listener, heartbeat, or operator) is sent during it.
+# max_turns is how many orchestrator turns one failure episode may use
+# before the bias is back in bounds. The next episode starts a new count.
+# max_memory is how many completed turns of one conversation stay visible.
+# It must be <= max_turns. The next turn after that many, and every turn
+# after it, omits earlier messages and attempted fixes. The model reasons
+# from the live telemetry, tunables, and model belief. Applied controller
+# targets and model mutations stay. A new failure episode starts a new count.
+# Equal to max_turns keeps every turn of a failure episode; the operator
+# session still forgets after this many of its own turns.
+session:
+  cooldown_s: 2.0
+  heartbeat_s: 15.0
+  telemetry_window_s: 2.0
+  max_turns: 5
+  max_memory: 5

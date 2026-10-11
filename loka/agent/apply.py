@@ -6,22 +6,46 @@ from typing import Any
 
 import mujoco
 
-from loka.control.gait import MODE_LIMP, MODE_WALK
 from loka.control.locomotion import LocomotionController
 from loka.agent.directives import LISTENER_KINDS, parse_listeners
-from loka.agent.error_defaults import adapt_error_spec_for_walk
-from loka.agent.error_spec import format_error_spec, parse_error_tracking
 from loka.agent.model_state import resolve_mjcf_name
 from loka.agent.context import format_stand_configuration
 from loka.agent.policy import filter_controller_targets
 
 
-def _mission_is_locomotion(controller: LocomotionController) -> bool:
-    """True while a walk or an active go-to should not be scored from the origin."""
-    cfg = controller.gait.config
-    mode = float(cfg.mode)
-    goal = float(cfg.goal_active) >= 0.5
-    return goal or mode in (MODE_WALK, MODE_LIMP)
+_SCRATCHPAD_KEYS = {
+    "semantic_state": "Semantic_State",
+    "belief_searches": "Belief_Searches",
+    "belief_search": "Belief_Search",
+    "task_targets": "Task_Targets",
+    "listeners": "Listeners",
+    "controller_targets": "Controller_Targets",
+    "planner_targets": "Planner_Targets",
+    "model_mutations": "Model_Mutations",
+    "mission_directives": "Mission_Directives",
+    "primary_objective": "Primary_Objective",
+}
+_STATE_KEYS = {
+    "hypothesis": "Hypothesis",
+    "hypotheses": "Hypotheses",
+    "analysis": "Analysis",
+}
+
+
+def canonicalize_scratchpad(scratchpad: dict) -> dict:
+    """Rename YAML keys the model lowercased back to the names the runtime reads."""
+    renamed = {}
+    for key, value in scratchpad.items():
+        canon = _SCRATCHPAD_KEYS.get(str(key).strip().lower(), key)
+        if canon == "Semantic_State" and isinstance(value, dict):
+            value = {
+                _STATE_KEYS.get(str(inner).strip().lower(), inner): item
+                for inner, item in value.items()
+            }
+        renamed[canon] = value
+    scratchpad.clear()
+    scratchpad.update(renamed)
+    return scratchpad
 
 
 def apply_stand_scratchpad(
@@ -49,10 +73,11 @@ def apply_stand_scratchpad(
         "controller_targets": {},
         "rejected_controller_targets": [],
         "task_targets": {},
-        "error_tracking": False,
         "mutations": 0,
         "listeners": 0,
     }
+    if isinstance(scratchpad, dict):
+        canonicalize_scratchpad(scratchpad)
     if not scratchpad or "Semantic_State" not in scratchpad:
         print("\n[!] Failed to parse LOKA scratchpad (missing Semantic_State).")
         return summary
@@ -118,31 +143,8 @@ def apply_stand_scratchpad(
             for name, value in applied_tasks.items():
                 print(f"     * {name} = {value:.4g}")
 
-    # -- Error_Tracking -----------------------------------------------------
-    error_tracking = scratchpad.get("Error_Tracking")
-    belief_model = controller.robot.model
-    if error_tracking is not None:
-        print("  -> Error_Tracking:")
-        try:
-            new_spec = parse_error_tracking(
-                error_tracking, belief_model.nq, belief_model.nv
-            )
-            if _mission_is_locomotion(controller):
-                adapted = adapt_error_spec_for_walk(new_spec)
-                if adapted.to_dict() != new_spec.to_dict():
-                    print(
-                        "  -> world-origin drift dropped; "
-                        "walk tracks heading_error and cross_track"
-                    )
-                new_spec = adapted
-            loka_state["error_spec"] = new_spec
-            loka_state["error_spec_owner"] = "loka"
-            summary["error_tracking"] = True
-            print(format_error_spec(new_spec))
-        except Exception as exc:
-            print(f"     * [WARN] Invalid Error_Tracking (ignored): {exc}")
-
     # -- Model_Mutations (belief) -------------------------------------------
+    belief_model = controller.robot.model
     mutations = scratchpad.get("Model_Mutations") or []
     if mutations:
         print("  -> Model_Mutations queued onto controller belief:")

@@ -12,63 +12,49 @@ from pathlib import Path
 import numpy as np
 
 from loka.control.locomotion import LocomotionController
-from loka.agent.error_spec import get_tracking_error
 from loka.agent.model_state import apply_loka_mutations, zero_dead_actuator_commands
 from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
-from loka.agent.compress import ANOMALY_COLLECTION_S, synthesize_stand_telemetry
+from loka.agent.compress import synthesize_stand_telemetry
+from loka.agent.loka_config import loka_config
 from loka.agent.directives import heartbeat_due, register_directive, take_fired
 from loka.agent.context import (
-    build_stand_capabilities,
-    build_stand_robot_context,
     default_stand_objective,
     format_stand_configuration,
 )
-from loka.agent.anomaly import assess_stand_anomaly
-from loka.agent.error_defaults import (
-    adapt_error_spec_for_walk,
-    default_stand_error_spec,
-    default_walk_error_spec,
-)
+from loka.agent.robot_context import build_robot_model_context
+from loka.agent.anomaly import EffortDeviationObserver, belief_actuator_deviation
+from loka.agent.belief_search import BeliefSearchRunner, parse_belief_searches
 from loka.agent.faults import FaultSpec, capture_nominal_params
 from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
 from loka.agent.llm import load_stand_system_prompt, stand_llm_worker
-from loka.agent.plateau import (
-    EpisodeMetrics,
-    build_accept_residual_scratchpad,
-    exceeds_residual_floor,
-    is_improved,
-    should_stop_episode,
-    snapshot_metrics,
-)
 from loka.agent.session_log import StandSessionLog, default_log_path
+import mujoco
 
-COOLDOWN_S = 4.0
-HEARTBEAT_S = 30.0
-NOMINAL_BASELINE_S = 2.0
-# Collect a short window of early clues before dispatching (faster than catastrophic waits).
-EARLY_ANOMALY_COLLECTION_S = 0.4
-# After operator / Task_Targets changes, ignore early plant clues while the pose settles.
-TASK_SETTLE_SUPPRESS_S = 5.0
+_SESSION = loka_config()["session"]
+_BIAS = loka_config().get("effort_bias", {})
 
 
 @dataclass
 class LokaConfig:
     enable_llm: bool = True
-    cooldown_s: float = COOLDOWN_S
-    anomaly_collection_s: float = ANOMALY_COLLECTION_S
-    heartbeat_s: float = HEARTBEAT_S
+    cooldown_s: float = float(_SESSION["cooldown_s"])
+    heartbeat_s: float = float(_SESSION["heartbeat_s"])
+    telemetry_window_s: float = float(_SESSION["telemetry_window_s"])
+    max_turns: int = int(_SESSION.get("max_turns", 5))
+    max_memory: int = int(_SESSION.get("max_memory", _SESSION.get("max_turns", 5)))
+    stand_on_fault: bool = bool(_BIAS.get("stand_on_fault", True))
+
+    def __post_init__(self) -> None:
+        assert 0 <= self.max_memory <= self.max_turns, (
+            f"session.max_memory ({self.max_memory}) must be <= "
+            f"session.max_turns ({self.max_turns})"
+        )
     objective: str = field(default_factory=default_stand_objective)
     log_path: Path | None = None
     print_compressor: bool = True
     enable_session_log: bool = False
-    # Failure-episode intervention budget + plateau gate (see plateau.py).
-    max_interventions_per_episode: int = 5
-    plateau_min_interventions: int = 2
-    plateau_stall_rounds: int = 2
-    plateau_rel_improve: float = 0.08
-    plateau_abs_score_eps: float = 0.03
 
 
 class LokaRuntime:
@@ -102,25 +88,15 @@ class LokaRuntime:
             "primary_objective": self.config.objective,
             "mission_directives": [],
             "listeners": [],
-            "error_spec_owner": "default",
-            "error_spec": default_stand_error_spec(
-                nominal_height=float(self.sim.data.qpos[2])
-            ),
         }
-        self.capabilities = build_stand_capabilities(self.controller)
-        self.robot_context = build_stand_robot_context(self.controller)
-        self.system_prompt = load_stand_system_prompt(
-            robot_context=self.robot_context,
-            objective=self.config.objective,
-            capabilities=self.capabilities,
-            error_spec=self.loka_state["error_spec"],
+        self.robot_context = build_robot_model_context(
+            self.controller.robot.model,
+            str(self.controller.config.model_path),
         )
+        self.system_prompt = load_stand_system_prompt(robot_context=self.robot_context)
 
-        self.nominal_baseline: deque = deque()
-        self.anomaly_buffer: deque = deque()
-        self._baseline_full = False
-        self._anomaly_collect_t0: float | None = None
-        self._last_dispatch_t = -1e9
+        self.recent_frames: deque = deque()
+        self._last_edit_t = -1e9
         self._last_invoke_t = 0.0
 
         self.failure_episode: FailureEpisode | None = None
@@ -134,16 +110,9 @@ class LokaRuntime:
         self._pending_user_content: str | None = None
         self._pending_dispatch_reason: str = "unknown"
         self._fall_logged = False
-        self._suppress_early_until = -1.0
-        # After Task_Targets / Error_Tracking change, clear standing baseline and
-        # re-capture healthy telemetry under the new mission.
-        self._baseline_stale = False
-        self._rebase_ready_at = -1.0
-        # After plateau/cap accept: only re-open if plant health exceeds this floor.
-        self._residual_floor: EpisodeMetrics | None = None
         self._prev_wbc_failures = 0
         self._prev_mpc_failures = 0
-        self._was_walking = False
+        self._walk_fault_stand = False
         self._cross_track = 0.0
         self._heading_watch = (0.0, 0.0, 0.0)
 
@@ -157,6 +126,22 @@ class LokaRuntime:
                 f"LLM={'on' if self.config.enable_llm else 'off'}; "
                 f"faults={len(self.faults)}"
             )
+
+        self.effort_observer = EffortDeviationObserver()
+        self.effort_observer.dt = float(self.sim.config.control_dt)
+        self.effort_observer.names = tuple(
+            mujoco.mj_id2name(self.sim.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or str(i)
+            for i in range(self.sim.model.nu)
+        )
+        self.belief_search = BeliefSearchRunner(self)
+
+    def note_search_result(self, line: str) -> None:
+        """Attach a finished search to the fix the next orchestrator turn reads."""
+        session = self.failure_episode or self.active_session
+        if session is not None and session.interventions:
+            session.interventions[-1].setdefault("search_results", []).append(line)
+            return
+        self.loka_state.setdefault("search_results", []).append(line)
 
     # -- frame bookkeeping --------------------------------------------------
 
@@ -233,6 +218,9 @@ class LokaRuntime:
             "goal_active": float(self.controller.gait.config.goal_active) >= 0.5,
             "goal_x": float(self.controller.gait.config.goal_x),
             "goal_y": float(self.controller.gait.config.goal_y),
+            "bias_nm": self._bias_nm(),
+            "bias_threshold_nm": self._bias_threshold_nm(),
+            "belief_search_busy": self.belief_search.busy,
         }
 
     def _gated_heading_error(self, tel) -> float:
@@ -264,129 +252,11 @@ class LokaRuntime:
         self._cross_track = 0.98 * self._cross_track + float(vel @ left) * dt
         return float(self._cross_track)
 
-    def _sync_gait_mission(self, now: float, walking: bool) -> None:
-        """Swap Error_Tracking / suppress early anomaly on stand↔walk transitions."""
-        if walking == self._was_walking:
-            return
-        self._was_walking = walking
-        if self.loka_state.get("error_spec_owner") == "loka":
-            self._suppress_early_until = max(
-                self._suppress_early_until,
-                now + (6.0 if walking else TASK_SETTLE_SUPPRESS_S),
-            )
-            # A spec written while standing must not keep scoring world x/y
-            # against the origin once the robot is walking.
-            if walking:
-                self._adopt_walk_tracking(now)
-            return
-        height = float(self.controller.command.height or self.controller.nominal_height)
-        if walking:
-            self.loka_state["error_spec"] = default_walk_error_spec(
-                nominal_height=max(height, 0.55)
-            )
-            reason = "gait.mode=walk"
-        else:
-            self.loka_state["error_spec"] = default_stand_error_spec(
-                nominal_height=max(height, 0.55)
-            )
-            reason = "gait.mode=stand"
-        self._rebuild_prompt()
-        self._invalidate_mission_baseline(now, reason=reason, close_failure_episode=True)
-        # Extra settle so the first steps do not look like a plant fault.
-        self._suppress_early_until = max(
-            self._suppress_early_until, now + (6.0 if walking else TASK_SETTLE_SUPPRESS_S)
-        )
-        print(
-            f"[LOKA] Error_Tracking → "
-            f"{'walk' if walking else 'stand'} defaults at t={now:.2f}s"
-        )
-
-    def _adopt_walk_tracking(self, now: float) -> None:
-        """Replace origin drift in an orchestrator-owned spec with walk terms."""
-        old = self.loka_state.get("error_spec")
-        if old is None:
-            return
-        new = adapt_error_spec_for_walk(old)
-        if new.to_dict() == old.to_dict():
-            return
-        self.loka_state["error_spec"] = new
-        self._rebuild_prompt()
-        self._invalidate_mission_baseline(
-            now,
-            reason="walk drops world-origin drift",
-            close_failure_episode=True,
-        )
-        print(
-            f"[LOKA] Error_Tracking dropped world-origin drift at t={now:.2f}s"
-        )
-
-    def _push_baseline(self, frame: dict) -> None:
-        self.nominal_baseline.append(frame)
-        max_n = max(1, int(NOMINAL_BASELINE_S / self.sim.config.control_dt))
-        while len(self.nominal_baseline) > max_n:
-            self.nominal_baseline.popleft()
-        if len(self.nominal_baseline) >= max_n:
-            self._baseline_full = True
-
-    def _invalidate_mission_baseline(
-        self,
-        now: float,
-        *,
-        reason: str,
-        close_failure_episode: bool = False,
-    ) -> None:
-        """Drop prior-mission nominals; re-collect after the pose settles."""
-        self.nominal_baseline.clear()
-        self._baseline_full = False
-        self._baseline_stale = True
-        self._rebase_ready_at = now + TASK_SETTLE_SUPPRESS_S
-        self._suppress_early_until = max(
-            self._suppress_early_until, self._rebase_ready_at
-        )
-        self.anomaly_buffer.clear()
-        self._anomaly_collect_t0 = None
-        # Operator objective changes end fault episodes; recovery Task_Targets do not.
-        if (
-            close_failure_episode
-            and self.failure_episode is not None
-            and not self.llm_busy
-        ):
-            print(f"[LOKA] failure episode closed ({reason})")
-            if self.log is not None:
-                self.log.note(f"failure episode closed ({reason})", sim_time=now)
-            if self.active_session is self.failure_episode:
-                self.active_session = None
-            self.failure_episode = None
-        print(
-            f"[LOKA] mission baseline invalidated at t={now:.2f}s "
-            f"({reason}); will re-baseline after settle"
-        )
-        if self.log is not None:
-            self.log.note(
-                f"mission baseline invalidated ({reason})",
-                sim_time=now,
-            )
-
-    def _maybe_rebaseline(self, frame: dict, *, healthy: bool) -> None:
-        if not self._baseline_stale:
-            return
-        now = float(frame["time"])
-        if now < self._rebase_ready_at or not healthy:
-            return
-        self._push_baseline(frame)
-        if self._baseline_full:
-            self._baseline_stale = False
-            print(
-                f"[LOKA] mission nominal baseline rebased at t={now:.2f}s "
-                f"({len(self.nominal_baseline)} frames)"
-            )
-            if self.log is not None:
-                self.log.note("mission nominal baseline rebased", sim_time=now)
-            # Keep any open episode's reference aligned with the new mission.
-            if self.failure_episode is not None:
-                self.failure_episode.nominal_baseline = list(self.nominal_baseline)
-
-    # -- plateau / intervention cap -----------------------------------------
+    def _push_recent(self, frame: dict) -> None:
+        self.recent_frames.append(frame)
+        max_n = max(1, int(self.config.telemetry_window_s / self.sim.config.control_dt))
+        while len(self.recent_frames) > max_n:
+            self.recent_frames.popleft()
 
     def _refresh_belief_mass(self) -> None:
         """Keep robot.total_mass and MPC mass aligned with belief body_mass."""
@@ -395,111 +265,17 @@ class LokaRuntime:
         if hasattr(self.controller, "mpc") and hasattr(self.controller.mpc, "mass"):
             self.controller.mpc.mass = float(robot.total_mass)
 
-    def _accept_residual(
-        self,
-        metrics: EpisodeMetrics,
-        *,
-        reason: str,
-        now: float,
-        live_pelvis_z: float | None = None,
-    ) -> None:
-        """Stop thrashing: absorb residual into mission + mass belief, close episode."""
-        episode = self.failure_episode
-        scratchpad = build_accept_residual_scratchpad(
-            metrics, self.controller, reason=reason
-        )
-        if live_pelvis_z is not None and "Error_Tracking" in scratchpad:
-            # Retarget pelvis floor to the actual settled height.
-            for term in scratchpad["Error_Tracking"].get("terms", []):
-                if term.get("name") == "pelvis_height":
-                    term["target"] = float(live_pelvis_z) + 0.04
-                    break
-        scratchpad.pop("_suggested_pelvis_target", None)
-
-        print(
-            f"\n[LOKA] accepting residual at t={now:.2f}s "
-            f"(reason={reason}, interventions="
-            f"{len(episode.interventions) if episode else 0}, "
-            f"score={metrics.anomaly_score:.2f}, "
-            f"‖f*-f‖={metrics.force_mismatch_n:.1f} N)"
-        )
-        if self.log is not None:
-            self.log.note(
-                f"accept residual ({reason}) score={metrics.anomaly_score:.2f}",
-                sim_time=now,
-            )
-
-        summary = apply_stand_scratchpad(
-            self.controller,
-            scratchpad,
-            self.loka_state,
-            plant_model=self.sim.model,
-            sim_time=now,
-            episode=episode,
-        )
-        if summary.get("mutations"):
-            self._refresh_belief_mass()
-
-        self._residual_floor = metrics
-        if episode is not None:
-            episode.accepted_residual = metrics
-
-        self._invalidate_mission_baseline(
-            now,
-            reason=f"accept residual ({reason})",
-            close_failure_episode=True,
-        )
-        self.anomaly_buffer.clear()
-        self._anomaly_collect_t0 = None
-        self._rebuild_prompt()
-        if self.log is not None:
-            self.log.apply_summary(sim_time=now, summary=summary)
-
-    def _gate_failure_dispatch(
-        self, metrics: EpisodeMetrics | None
-    ) -> str | None:
-        """Update stall counters; return stop reason or None to dispatch LLM."""
-        episode = self.failure_episode
-        if episode is None or metrics is None:
-            return None
-        cfg = self.config
-        if episode.metric_history:
-            if is_improved(
-                metrics,
-                episode.metric_history[-1],
-                rel_improve=cfg.plateau_rel_improve,
-                abs_score_eps=cfg.plateau_abs_score_eps,
-            ):
-                episode.stall_count = 0
-            else:
-                episode.stall_count += 1
-        episode.metric_history.append(metrics)
-        return should_stop_episode(
-            n_interventions=len(episode.interventions),
-            stall_count=episode.stall_count,
-            max_interventions=cfg.max_interventions_per_episode,
-            plateau_min_interventions=cfg.plateau_min_interventions,
-            plateau_stall_rounds=cfg.plateau_stall_rounds,
-        )
-
     # -- LLM dispatch -------------------------------------------------------
 
     def _rebuild_prompt(self) -> None:
-        self.system_prompt = load_stand_system_prompt(
-            robot_context=self.robot_context,
-            objective=self.loka_state["primary_objective"],
-            capabilities=self.capabilities,
-            error_spec=self.loka_state["error_spec"],
-        )
+        self.system_prompt = load_stand_system_prompt(robot_context=self.robot_context)
 
-    def _telemetry_for(self, frame: dict, *, directive: str) -> str:
-        window = list(self.anomaly_buffer) or list(self.nominal_baseline) or [frame]
+    def _telemetry_for(self, frame: dict) -> str:
+        window = list(self.recent_frames) or [frame]
         return synthesize_stand_telemetry(
-            self.nominal_baseline,
             window,
             control_dt=self.sim.config.control_dt,
-            error_spec=self.loka_state["error_spec"],
-            directive=directive,
+            observer=self.effort_observer,
         )
 
     def _consume_listeners(self, frame: dict) -> list:
@@ -515,16 +291,28 @@ class LokaRuntime:
             )
         return fired
 
-    def _dispatch(self, session, user_content: str, *, reason: str = "unknown") -> None:
-        if not self.config.enable_llm:
-            return
+    def _in_cooldown(self, now: float) -> bool:
+        return (now - self._last_edit_t) < self.config.cooldown_s
+
+    def _dispatch(self, session, user_content: str, *, reason: str = "unknown") -> bool:
+        now = float(self.sim.data.time)
+        if (
+            not self.config.enable_llm
+            or self.llm_busy
+            or self._in_cooldown(now)
+            or self.belief_search.busy
+        ):
+            return False
         self.llm_busy = True
         self.active_session = session
         self._pending_user_content = user_content
         self._pending_dispatch_reason = reason
-        self._last_dispatch_t = self.sim.data.time
-        self._last_invoke_t = float(self.sim.data.time)
-        messages = session.compose_api_messages(self.system_prompt, user_content)
+        self._last_invoke_t = now
+        messages = session.compose_api_messages(
+            self.system_prompt,
+            user_content,
+            max_memory=self.config.max_memory,
+        )
         thread = threading.Thread(
             target=stand_llm_worker,
             args=(messages, self.llm_queue),
@@ -547,7 +335,9 @@ class LokaRuntime:
                 reason=reason,
                 user_content=user_content,
                 system_prompt=self.system_prompt,
+                messages=messages,
             )
+        return True
 
     def _drain_llm(self) -> None:
         try:
@@ -555,12 +345,17 @@ class LokaRuntime:
         except queue.Empty:
             return
         self.llm_busy = False
+        now = float(self.sim.data.time)
+        self._last_edit_t = now
         if not result or not result.get("scratchpad"):
-            print("[LOKA] empty orchestrator result")
+            print(
+                f"[LOKA] empty orchestrator result; "
+                f"cooldown {self.config.cooldown_s:.1f}s"
+            )
             if self.log is not None:
                 self.log.note(
                     "empty orchestrator result",
-                    sim_time=float(self.sim.data.time),
+                    sim_time=now,
                 )
             self._pending_user_content = None
             return
@@ -575,6 +370,7 @@ class LokaRuntime:
         if self.active_session is not None and self._pending_user_content is not None:
             self.active_session.append_exchange(self._pending_user_content, raw)
         self._pending_user_content = None
+        self._sync_walk_block()
         summary = apply_stand_scratchpad(
             self.controller,
             scratchpad,
@@ -583,20 +379,19 @@ class LokaRuntime:
             sim_time=float(self.sim.data.time),
             episode=self.active_session if isinstance(self.active_session, FailureEpisode) else None,
         )
-        now = float(self.sim.data.time)
-        # Task setpoint changes move the operating point — re-baseline after settle.
-        # Error_Tracking-only edits during fault recovery keep the pose baseline.
-        if summary.get("task_targets"):
-            self._invalidate_mission_baseline(
-                now,
-                reason="Task_Targets update",
-                close_failure_episode=False,
-            )
+        searches = parse_belief_searches(scratchpad if isinstance(scratchpad, dict) else {})
+        if searches:
+            summary["belief_searches"] = [
+                {"kind": spec.kind, "name": spec.name, "axis": spec.axis} for spec in searches
+            ]
+            self.belief_search.enqueue(searches)
         if self.log is not None:
             self.log.apply_summary(sim_time=now, summary=summary)
         self._rebuild_prompt()
-        self.anomaly_buffer.clear()
-        self._anomaly_collect_t0 = None
+        print(
+            f"[LOKA] edit applied at t={now:.2f}s; "
+            f"no orchestrator calls for {self.config.cooldown_s:.1f}s"
+        )
 
     def submit_operator(self, text: str) -> None:
         self.operator_queue.put(text.strip())
@@ -617,7 +412,6 @@ class LokaRuntime:
         if msg is None:
             print("[FAULT] nothing to clear")
             return
-        self._residual_floor = None
         print(msg)
         if self.log is not None:
             self.log.note(msg, sim_time=float(self.sim.data.time))
@@ -643,11 +437,35 @@ class LokaRuntime:
         force = sim._applied_force()
         self.viz.external_force = force.copy()
         self.viz.external_body_id = sim.pelvis_id
+
         for _ in range(sim.steps_per_control):
             sim.data.ctrl[:] = torque
             sim.data.xfrc_applied[sim.pelvis_id, :3] = force
             mujoco.mj_step(sim.model, sim.data)
+
         sim.data.xfrc_applied[sim.pelvis_id, :3] = 0.0
+
+        # Post-step qpos is ahead of xpos. Refresh kinematics, then compare
+        # inverse-dynamics bias on the plant and the belief at that same state.
+        mujoco.mj_kinematics(sim.model, sim.data)
+        mujoco.mj_comPos(sim.model, sim.data)
+        plant_bias = np.empty(sim.model.nv)
+        mujoco.mj_rne(sim.model, sim.data, 0, plant_bias)
+        robot = self.controller.robot
+        robot.update(sim.data.qpos, sim.data.qvel)
+        deviation = belief_actuator_deviation(
+            plant_bias, robot.data.qfrc_bias, robot.contact_jacobian()
+        )
+        tel = self.controller.telemetry
+        self.effort_observer.is_walking = bool(tel is not None and tel.walking)
+        self.effort_observer.step_period = float(self.controller.gait.config.step_period)
+        self.effort_observer.update(
+            deviation,
+            self.controller.mpc.cost_components,
+            printout=self.effort_observer.printout,
+            xyz=sim.data.qpos[:3],
+        )
+        self._sync_walk_block()
 
         telemetry = self.controller.telemetry
         sim.history.append(
@@ -674,32 +492,23 @@ class LokaRuntime:
         self._refresh_belief_mass()
 
         self._control_step()
+        self.belief_search.tick()
 
         frame = self._frame()
         self.history.append(
             {
                 "t": frame["time"],
                 "com_error": float(np.linalg.norm(frame["com_error"])),
-                "tracking_error": float(
-                    get_tracking_error(
-                        self.sim.data, self.loka_state["error_spec"], frame
-                    )
-                ),
                 "fell": self.sim.fell,
             }
         )
 
         now = frame["time"]
-        self._sync_gait_mission(now, bool(frame.get("walking", False)))
-
-        if not self._baseline_full:
-            self._push_baseline(frame)
-            return frame
-
-        error = get_tracking_error(self.sim.data, self.loka_state["error_spec"], frame)
+        self._push_recent(frame)
 
         # Operator directives are locked text. They do not replace the charter.
-        if not self.llm_busy:
+        # Nothing is dequeued during cooldown, so the request or listener waits.
+        if not self.llm_busy and not self._in_cooldown(now):
             try:
                 request = self.operator_queue.get_nowait()
             except queue.Empty:
@@ -717,35 +526,22 @@ class LokaRuntime:
                 )
                 if self.config.enable_llm:
                     self._rebuild_prompt()
-                    self._invalidate_mission_baseline(
-                        now,
-                        reason=f"directive:{request[:40]}",
-                        close_failure_episode=True,
-                    )
-                    telemetry = self._telemetry_for(
-                        frame,
-                        directive=(
-                            f"Locked directive: {request}\n"
-                            "Set Task_Targets, gait, Error_Tracking, and a Listener. "
-                            "The directive text itself cannot change.\n"
-                        ),
-                    )
+                    telemetry = self._telemetry_for(frame)
                     cfg_text = format_stand_configuration(self.controller)
                     user = self.operator_session.build_request_turn(
-                        request, telemetry, self.loka_state, now, cfg_text
+                        request,
+                        telemetry,
+                        self.loka_state,
+                        now,
+                        cfg_text,
+                        max_memory=self.config.max_memory,
                     )
                     self._dispatch(self.operator_session, user, reason="directive")
                 return frame
 
             fired = self._consume_listeners(frame)
             if fired and self.config.enable_llm:
-                telemetry = self._telemetry_for(
-                    frame,
-                    directive=(
-                        "Listener fired. Read the message and the full state. "
-                        "Continue the locked directives.\n"
-                    ),
-                )
+                telemetry = self._telemetry_for(frame)
                 cfg_text = format_stand_configuration(self.controller)
                 user = self.operator_session.build_listener_turn(
                     [item.message for item in fired],
@@ -761,113 +557,73 @@ class LokaRuntime:
                 )
                 return frame
 
-        mission_breach = error > self.loka_state["error_spec"].trigger_threshold
-        early = assess_stand_anomaly(frame)
-        frame["anomaly_score"] = early.score
-        frame["anomaly_clues"] = list(early.clues)
-        settling = now < self._suppress_early_until
-        plant_anomaly = early.triggered and not settling
-        # After accepting a residual, ignore the same steady-state mismatch until
-        # plant health gets meaningfully worse.
-        if plant_anomaly and self._residual_floor is not None:
-            window = list(self.anomaly_buffer) + [frame]
-            cur = snapshot_metrics(window)
-            if cur is not None and not exceeds_residual_floor(cur, self._residual_floor):
-                plant_anomaly = False
-        # While re-baselining after a mission change, Error_Tracking may still
-        # describe the *old* objective — do not treat that lag as a fault.
-        mission_for_dispatch = (
-            mission_breach and not self._baseline_stale and not settling
-        )
-
-        # Re-capture MissionNominal from healthy frames after objective changes.
-        if self._baseline_stale:
-            self._maybe_rebaseline(frame, healthy=early.balance_healthy)
-
-        if mission_for_dispatch or plant_anomaly:
-            self.anomaly_buffer.append(frame)
-            if self._anomaly_collect_t0 is None:
-                self._anomaly_collect_t0 = now
-            collect_s = (
-                self.config.anomaly_collection_s
-                if mission_for_dispatch
-                else EARLY_ANOMALY_COLLECTION_S
-            )
-            ready = (now - self._anomaly_collect_t0) >= collect_s
-            cooled = (now - self._last_dispatch_t) >= self.config.cooldown_s
-            if (
-                self.config.enable_llm
-                and ready
-                and cooled
-                and not self.llm_busy
-            ):
-                if self.failure_episode is None:
-                    self.failure_episode = FailureEpisode(
-                        started_at=now,
-                        nominal_baseline=list(self.nominal_baseline),
+        obs = self.effort_observer
+        effort_fault = obs.consecutive_out_of_bounds >= obs.consecutive_steps
+        recovered = (obs.consecutive_in_bounds * obs.dt) > obs.clear_below_s
+        just_stood = False
+        if effort_fault and self.config.enable_llm and self.config.stand_on_fault:
+            just_stood = self._stand_for_walking_bias(now, frame)
+        if (
+            effort_fault
+            and self.config.enable_llm
+            and not self.llm_busy
+            and not self._in_cooldown(now)
+        ):
+            if self.failure_episode is None:
+                self.failure_episode = FailureEpisode(started_at=now)
+                pending = self.loka_state.pop("search_results", None)
+                if pending:
+                    self.failure_episode.interventions.append({
+                        "time": now,
+                        "hypothesis": "earlier belief search",
+                        "search_results": list(pending),
+                    })
+            if self._walk_fault_stand:
+                self.failure_episode.interrupted_walk = True
+            if self.failure_episode.turns_sent >= self.config.max_turns:
+                if not self.failure_episode._turn_cap_noted:
+                    self.failure_episode._turn_cap_noted = True
+                    note = (
+                        f"failure episode turn cap ({self.config.max_turns}) "
+                        f"reached; no further turns until the bias is back in bounds"
                     )
-                metrics = snapshot_metrics(self.anomaly_buffer)
-                stop_reason = self._gate_failure_dispatch(metrics)
-                if stop_reason is not None and metrics is not None:
-                    live_z = float(frame["qpos"][2])
-                    self._accept_residual(
-                        metrics,
-                        reason=stop_reason,
-                        now=now,
-                        live_pelvis_z=live_z,
-                    )
-                    return frame
-
-                reason = "mission" if mission_for_dispatch else "early_anomaly"
-                clue_txt = (
-                    " ".join(early.clues) if early.clues else "(none)"
-                )
-                telemetry = synthesize_stand_telemetry(
-                    self.failure_episode.nominal_baseline,
-                    self.anomaly_buffer,
-                    control_dt=self.sim.config.control_dt,
-                    error_spec=self.loka_state["error_spec"],
-                    directive=(
-                        f"Plant-health anomaly (score={early.score:.2f}). "
-                        f"Clues: {clue_txt}\n"
-                        "Mission Error_Tracking "
-                        f"{'BREACHED' if mission_breach else 'still inside band'}.\n"
-                        "Diagnose from telemetry only (no privileged fault label). "
-                        "Prefer 1–3 allowlisted Controller_Targets and/or Task_Targets. "
-                        "If gait.mode=walk: do NOT lower friction_mu / kp_base_position "
-                        "for normal swing slip or CoM residuals — prefer gait.* knobs "
-                        "or lean; crouch only if tipping. Omit locked QP weights.\n"
-                    ),
-                )
+                    print(f"[LOKA] {note} at t={now:.2f}s")
+                    if self.log is not None:
+                        self.log.note(note, sim_time=now)
+            else:
+                telemetry = self._telemetry_for(frame)
                 cfg_text = format_stand_configuration(self.controller)
                 if self.failure_episode.prior_turn_count == 0:
                     user = self.failure_episode.build_initial_user_turn(
-                        telemetry, self.loka_state, now, cfg_text
+                        telemetry,
+                        self.loka_state,
+                        now,
+                        cfg_text,
+                        just_stood=just_stood,
+                        max_turns=self.config.max_turns,
+                        max_memory=self.config.max_memory,
                     )
                 else:
                     user = self.failure_episode.build_user_turn(
-                        telemetry, self.loka_state, now, cfg_text
+                        telemetry,
+                        self.loka_state,
+                        now,
+                        cfg_text,
+                        just_stood=just_stood,
+                        max_turns=self.config.max_turns,
+                        max_memory=self.config.max_memory,
                     )
-                self._dispatch(self.failure_episode, user, reason=reason)
-        else:
-            # Healthy under the current mission: refresh / rebuild nominal baseline.
-            self.anomaly_buffer.clear()
-            self._anomaly_collect_t0 = None
-            if self._baseline_stale:
-                self._maybe_rebaseline(frame, healthy=early.balance_healthy)
-            else:
-                self._push_baseline(frame)
-            if (
-                self.failure_episode is not None
-                and not self.llm_busy
-                and error == 0.0
-                and not plant_anomaly
-            ):
+                if self._dispatch(self.failure_episode, user, reason="effort_bias"):
+                    self.failure_episode.turns_sent += 1
+        elif recovered and not self.belief_search.busy:
+            if self.failure_episode is not None and not self.llm_busy:
                 print(f"[LOKA] failure episode closed at t={now:.2f}s")
                 if self.log is not None:
                     self.log.note("failure episode closed", sim_time=now)
                 self.failure_episode = None
                 self.active_session = None
+            if not self.llm_busy:
+                self._walk_fault_stand = False
             self._maybe_heartbeat(frame, now)
 
         if self.sim.fell and self.log is not None and not self._fall_logged:
@@ -880,29 +636,65 @@ class LokaRuntime:
 
         return frame
 
+    def _bias_nm(self) -> float | None:
+        obs = self.effort_observer
+        if obs.joint_bias is None:
+            return None
+        return float(np.sum(np.abs(obs.joint_bias)))
+
+    def _bias_threshold_nm(self) -> float:
+        obs = self.effort_observer
+        if obs.is_walking:
+            return float(obs.walk_threshold_nm)
+        return float(obs.stand_threshold_nm)
+
+    def _sync_walk_block(self) -> None:
+        """Refuse a walk command while |bias| is above the mode threshold."""
+        total = self._bias_nm()
+        if total is None:
+            self.controller.gait.block_walk = False
+            return
+        self.controller.gait.block_walk = total > self._bias_threshold_nm()
+
+    def _stand_for_walking_bias(self, now: float, frame: dict) -> bool:
+        """Stand before the orchestrator is invoked for a walking effort fault.
+
+        Returns True only on the step that commands the stand. Later steps of
+        the same episode leave ``_walk_fault_stand`` set so the prompt still
+        tells the model to walk back to the goal.
+        """
+        from loka.control.gait import MODE_WALK
+
+        gait = self.controller.gait
+        if float(gait.config.mode) < MODE_WALK:
+            return False
+        if not bool(frame.get("walking")) and not gait.wants_walk():
+            return False
+        self.controller.set_task_targets({"gait.mode": "stand", "gait.speed": 0.0})
+        self._walk_fault_stand = True
+        frame["walking"] = False
+        frame["cmd_mode"] = float(gait.config.mode)
+        frame["cmd_speed"] = float(gait.config.speed)
+        frame["goal_active"] = float(gait.config.goal_active) >= 0.5
+        print(
+            f"[LOKA] effort bias while walking: gait.mode=stand at t={now:.2f}s"
+        )
+        if self.log is not None:
+            self.log.note("effort bias while walking: gait.mode=stand", sim_time=now)
+        return True
+
     def _maybe_heartbeat(self, frame: dict, now: float) -> None:
         """Wake LOKA on a fixed period when no listener has called it."""
         if (
             not self.config.enable_llm
             or self.llm_busy
+            or self._in_cooldown(now)
             or self.failure_episode is not None
         ):
             return
         if not heartbeat_due(now, self._last_invoke_t, self.config.heartbeat_s):
             return
-        telemetry = self._telemetry_for(
-            frame,
-            directive=(
-                "Periodic check. Before any cost or friction change, read closing "
-                "speed and along heading in the full-state snapshot. Positive "
-                "closing speed is motion toward the goal. Negative means the "
-                "robot is walking away; planar speed does not show the sign. "
-                "A position closer than the start is not progress while closing "
-                "speed is negative. If it is walking away, re-aim gait.heading "
-                "or stop and stand, then walk again. Listeners did not fire "
-                "this interval.\n"
-            ),
-        )
+        telemetry = self._telemetry_for(frame)
         cfg_text = format_stand_configuration(self.controller)
         user = self.operator_session.build_heartbeat_turn(
             telemetry,

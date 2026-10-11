@@ -25,8 +25,8 @@ def default_stand_objective() -> str:
         "Hold a robust standing balance on the Unitree G1, and accept operator "
         "requests to crouch, stand tall, lean, yaw, or walk. On walk requests, "
         "set gait.mode/speed/heading (and optionally cadence / swing height). "
-        "On faults, diagnose and mutate typed controller costs / task setpoints "
-        "/ model belief so the MPC+WBC plant recovers without generating code."
+        "On faults, queue Belief_Searches so the model matches the plant, and set "
+        "Task_Targets for the directive. Do not generate code."
     )
 
 
@@ -93,7 +93,8 @@ def format_stand_capabilities_block(capabilities: dict) -> str:
         "",
         "### Listeners",
         "Arm a one-shot wake: kind near_xy | heading_error_below | speed_below |",
-        "pelvis_z_below | pelvis_z_above | after_s, plus a message.",
+        "pelvis_z_below | pelvis_z_above | after_s | bias_under_threshold, plus a message.",
+        "bias_under_threshold fires when |bias| is at or under the mode threshold.",
         "near_xy uses world pelvis x,y and radius (default 0.4 m).",
         "Set the point early: the call itself takes time and the robot keeps moving.",
         "Omit Listeners to leave the current set armed; an empty list clears them.",
@@ -118,25 +119,27 @@ def _gait_knob_lines(stack: str = "legacy_dcm") -> list[str]:
 
 
 def format_stand_configuration(controller: LocomotionController) -> str:
+    """Live MPC costs and DCM gait knobs, current values only."""
     tasks = controller.task_snapshot()
     weights = controller.tunables()
-    lines = ["## CURRENT STAND CONFIGURATION", "Task_Targets:"]
-    for key, value in tasks.items():
-        if key == "gait.mode":
-            from loka.control.gait import gait_mode_name
+    from loka.control.gait import gait_mode_name
 
+    lines = ["## CURRENT MPC TUNABLES"]
+    mpc_paths = [path for path in sorted(weights) if path.startswith("mpc.")]
+    if not mpc_paths:
+        lines.append("  (none)")
+    for path in mpc_paths:
+        lines.append(f"  {path}: {weights[path]:.6g}")
+    lines.append("## CURRENT DCM TUNABLES")
+    gait_keys = [key for key in sorted(tasks) if str(key).startswith("gait.")]
+    if not gait_keys:
+        lines.append("  (none)")
+    for key in gait_keys:
+        value = float(tasks[key])
+        if key == "gait.mode":
             lines.append(f"  {key}: {value:.4g} ({gait_mode_name(value)})")
         else:
-            lines.append(f"  {key}: {value:.4g}")
-    lines.append("Controller_Targets (allowlisted):")
-    allow = sorted(weights)
-    from loka.control.stacks import SPECS
-
-    stack = getattr(controller.config, "stack", "legacy_dcm")
-    if stack in SPECS:
-        allow = [p for p in sorted(SPECS[stack].llm_allowlist) if p in weights]
-    for path in allow:
-        lines.append(f"  {path}: {weights[path]:.4g}")
+            lines.append(f"  {key}: {value:.6g}")
     return "\n".join(lines)
 
 
@@ -152,12 +155,9 @@ def build_stand_robot_context(controller: LocomotionController) -> str:
         f"Live lean limits [m]: "
         f"x in [{limits['lean_x_min']:.3f}, {limits['lean_x_max']:.3f}], "
         f"y in [{limits['lean_y_min']:.3f}, {limits['lean_y_max']:.3f}]",
-        "qpos[0:3]=pelvis xyz, qpos[3:7]=quat wxyz, qpos[7:]=29 joints.",
+        "qpos[0]=x (pitch), qpos[1]=y (roll), qpos[2]=z (height). "
+        "qpos[3:7]=quat wxyz, qpos[7:]=29 joints.",
         "qvel[0:3]=linear, qvel[3:6]=angular, qvel[6:]=joint rates.",
-        "Default Error_Tracking uses pelvis_height (qpos[2]), drift (qpos[0]/[1]), "
-        "tip_rate (qvel[4]), roll_rate (qvel[3]).",
-        "On gait.mode=walk, forward world-x drift is dropped from Error_Tracking "
-        "(walking advances); criteria focus on height, lateral drift, tip/roll rates.",
     ]
     # Actuator name list helps amputation.
     names = []

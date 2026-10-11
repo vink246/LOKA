@@ -4,12 +4,13 @@
     python -m loka.run_loka
     python -m loka.run_loka --mode walk --speed 0.3
     python -m loka.run_loka --operator "lean left and crouch"
-    python -m loka.run_loka --no-llm --task height=0.60,lean_x=0.03
+    python -m loka.run_loka --no-llm --goal 3,3
     python -m loka.run_loka --fault mass --headless -T 12
 
 ``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``).
-``--no-llm`` ablations may only use structured ``--task`` setpoints — never
-keyword-matched phrases. The control loop never blocks on the model.
+``--no-llm`` accepts a world goal (``--goal 3,3`` or ``goal 3 3`` on
+stdin) and structured ``--task`` setpoints. The control loop never blocks on
+the model.
 
 To drive the same plant by hand, without any language in the loop, use
 ``python -m loka.dashboard`` instead.
@@ -18,13 +19,18 @@ Walk geometry (the footstep plan, DCM reference and swing arcs) is classical;
 the LLM only sets high-level ``gait.*`` Task_Targets (mode, speed, heading,
 cadence, …).
 
+The effort observer prints joint torque bias and per-component state cost
+on one updating line. The orchestrator runs unless you pass ``--no-llm``.
+
 Session logs rewrite ``logs/loka/session.log`` (+ ``.jsonl``) each run.
 
 Interactive viewer commands (stdin) and keys:
   mass / friction|ice / push / dead / scale|weak / clear / help
-  Keys: 2 right knee at 50% torque, 3 push, 4 ice,
+  search mass [body] | search com <x|y|z> [body] | search friction | search gear <actuator> | search stop
+  Keys: 2 right knee at 75% torque, 3 push, 4 ice,
         5 left-shoulder +5 kg, 6 torso +5 kg,
-        7 right-shoulder +5 kg, 8 clear, H help
+        7 right-shoulder +5 kg, 8 clear, H help,
+        M torso-mass search, X/Y/Z torso COM search
 """
 
 from __future__ import annotations
@@ -41,7 +47,14 @@ from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig, TASK_PARAME
 from loka.control.stacks import add_stack_argument, apply_stack_arg
 from loka.sim import Simulation
 from loka.agent.faults import FaultSpec
-from loka.agent.interactive import FAULT_HELP, KeyDebounce, fault_for_keycode, parse_fault_command
+from loka.agent.belief_search import parse_search_command, search_for_keycode
+from loka.agent.interactive import (
+    FAULT_HELP,
+    KeyDebounce,
+    fault_for_keycode,
+    parse_fault_command,
+    parse_goal_command,
+)
 from loka.agent.runtime import LokaConfig, LokaRuntime
 from loka.agent.session_log import default_log_path
 from loka.viz import begin_frame, render_fault_overlays, render_gait_overlays
@@ -115,6 +128,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Structured Task_Targets for ablations, e.g. height=0.60,lean_x=0.03",
     )
+    parser.add_argument(
+        "--goal",
+        type=str,
+        default=None,
+        help="World goal x,y the plant walks to. Works with --no-llm. Example: 3,3",
+    )
     parser.add_argument("--operator-at", type=float, default=3.0)
     parser.add_argument(
         "--fault",
@@ -142,13 +161,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Do not print the full compressor user-turn to stdout (still logged)",
     )
     parser.add_argument(
-        "--max-interventions",
-        type=int,
-        default=5,
-        help="Max LLM interventions per failure episode before accepting residual "
-        "(default: 5; plateau may stop earlier)",
-    )
-    parser.add_argument(
         "--mode",
         choices=("stand", "walk"),
         default="stand",
@@ -166,8 +178,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.operator and args.no_llm:
         parser.error(
             "--operator is language and requires the LLM; "
-            "drop --no-llm, or use --task height=...,lean_x=... for ablations"
+            "drop --no-llm, or use --goal 3,3 / --task for the plant"
         )
+    if args.operator and args.goal:
+        parser.error("pass only one of --operator or --goal")
+    if args.goal is not None:
+        parsed_goal = parse_goal_command(f"goal {args.goal}")
+        if parsed_goal is None:
+            parser.error(f"--goal must be x,y, got {args.goal!r}")
+        args.goal_xy = (parsed_goal[0], parsed_goal[1])
+        args.goal_speed = parsed_goal[2]
+    else:
+        args.goal_xy = None
+        args.goal_speed = None
     if args.operator and args.task:
         parser.error("pass only one of --operator or --task")
     return args
@@ -208,6 +231,11 @@ def build_faults(args: argparse.Namespace) -> list[FaultSpec]:
 def _handle_interactive_line(
     runtime: LokaRuntime, line: str, *, llm_enabled: bool
 ) -> None:
+    if line.strip().lower().startswith("search"):
+        spec = parse_search_command(line)
+        if spec is not None:
+            runtime.belief_search.request(spec)
+        return
     parsed = parse_fault_command(line)
     if parsed == "help":
         print(FAULT_HELP)
@@ -221,21 +249,40 @@ def _handle_interactive_line(
     text = line.strip()
     if not text:
         return
+    goal = parse_goal_command(text)
+    if goal is not None and not llm_enabled:
+        x, y, speed = goal
+        _apply_goal(runtime, x, y, speed)
+        return
     if llm_enabled:
         runtime.submit_operator(text)
         print(f"[operator] queued: {text}")
     else:
         print(
-            "[!] Not a fault command and LLM is off. "
-            "Type 'help' for faults, or run without --no-llm for language."
+            "[!] Not a fault or goal command, and LLM is off. "
+            "Type 'goal x y' or 'help'."
         )
+
+
+def _apply_goal(runtime: LokaRuntime, x: float, y: float, speed: float | None) -> None:
+    """Arm a world goal on the plant. The gait stands once it is inside tolerance."""
+    cruise = 0.15 if speed is None else float(speed)
+    applied = runtime.controller.set_task_targets(
+        {
+            "gait.mode": "walk",
+            "gait.speed": cruise,
+            "gait.goal_x": float(x),
+            "gait.goal_y": float(y),
+        }
+    )
+    print(f"[goal] walk to ({x:g}, {y:g}) at {cruise:g} m/s: {applied}")
 
 
 def _stdin_command_thread(
     runtime: LokaRuntime, stop: threading.Event, *, llm_enabled: bool
 ) -> None:
     print(FAULT_HELP)
-    print("[interactive] type a fault command or operator request, then Enter")
+    print("[interactive] type a fault command, 'goal x y', or an operator request, then Enter")
     while not stop.is_set():
         try:
             line = sys.stdin.readline()
@@ -252,7 +299,12 @@ def _make_key_callback(runtime: LokaRuntime):
     def key_callback(keycode: int) -> None:
         # GLFW keycodes: digits and letters are their Unicode code points.
         action = fault_for_keycode(keycode)
-        if action is None or not keys.allow(keycode):
+        if action is None:
+            spec = search_for_keycode(keycode)
+            if spec is not None and keys.allow(keycode):
+                runtime.belief_search.request(spec)
+            return
+        if not keys.allow(keycode):
             return
         if action == "help":
             print(FAULT_HELP)
@@ -266,6 +318,7 @@ def _make_key_callback(runtime: LokaRuntime):
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    llm_enabled = not args.no_llm
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
     apply_stack_arg(config, args)
     sim = Simulation(config, model_path=args.model)
@@ -275,14 +328,14 @@ def main(argv: list[str] | None = None) -> int:
     runtime = LokaRuntime(
         sim,
         LokaConfig(
-            enable_llm=not args.no_llm,
+            enable_llm=llm_enabled,
             enable_session_log=not args.no_log,
             log_path=log_path,
             print_compressor=not args.quiet_compressor,
-            max_interventions_per_episode=args.max_interventions,
         ),
         faults=build_faults(args),
     )
+    runtime.effort_observer.printout = True
     if args.mode == "walk":
         applied = runtime.controller.set_task_targets(
             {
@@ -296,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     duration = args.duration or (20.0 if args.headless else None)
     stop = threading.Event()
 
-    if args.operator or args.task:
+    if args.operator or args.task or args.goal_xy:
         def _queue_later():
             while not stop.is_set() and sim.data.time < args.operator_at:
                 time.sleep(0.05)
@@ -305,14 +358,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.task is not None:
                 applied = runtime.controller.set_task_targets(args.task)
                 print(f"[ablation] Task_Targets applied: {applied}")
-            else:
+            if args.goal_xy is not None:
+                _apply_goal(runtime, args.goal_xy[0], args.goal_xy[1], args.goal_speed)
+            elif args.operator:
                 runtime.submit_operator(args.operator)
 
         threading.Thread(target=_queue_later, daemon=True).start()
 
     print(
-        f"G1 stand + LOKA: LLM={'on' if not args.no_llm else 'off'}  "
-        f"fault={args.fault}"
+        f"G1 stand: orchestrator {'on' if llm_enabled else 'off'}  fault={args.fault}"
     )
 
     if args.headless:
@@ -332,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         threading.Thread(
             target=_stdin_command_thread,
             args=(runtime, stdin_stop),
-            kwargs={"llm_enabled": not args.no_llm},
+            kwargs={"llm_enabled": llm_enabled},
             daemon=True,
         ).start()
 

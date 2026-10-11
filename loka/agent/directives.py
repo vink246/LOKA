@@ -1,7 +1,7 @@
 """Locked operator missions and the conditions that wake the orchestrator.
 
 A mission directive is text the operator set. LOKA reads it on every turn and
-drives Task_Targets / Error_Tracking / gait toward it. Nothing in a scratchpad
+drives Task_Targets and gait toward it. Nothing in a scratchpad
 can edit or drop it.
 
 A listener is LOKA's own wake-up: a condition plus the message to show when
@@ -23,6 +23,7 @@ LISTENER_KINDS = frozenset(
         "pelvis_z_below",
         "pelvis_z_above",
         "after_s",
+        "bias_under_threshold",
     }
 )
 
@@ -94,7 +95,7 @@ def format_mission_directives(loka_state: dict) -> str:
         )
     lines = [
         "LOCKED. You cannot edit, drop, complete, or replace these.",
-        "Pursue them with Task_Targets, gait.*, Error_Tracking, and Listeners.",
+        "Pursue them with Task_Targets, gait.*, and Listeners.",
     ]
     lines.extend(d.format_line() for d in directives)
     return "\n".join(lines)
@@ -160,6 +161,14 @@ def listener_fired(listener: Listener, frame: dict) -> bool:
         return float(qpos[2]) >= _f(p, "z", 0.75)
     if kind == "after_s":
         return float(frame.get("time", 0.0)) - listener.armed_at >= _f(p, "delay", 5.0)
+    if kind == "bias_under_threshold":
+        if frame.get("belief_search_busy"):
+            return False
+        bias = frame.get("bias_nm")
+        threshold = frame.get("bias_threshold_nm")
+        if bias is None or threshold is None:
+            return False
+        return float(bias) <= float(threshold)
     return False
 
 

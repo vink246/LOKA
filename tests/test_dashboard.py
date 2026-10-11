@@ -99,10 +99,10 @@ def test_number_keys_reach_the_plant_without_a_viewer():
     dash._on_perturb_key("handler", dpg.mvKey_5, None)
     assert sim.model.body_mass[shoulder] == pytest.approx(mass0 + 5.0)
     dash._on_perturb_key("handler", dpg.mvKey_NumPad2, None)
-    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.5 * gear0)
-    # A second press stays at half torque; it does not compound.
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.75 * gear0)
+    # A second press stays at 75% torque; it does not compound.
     dash._on_perturb_key("handler", ord("2"), None)
-    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.5 * gear0)
+    assert sim.model.actuator_gear[knee, 0] == pytest.approx(0.75 * gear0)
     dash._on_perturb_key("handler", dpg.mvKey_8, None)
     assert sim.model.body_mass[shoulder] == pytest.approx(mass0)
     assert sim.model.actuator_gear[knee, 0] == pytest.approx(gear0)
