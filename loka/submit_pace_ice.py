@@ -36,7 +36,7 @@ from loka.harness.units import iter_units
 
 # PACE rejects a submission once a user has about this many jobs queued.
 # Each element of a job array counts as one job.
-DEFAULT_MAX_SUBMITTED = 50
+DEFAULT_MAX_SUBMITTED = 25
 
 
 def first_wave(n_remaining: int, max_submitted: int, *, self_counts: bool) -> tuple[int, str]:
