@@ -2,8 +2,8 @@
 
 Live ``mujoco.Renderer`` shares the process with GLFW and fails under WSLg
 (``GLX`` / ``EGL_BAD_ACCESS``). Instead we sample ``qpos`` at the target fps
-while the viewer runs, then render the clip in a fresh spawned process that
-owns EGL exclusively.
+while the viewer runs, then render the clip in a fresh spawned process. A
+headless node uses OSMesa; a machine with a display uses EGL.
 """
 
 from __future__ import annotations
@@ -36,14 +36,69 @@ def timestamped_recording_path(
     return directory / f"loka_{stamp}.mp4"
 
 
+_OFFSCREEN_KEYS = ("MUJOCO_GL", "PYOPENGL_PLATFORM", "LD_LIBRARY_PATH", "MPLCONFIGDIR")
+
+
+def prepare_offscreen_env() -> str:
+    """Pick a GL backend the way the walker suite does.
+
+    A spawned render process imports MuJoCo while loading the main module, and
+    MuJoCo locks its GL backend at that import. The choice has to be in the
+    environment before ``Process.start``. CPU nodes have no ``DISPLAY``; EGL
+    needs a GPU, so those nodes use OSMesa. Conda keeps ``libOSMesa.so`` in
+    ``$CONDA_PREFIX/lib``, which the dynamic linker does not search.
+    """
+    backend = os.environ.get("MUJOCO_GL", "").strip()
+    if not backend or backend.lower() in {"disable", "disabled", "off", "false", "0"}:
+        headless = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
+        backend = "osmesa" if headless else "egl"
+        os.environ["MUJOCO_GL"] = backend
+    if backend == "osmesa":
+        os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+        prefix = os.environ.get("CONDA_PREFIX", "").strip()
+        lib = os.path.join(prefix, "lib") if prefix else ""
+        if lib and os.path.isdir(lib):
+            current = [part for part in os.environ.get("LD_LIBRARY_PATH", "").split(":") if part]
+            if lib not in current:
+                os.environ["LD_LIBRARY_PATH"] = ":".join([lib, *current])
+
+    config_dir = os.environ.get("MPLCONFIGDIR", "").strip()
+    if not config_dir:
+        home = os.environ.get("HOME") or ""
+        if home and home != "/":
+            config_dir = os.path.join(home, ".cache", "matplotlib")
+        else:
+            config_dir = os.path.join(tempfile.gettempdir(), "matplotlib")
+        os.makedirs(config_dir, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = config_dir
+    return backend
+
+
+def start_offscreen(proc) -> str:
+    """Start ``proc`` with :func:`prepare_offscreen_env`, then restore this process."""
+    saved = {key: os.environ.get(key) for key in _OFFSCREEN_KEYS}
+    backend = prepare_offscreen_env()
+    try:
+        proc.start()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return backend
+
+
 def _render_clip_worker(job: dict) -> None:
     """Child-process entry: load model, render buffered qpos, write mp4."""
-    os.environ["MUJOCO_GL"] = "egl"
-    # Import only after MUJOCO_GL is set so gl_context binds to EGL.
+    prepare_offscreen_env()
     import mediapy as media
     import mujoco
 
     model = mujoco.MjModel.from_xml_path(job["model_path"])
+    from loka.viz import hide_foot_contact_markers
+
+    hide_foot_contact_markers(model)
     data = mujoco.MjData(model)
     qpos_frames = np.load(job["frames_path"])["qpos"]
     camera = job["camera"]
@@ -110,7 +165,7 @@ def render_qpos_clip(
     }
     ctx = mp.get_context("spawn")
     proc = ctx.Process(target=_render_clip_worker, args=(job,))
-    proc.start()
+    start_offscreen(proc)
     proc.join()
     if proc.exitcode != 0:
         raise RuntimeError(

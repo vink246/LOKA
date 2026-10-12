@@ -507,6 +507,7 @@ class LocomotionController:
             measured_mask=measured_mask,
             foot_yaws=robot.foot_yaws(),
             L_meas=robot.angular_momentum_about(feet[stance_i]),
+            pelvis_xy=np.asarray(qpos[:2], dtype=float),
         )
         self._last_gait = gait_out
         walking = gait_out.walking

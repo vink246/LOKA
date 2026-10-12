@@ -305,7 +305,12 @@ def commit_fault(sim, viz: FaultVizState, fault: FaultSpec) -> tuple[bool, str]:
             direction = np.array([1.0, 0.0, 0.0])
         else:
             direction = np.array([direction[0] / n, direction[1] / n, 0.0])
-        sim.pushes.append(Push(impulse=impulse, direction=direction, time=now))
+        duration = float(fault.params.get("duration", 0.05))
+        if duration <= 0.0:
+            return False, f"[FAULT] push duration must be positive, got {duration}"
+        sim.pushes.append(
+            Push(impulse=impulse, direction=direction, time=now, duration=duration)
+        )
         msg = (
             f"[FAULT] push {impulse:.1f} N.s "
             f"dir=({direction[0]:+.1f},{direction[1]:+.1f}) at t={now:.2f}s"

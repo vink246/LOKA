@@ -32,6 +32,38 @@ PUSH = (0.10, 0.85, 1.00, 0.95)
 ADDED_MASS = (1.00, 0.45, 0.05, 0.90)
 
 
+# Group 3 is off in MuJoCo's default viewer and the offscreen renderer.
+_HIDDEN_GROUP = 3
+_FOOT_CONTACT_GEOMS = (
+    "left_foot_heel_out",
+    "left_foot_heel_in",
+    "left_foot_toe_out",
+    "left_foot_toe_in",
+    "right_foot_heel_out",
+    "right_foot_heel_in",
+    "right_foot_toe_out",
+    "right_foot_toe_in",
+)
+
+
+def hide_foot_contact_markers(model) -> None:
+    """Keep sole contact sites and spheres out of a rendered frame.
+
+    The markers stay in the model for the controller. Only their draw group
+    changes, and group 3 is not shown by the default renderer.
+    """
+    from loka.control.robot import CONTACT_SITES, FOOT_CENTER_SITES
+
+    for name in (*CONTACT_SITES, *FOOT_CENTER_SITES):
+        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
+        if site_id >= 0:
+            model.site_group[site_id] = _HIDDEN_GROUP
+    for name in _FOOT_CONTACT_GEOMS:
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if geom_id >= 0:
+            model.geom_group[geom_id] = _HIDDEN_GROUP
+
+
 def begin_frame(viewer) -> None:
     """Drop last frame's overlays. Call once, before the first draw."""
     viewer.user_scn.ngeom = 0
@@ -145,14 +177,13 @@ def render_gait_overlays(viewer, controller) -> None:
         previous = point
 
 
-def render_fault_overlays(viewer, model, data, viz) -> None:
-    """Draw the pushes and added masses an operator has injected.
+def draw_fault_overlays(scene, model, data, viz) -> None:
+    """Draw pushes and added masses into ``scene``.
 
     ``viz`` is any object carrying ``external_force``, ``external_body_id`` and
-    ``mass_loads``; see ``loka.agent.interactive.FaultVizState``.
+    ``mass_loads``; see ``loka.agent.interactive.FaultVizState``. The interactive
+    viewer and the offscreen eval renderer both call this.
     """
-    scene = viewer.user_scn
-
     force = np.asarray(viz.external_force, dtype=float)
     body_id = viz.external_body_id
     if body_id < 0:
@@ -177,3 +208,8 @@ def render_fault_overlays(viewer, model, data, viz) -> None:
         if norm > MAX_ARROW_LEN:
             weight *= MAX_ARROW_LEN / norm
         add_arrow(scene, center, weight, (1.0, 0.25, 0.05, 0.95), width=0.028)
+
+
+def render_fault_overlays(viewer, model, data, viz) -> None:
+    """Draw the pushes and added masses an operator has injected."""
+    draw_fault_overlays(viewer.user_scn, model, data, viz)

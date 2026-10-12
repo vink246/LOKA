@@ -129,8 +129,9 @@ def format_full_state_section(frames: Sequence[dict]) -> str:
 
 
 _EFFORT_NOTE = (
-    "Plant bias force minus the belief-model bias force, resolved into actuators through the foot contacts. "
-    "Zero means the believed dynamics match the plant. "
+    "Measured force minus the belief model's inverse dynamics, resolved into actuators through the foot contacts. "
+    "Measured force is actuator torque (current) plus contact force (foot sensors). "
+    "Zero means the believed dynamics explain the motion. "
     "A persistent positive value means the plant outweighs the belief along that joint (mass or COM too low). "
     "A persistent negative value means the belief overshoots the plant. "
     "A correct mass or COM edit drives these values to zero; if the sign flips, the last edit went too far. "
@@ -172,6 +173,25 @@ def format_effort_section(observer) -> str:
     )
     for _magnitude, value, name in ranked:
         lines.append(f"  {name}: {value:+.2f}")
+    if observer.motor_bias is not None:
+        lines.append(
+            f"  |motor|={observer.motor_nm:.2f}  threshold={observer.motor_threshold_nm:.1f}"
+            "  commanded torque minus applied torque (current). Zero means the gear matches."
+        )
+        motor = np.asarray(observer.motor_bias, dtype=float)
+        shown = 0
+        order = np.argsort(-np.abs(motor))
+        for index in order:
+            if abs(float(motor[index])) < 0.2 or shown >= 4:
+                break
+            name = names[index] if index < len(names) else str(index)
+            lines.append(f"  motor {name}: {float(motor[index]):+.2f}")
+            shown += 1
+    lines.append(
+        f"  stance slip={observer.slip_mps:.3f} m/s"
+        f"  threshold={observer.slip_threshold_mps:.2f}"
+        "  fastest planted sole, ground plane. Persistent slip with a quiet motor is friction."
+    )
     return "\n".join(lines) + "\n"
 
 
