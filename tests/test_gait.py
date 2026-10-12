@@ -25,6 +25,7 @@ from loka.control.gait import (
     MAX_DCM_CORRECTION,
     MODE_WALK,
     SCHED_UP_LAG,
+    STOP_FORCE_STEPS,
     SWING_TOUCHDOWN_VZ,
     SWING_TOUCHDOWN_Z,
     GaitConfig,
@@ -159,6 +160,48 @@ def test_speed_schedule_fills_cadence_unless_the_user_pins_it():
         }
     )
     assert pinned.config.step_period == pytest.approx(0.70)
+
+
+def test_stuck_stop_stands_instead_of_stepping_forever():
+    """A body that never settles must not stay in the zero-speed walk."""
+    sched = walking_scheduler()
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.array([0.25, 0.0, 0.0]), ticks=500)
+    assert sched.walking
+    sched.apply_updates({"gait.mode": "stand", "gait.speed": 0.0})
+    # Ahead of the feet and still moving, so the settle gates stay closed.
+    stuck = np.array([0.25, 0.0, HEIGHT])
+    backward = np.array([-0.30, 0.0, 0.0])
+    drive(sched, com=stuck, com_vel=backward, ticks=200)
+    assert sched.walking
+    assert sched.stop_in_progress
+    drive(sched, com=stuck, com_vel=backward, ticks=2500)
+    assert not sched.walking
+    assert not sched.stop_in_progress
+
+
+def test_settled_stop_stands_before_the_force_budget():
+    sched = walking_scheduler(stance_width=0.20)
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.array([0.25, 0.0, 0.0]), ticks=500)
+    sched.apply_updates({"gait.mode": "stand", "gait.speed": 0.0})
+    # One step is ~0.35 s. The force budget is several steps past a healthy stop.
+    drive(sched, com=com, com_vel=np.zeros(3), ticks=int(0.35 * (STOP_FORCE_STEPS - 2) / 0.002))
+    assert not sched.walking
+
+
+def test_walk_command_clears_a_pending_stop():
+    sched = walking_scheduler()
+    com = np.array([0.0, 0.0, HEIGHT])
+    drive(sched, com=com, com_vel=np.array([0.25, 0.0, 0.0]), ticks=500)
+    sched.apply_updates({"gait.mode": "stand", "gait.speed": 0.0})
+    assert sched.stop_in_progress
+    sched.apply_updates({"gait.mode": "walk", "gait.speed": 0.15})
+    assert not sched.stop_in_progress
+    assert sched.config.mode == MODE_WALK
+    drive(sched, com=com, com_vel=np.array([0.15, 0.0, 0.0]), ticks=50)
+    assert sched.walking
+    assert sched.cmd_speed == pytest.approx(0.15, abs=0.02)
 
 
 def test_mpc_preview_puts_the_swing_foot_on_the_bezier():

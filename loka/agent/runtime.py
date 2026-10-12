@@ -45,12 +45,30 @@ class LokaConfig:
     max_turns: int = int(_SESSION.get("max_turns", 5))
     max_memory: int = int(_SESSION.get("max_memory", _SESSION.get("max_turns", 5)))
     stand_on_fault: bool = bool(_BIAS.get("stand_on_fault", True))
+    #: Orchestrator model. None keeps ``LOKA_STAND_MODEL`` / the worker default.
+    llm_model: str | None = None
+    #: ``wall`` applies a reply on the step it arrives. ``fixed_sim`` lets the
+    #: plant run for ``llm_latency_s`` of sim time after the dispatch, then
+    #: blocks until the reply (or ``llm_request_timeout_s`` of wall time).
+    #: ``pause`` is ``fixed_sim`` with a latency of 0.
+    llm_latency_mode: str = "wall"
+    llm_latency_s: float = 2.0
+    llm_request_timeout_s: float = 120.0
 
     def __post_init__(self) -> None:
         assert 0 <= self.max_memory <= self.max_turns, (
             f"session.max_memory ({self.max_memory}) must be <= "
             f"session.max_turns ({self.max_turns})"
         )
+        if self.llm_latency_mode not in ("wall", "fixed_sim", "pause"):
+            raise ValueError(
+                f"llm_latency_mode must be wall, fixed_sim, or pause, "
+                f"got {self.llm_latency_mode!r}"
+            )
+        if float(self.llm_latency_s) < 0.0:
+            raise ValueError("llm_latency_s must be >= 0")
+        if float(self.llm_request_timeout_s) < 0.0:
+            raise ValueError("llm_request_timeout_s must be >= 0")
     objective: str = field(default_factory=default_stand_objective)
     log_path: Path | None = None
     print_compressor: bool = True
@@ -105,6 +123,9 @@ class LokaRuntime:
 
         self.llm_queue: queue.Queue = queue.Queue()
         self.llm_busy = False
+        self.turns: list[dict] = []
+        self._dispatch_sim_t = 0.0
+        self._dispatch_wall_t = 0.0
         self.operator_queue: queue.Queue = queue.Queue()
         self.history: list[dict] = []
         self._pending_user_content: str | None = None
@@ -308,6 +329,11 @@ class LokaRuntime:
         self._pending_user_content = user_content
         self._pending_dispatch_reason = reason
         self._last_invoke_t = now
+        self._dispatch_sim_t = now
+        self._dispatch_wall_t = time.perf_counter()
+        # A fresh queue so a reply abandoned after a timeout cannot be
+        # applied as the next turn.
+        self.llm_queue = queue.Queue()
         messages = session.compose_api_messages(
             self.system_prompt,
             user_content,
@@ -316,6 +342,7 @@ class LokaRuntime:
         thread = threading.Thread(
             target=stand_llm_worker,
             args=(messages, self.llm_queue),
+            kwargs={"model": self.config.llm_model},
             daemon=True,
         )
         thread.start()
@@ -340,23 +367,59 @@ class LokaRuntime:
         return True
 
     def _drain_llm(self) -> None:
-        try:
-            result = self.llm_queue.get_nowait()
-        except queue.Empty:
+        if not self.llm_busy:
             return
+        mode = self.config.llm_latency_mode
+        now = float(self.sim.data.time)
+        timed_out = False
+        if mode in ("fixed_sim", "pause"):
+            latency = 0.0 if mode == "pause" else float(self.config.llm_latency_s)
+            if now + 1e-9 < float(self._dispatch_sim_t) + latency:
+                return
+            timeout = max(0.0, float(self.config.llm_request_timeout_s))
+            try:
+                result = self.llm_queue.get(timeout=timeout)
+            except queue.Empty:
+                result = None
+                timed_out = True
+                self.llm_queue = queue.Queue()
+        else:
+            try:
+                result = self.llm_queue.get_nowait()
+            except queue.Empty:
+                return
+        self._accept_llm_result(result, timed_out=timed_out)
+
+    def _accept_llm_result(self, result, *, timed_out: bool) -> None:
         self.llm_busy = False
         now = float(self.sim.data.time)
         self._last_edit_t = now
-        if not result or not result.get("scratchpad"):
-            print(
-                f"[LOKA] empty orchestrator result; "
-                f"cooldown {self.config.cooldown_s:.1f}s"
+        wall_latency = time.perf_counter() - float(self._dispatch_wall_t)
+        reason = self._pending_dispatch_reason
+        user_content = self._pending_user_content
+        if timed_out or not result or not result.get("scratchpad"):
+            note = (
+                f"orchestrator timed out after {self.config.llm_request_timeout_s:.0f}s"
+                if timed_out
+                else "empty orchestrator result"
             )
+            print(f"[LOKA] {note}; cooldown {self.config.cooldown_s:.1f}s")
             if self.log is not None:
-                self.log.note(
-                    "empty orchestrator result",
-                    sim_time=now,
-                )
+                self.log.note(note, sim_time=now)
+            self.turns.append(
+                {
+                    "reason": reason,
+                    "sim_time": float(self._dispatch_sim_t),
+                    "applied_sim_time": now,
+                    "wall_latency_s": wall_latency,
+                    "user_content": user_content,
+                    "raw_yaml": None if not result else result.get("raw_yaml"),
+                    "scratchpad": None,
+                    "summary": None,
+                    "timed_out": timed_out,
+                    "model": self.config.llm_model,
+                }
+            )
             self._pending_user_content = None
             return
         scratchpad = result["scratchpad"]
@@ -387,6 +450,20 @@ class LokaRuntime:
             self.belief_search.enqueue(searches)
         if self.log is not None:
             self.log.apply_summary(sim_time=now, summary=summary)
+        self.turns.append(
+            {
+                "reason": reason,
+                "sim_time": float(self._dispatch_sim_t),
+                "applied_sim_time": now,
+                "wall_latency_s": wall_latency,
+                "user_content": user_content,
+                "raw_yaml": raw,
+                "scratchpad": scratchpad if isinstance(scratchpad, dict) else None,
+                "summary": summary,
+                "timed_out": False,
+                "model": self.config.llm_model,
+            }
+        )
         self._rebuild_prompt()
         print(
             f"[LOKA] edit applied at t={now:.2f}s; "

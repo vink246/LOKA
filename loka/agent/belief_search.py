@@ -29,6 +29,7 @@ import numpy as np
 
 from loka.agent.interactive import MASS_BODY_ALIASES
 from loka.agent.model_state import resolve_mjcf_name
+from loka.control.gait import MODE_WALK
 
 _KNEE = ("left_knee", "right_knee")
 _PITCH = ("left_hip_pitch", "right_hip_pitch", "waist_pitch")
@@ -329,6 +330,7 @@ class BeliefSearchRunner:
         self._saved_mutations: list | None = None
         self._target: dict | None = None
         self._saved_gait: dict | None = None
+        self._hold_for_stand = False
 
     @property
     def busy(self) -> bool:
@@ -365,6 +367,22 @@ class BeliefSearchRunner:
         if not self.active or self._search is None or self._target is None:
             return
         now = float(self.runtime.sim.data.time)
+        if self._hold_for_stand:
+            if self.runtime.sim.fell:
+                self._hold_for_stand = False
+                self._queue.clear()
+                self._finish("robot fell", self._search.value)
+                return
+            if self.runtime.effort_observer.is_walking:
+                return
+            self._hold_for_stand = False
+            settle = self._get_settle_time()
+            self._ready_at = now + settle
+            print(
+                f"\n[search] {self._label()} standing."
+                f" Settling {settle:.2f}s before the first probe."
+            )
+            return
         if now < self._ready_at:
             return
         if self.runtime.sim.fell:
@@ -396,6 +414,7 @@ class BeliefSearchRunner:
                 self._record(self._search.start, decision.reason)
                 self._search = None
                 self.active = False
+                self._hold_for_stand = False
                 self._start_next()
                 return
             self._write(decision.value)
@@ -430,28 +449,49 @@ class BeliefSearchRunner:
         self._search = make_search(spec.kind, start, axis=spec.axis, origin=origin)
         self.active = True
         now = float(self.runtime.sim.data.time)
-        # new save gait stuff
-        gait = self.runtime.controller.gait
-        if self.runtime.effort_observer.is_walking:
-            self._saved_gait = {
-                "gait.speed": float(gait.config.speed),
-                "gait.stance_width": float(gait.config.stance_width),
-                "gait.duty_factor": float(gait.config.duty_factor),
-            }
-            self.runtime.controller.set_task_targets({ # Stabilize the robot during the search
-                "gait.speed": 0,             # Slow walking
-                "gait.stance_width": 0.28,     # Maximum stance width
-                "gait.duty_factor": 0.85       # Maximum double-support time
-            })
-            print("\n[search] Engaged high-stability Search Gait.")
-        else:
-            self._saved_gait = None
-
-        self._ready_at = now + self._get_settle_time() # self._settle_s
+        self._engage_measurement_gait()
+        if self._hold_for_stand:
+            self._ready_at = now
+            print(
+                f"\n[search] {self._label()} started at {start:.4g} "
+                f"(nominal {origin:.4g}). Waiting for the stand before probing."
+            )
+            return
+        settle = self._get_settle_time()
+        self._ready_at = now + settle
         print(
             f"\n[search] {self._label()} started at {start:.4g} "
-            f"(nominal {origin:.4g}). Settling {self._get_settle_time():.2f}s between probes."
+            f"(nominal {origin:.4g}). Settling {settle:.2f}s between probes."
         )
+
+    def _engage_measurement_gait(self) -> None:
+        """Keep a fault stand. A live walk may still use the slow search gait.
+
+        ``gait.mode=stand`` only requests a stop. Until that stop finishes,
+        ``is_walking`` is still true. Applying the speed-0 search gait there
+        widens the stance the stop is trying to square and leaves the step
+        clock running, which walks backward under a torso-mass error.
+        """
+        gait = self.runtime.controller.gait
+        if gait.stop_in_progress or float(gait.config.mode) < MODE_WALK:
+            self._saved_gait = None
+            self._hold_for_stand = bool(gait.walking)
+            return
+        self._hold_for_stand = False
+        if not self.runtime.effort_observer.is_walking:
+            self._saved_gait = None
+            return
+        self._saved_gait = {
+            "gait.speed": float(gait.config.speed),
+            "gait.stance_width": float(gait.config.stance_width),
+            "gait.duty_factor": float(gait.config.duty_factor),
+        }
+        self.runtime.controller.set_task_targets({
+            "gait.speed": 0,
+            "gait.stance_width": 0.28,
+            "gait.duty_factor": 0.85,
+        })
+        print("\n[search] Engaged high-stability Search Gait.")
 
     def _resolve(self, spec: SearchRequest) -> dict | None:
         import mujoco
@@ -564,6 +604,7 @@ class BeliefSearchRunner:
         self._restore_gait()
         print("[search] cancelled; belief restored")
         self.active = False
+        self._hold_for_stand = False
         self._search = None
 
     def _record(self, value: float, reason: str) -> None:
@@ -578,6 +619,7 @@ class BeliefSearchRunner:
         self._restore_gait()
         self._search = None
         self.active = False
+        self._hold_for_stand = False
         self._start_next()
 
     def _label(self) -> str:

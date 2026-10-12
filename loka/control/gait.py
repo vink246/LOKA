@@ -214,6 +214,12 @@ STEP_SWING_RATE_MAX = 1.25  # fastest swing clock; v1 only ever shortens a step
 
 #: Extra steps after a stop request before the feet-square test loosens.
 STOP_RELAX_STEPS = 4
+#: Step boundaries an unfinished stop may take before standing anyway.
+#: A model error can hold the body outside the speed and offset gates, and
+#: the zero-speed walk that remains then ratchets the footholds backward.
+#: Command speed hits zero in about one step; this bound is several steps
+#: past that, so a healthy stop still settles on the gates below.
+STOP_FORCE_STEPS = 8
 #: Don't enter stand while the heading speed is still above this [m/s], or
 #: while the pelvis sits this far from the foot midpoint [m]. The step orbit
 #: itself is about 0.10 m/s at a boundary, so the bar sits just above that.
@@ -690,6 +696,11 @@ class GaitScheduler:
         return self._active
 
     @property
+    def stop_in_progress(self) -> bool:
+        """True after a stand was requested and the step clock has not released."""
+        return bool(self._stop_requested and self._active)
+
+    @property
     def step_index(self) -> int:
         """Support steps completed since the walk began."""
         return int(self._step)
@@ -753,6 +764,10 @@ class GaitScheduler:
                     self._stop_requested = True
                 else:
                     self.reset()
+            elif field_name == "mode" and value >= MODE_WALK:
+                # A fault stand leaves the stop set until the clock releases.
+                # The next walk has to drop it, or the speed target stays 0.
+                self._release_stop()
         self._apply_goal_updates(applied)
         self._use_speed_schedule = float(self.config.mode) >= MODE_WALK
         applied.update(self.apply_speed_schedule())
@@ -795,6 +810,12 @@ class GaitScheduler:
             else:
                 cfg.mode = MODE_WALK
                 applied["gait.mode"] = MODE_WALK
+                self._release_stop()
+
+    def _release_stop(self) -> None:
+        """Drop a stand request so a new walk can command a speed."""
+        self._stop_requested = False
+        self._stop_extra = 0
 
     def _steer_to_goal(self, com_xy: np.ndarray) -> None:
         """Aim heading at the goal and command the approach speed.
@@ -826,6 +847,7 @@ class GaitScheduler:
                 cfg.mode = MODE_STAND
                 return
             cfg.mode = MODE_WALK
+            self._release_stop()
         if dist <= tol:
             self._goal_arrived = True
             self._goal_cmd = 0.0
@@ -840,6 +862,7 @@ class GaitScheduler:
                 self._goal_cmd = 0.0
                 return
             cfg.mode = MODE_WALK
+            self._release_stop()
         if dist > max(GOAL_HEADING_FREEZE, 1.5 * tol):
             bearing = float(np.arctan2(delta[1], delta[0]))
             if abs(wrap_angle(bearing - float(cfg.heading))) > GOAL_HEADING_DEADBAND:
@@ -1632,12 +1655,16 @@ class GaitScheduler:
         """True once halting would leave the feet square and the body over them.
 
         Called only at a step boundary, so stopping always completes the step
-        in progress rather than freezing a leg in mid-air.
+        in progress rather than freezing a leg in mid-air. A stop that is
+        still outside the settle gates after :data:`STOP_FORCE_STEPS`
+        boundaries stands anyway.
         """
         if float(self.config.mode) == MODE_TREAD and not self._stop_requested:
             return False
+        if self._stop_requested and self._stop_extra >= STOP_FORCE_STEPS:
+            return True
         if self._cmd_speed > 1e-3:
-            return False
+            return self._count_unfinished_stop()
         # Command speed is not the body's speed. The lateral part of this
         # reading is the step orbit, so only the heading component has to be
         # gone. A shortened foothold can still leave the pelvis ahead of the
@@ -1646,11 +1673,11 @@ class GaitScheduler:
             abs(float(self._meas_speed)) > STOP_SPEED
             or float(np.linalg.norm(com_xy - feet_xy.mean(axis=0))) > STOP_OFFSET
         ):
-            return False
+            return self._count_unfinished_stop()
         here = self._steps.get(self._step)
         nxt = self._steps.get(self._step + 1)
         if here is None or nxt is None:
-            return False
+            return self._count_unfinished_stop()
         if not self._stop_requested:
             if abs(wrap_angle(self._heading_goal() - float(here.yaw))) > 0.03:
                 return False
@@ -1662,9 +1689,17 @@ class GaitScheduler:
         yaw_ok = abs(wrap_angle(float(nxt.yaw) - float(here.yaw))) < yaw_tol
         if stride_ok and yaw_ok and self._stance_planted(feet, ground_z, measured_mask):
             return True
-        if self._stop_requested:
-            self._stop_extra += 1
-        return False
+        return self._count_unfinished_stop()
+
+    def _count_unfinished_stop(self) -> bool:
+        """Count one step boundary of a stop that has not settled.
+
+        Returns true once that count reaches :data:`STOP_FORCE_STEPS`.
+        """
+        if not self._stop_requested:
+            return False
+        self._stop_extra += 1
+        return self._stop_extra >= STOP_FORCE_STEPS
 
     def _stance_planted(self, feet, ground_z, measured_mask) -> bool:
         """Both soles down, and the lateral gap at least the stance width."""
@@ -1797,14 +1832,23 @@ class GaitScheduler:
                 cleared = self._swing_cleared
                 self._swing_cleared = False
                 # A touchdown timeout leaves the swing foot in the air.
-                # Standing then treats that foot as support.
-                if foot_down and self._may_stop(
-                    com_xy=com_xy,
-                    feet_xy=feet_xy,
-                    feet=feet,
-                    ground_z=ground_z,
-                    measured_mask=measured_mask,
-                ):
+                # Standing then treats that foot as support. Count it toward
+                # the force-stand budget so a foot that never plants cannot
+                # keep the zero-speed walk alive.
+                if foot_down:
+                    stand_now = self._may_stop(
+                        com_xy=com_xy,
+                        feet_xy=feet_xy,
+                        feet=feet,
+                        ground_z=ground_z,
+                        measured_mask=measured_mask,
+                    )
+                elif self._stop_requested:
+                    self._stop_extra += 1
+                    stand_now = self._stop_extra >= STOP_FORCE_STEPS
+                else:
+                    stand_now = False
+                if stand_now:
                     yaw = self._stance_yaw()
                     self.reset()
                     self._stand_yaw = yaw

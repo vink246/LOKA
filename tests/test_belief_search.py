@@ -1,10 +1,14 @@
 """Unbounded belief search, without a simulator."""
 
+from types import SimpleNamespace
+
 from loka.agent.belief_search import (
+    BeliefSearchRunner,
     UnboundedSearch,
     parse_belief_searches,
     parse_search_command,
 )
+from loka.control.gait import MODE_STAND, MODE_WALK
 
 
 def _run(search: UnboundedSearch, error_at):
@@ -114,3 +118,64 @@ def test_scratchpad_queues_mass_then_com_axes():
         ("com", "torso_link", "y"),
         ("gear", "right_knee", None),
     ]
+
+
+def _runner(*, mode, walking, stop, searching_while_walking=True):
+    gait = SimpleNamespace(
+        config=SimpleNamespace(
+            mode=mode, speed=0.15, stance_width=0.226, duty_factor=0.81,
+        ),
+        walking=walking,
+        stop_in_progress=stop,
+    )
+    controller = SimpleNamespace(gait=gait, targets=None)
+
+    def set_task_targets(updates):
+        controller.targets = dict(updates)
+
+    controller.set_task_targets = set_task_targets
+    observer = SimpleNamespace(
+        is_walking=searching_while_walking,
+        step_period=0.70,
+        window_size=100,
+        dt=0.002,
+        joint_bias=None,
+    )
+    runtime = SimpleNamespace(
+        controller=controller,
+        effort_observer=observer,
+        sim=SimpleNamespace(data=SimpleNamespace(time=1.0), fell=False),
+    )
+    return BeliefSearchRunner(runtime), controller, observer
+
+
+def test_search_waits_for_a_fault_stand_instead_of_overriding_it():
+    runner, controller, observer = _runner(mode=MODE_STAND, walking=True, stop=True)
+    runner._engage_measurement_gait()
+    assert controller.targets is None
+    assert runner._saved_gait is None
+    assert runner._hold_for_stand
+
+    runner.active = True
+    runner._search = SimpleNamespace(value=9.6)
+    runner._target = {}
+    runner._request = SimpleNamespace(kind="mass", name="torso_link", axis=None)
+    runner.tick()
+    assert runner._hold_for_stand
+
+    observer.is_walking = False
+    runner.tick()
+    assert not runner._hold_for_stand
+    assert runner._ready_at > runner.runtime.sim.data.time
+
+
+def test_search_gait_still_engages_during_a_live_walk():
+    runner, controller, _observer = _runner(mode=MODE_WALK, walking=True, stop=False)
+    runner._engage_measurement_gait()
+    assert controller.targets == {
+        "gait.speed": 0,
+        "gait.stance_width": 0.28,
+        "gait.duty_factor": 0.85,
+    }
+    assert runner._saved_gait["gait.speed"] == 0.15
+    assert not runner._hold_for_stand

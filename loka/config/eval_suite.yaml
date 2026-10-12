@@ -1,0 +1,79 @@
+# G1 evaluation suite. CLI flags override these values.
+# python -m loka.run_eval --config loka/config/eval_suite.yaml
+
+output_dir: results/g1_eval
+seed: 0
+num_trials: 5
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+orchestrator:
+  model: gpt-6-luna
+  # fixed_sim keeps the plant running for `seconds` of sim time after a
+  # dispatch, then waits for the reply. wall uses arrival time. pause waits
+  # immediately (zero sim-time latency).
+  latency:
+    mode: fixed_sim
+    seconds: 2.0
+  request_timeout_s: 120.0
+
+recording:
+  enabled: true
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  # boundary encodes the last survived probe and the first falling probe.
+  # all encodes every probe. render.npz is kept either way.
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+# A baseline is a name, or {name, type, options} for a future RL / VLA entry.
+baselines: [low_level, loka]
+
+tasks:
+  - name: stand_push
+    type: stand_push
+    mass:
+      body: left_shoulder_roll_link
+      delta_kg: 10.0
+    mass_time_s: 2.0
+    push_delay_s: 10.0
+    observe_s: 10.0
+    push:
+      direction: [0.0, 1.0]
+      duration_s: 0.05
+    search:
+      lo_n: 0.0
+      hi_n: 200.0
+      max_hi_n: 2000.0
+      resolution_n: 0.2
+    metrics: [max_push_force_n]
+
+  - name: goto_goal
+    type: goto_goal
+    goal:
+      xy: [3.0, 0.0]
+      speed: 0.15
+      radius: 0.15
+      hold_s: 0.0
+    command_time_s: 0.5
+    perturbation_time_s: 3.0
+    timeout_s: 40.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+      - {name: torso_mass, kind: mass, body: torso_link, delta_kg: 10.0}
+      - {name: shoulder_mass, kind: mass, body: left_shoulder_roll_link, delta_kg: 7.0}
+      - {name: weak_right_knee, kind: actuator_gear, actuator: right_knee, scale: 0.75}
+      - {name: low_friction, kind: friction, mu: 0.3}
+      - {name: shove, kind: push, force_n: 150.0, direction: [0.0, 1.0], duration_s: 0.1}
+    metrics: [success, time_to_goal_s, final_goal_error_m, fell, path_efficiency]
