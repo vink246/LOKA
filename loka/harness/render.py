@@ -86,10 +86,25 @@ def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, muj
         "distance": float(recording.distance),
         "min_push_visible_s": float(recording.min_push_visible_s),
     }
+    # Spawn re-imports the main module, and that import pulls MuJoCo in,
+    # before ``_render_worker`` runs. The GL backend is chosen on first
+    # import, so the child has to inherit the variable. Setting it inside
+    # the worker is too late: on a headless node the default is GLFW, and
+    # GLFW exits because DISPLAY is unset.
     ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_render_worker, args=(job,))
-    proc.start()
-    proc.join()
+    previous = os.environ.get("MUJOCO_GL")
+    os.environ["MUJOCO_GL"] = str(mujoco_gl)
+    proc = None
+    try:
+        proc = ctx.Process(target=_render_worker, args=(job,))
+        proc.start()
+    finally:
+        if previous is None:
+            os.environ.pop("MUJOCO_GL", None)
+        else:
+            os.environ["MUJOCO_GL"] = previous
+    if proc is not None:
+        proc.join()
     try:
         os.remove(frames_path)
     except OSError:

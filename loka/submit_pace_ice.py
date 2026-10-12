@@ -201,8 +201,9 @@ def _preamble(
         "export MKL_NUM_THREADS=1",
         f"export LOKA_JOBS_FILE={shlex.quote(str(jobs_file))}",
     ]
-    if mujoco_gl:
-        lines.append(f"export MUJOCO_GL={shlex.quote(mujoco_gl)}")
+    # Headless compute nodes have no DISPLAY. Export this before Python
+    # starts so MuJoCo does not bind GLFW during import.
+    lines.append(f"export MUJOCO_GL={shlex.quote(mujoco_gl or 'egl')}")
     return lines
 
 

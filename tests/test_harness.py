@@ -82,6 +82,45 @@ def test_shipped_suite_and_round_trip():
     ]
 
 
+def test_render_child_inherits_mujoco_gl_before_import(monkeypatch, tmp_path: Path):
+    import os
+
+    from loka.harness import render as render_mod
+    from loka.harness.config import RecordingSpec
+
+    seen = {}
+
+    class _Proc:
+        exitcode = 0
+
+        def start(self):
+            seen["during"] = os.environ.get("MUJOCO_GL")
+
+        def join(self):
+            return None
+
+    class _Ctx:
+        def Process(self, target, args):
+            del target
+            seen["job_gl"] = args[0]["mujoco_gl"]
+            return _Proc()
+
+    monkeypatch.setattr(render_mod.mp, "get_context", lambda _name: _Ctx())
+    monkeypatch.setenv("MUJOCO_GL", "glfw")
+    render_mod._spawn_render(
+        model_path="models/g1/scene.xml",
+        times=[0.0],
+        qpos=[[0.0]],
+        overlays=[],
+        out_path=tmp_path / "episode.mp4",
+        recording=RecordingSpec(fps=10, width=64, height=48),
+        mujoco_gl="osmesa",
+    )
+    assert seen["during"] == "osmesa"
+    assert seen["job_gl"] == "osmesa"
+    assert os.environ["MUJOCO_GL"] == "glfw"
+
+
 def test_recording_follows_the_yaml_unless_a_flag_is_set():
     import argparse
 
