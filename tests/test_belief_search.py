@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from loka.agent.belief_search import (
     BeliefSearchRunner,
     UnboundedSearch,
@@ -92,13 +94,71 @@ def test_in_bounds_must_hold_before_clear():
     import numpy as np
     from loka.agent.anomaly import EffortDeviationObserver
 
-    obs = EffortDeviationObserver()
+    obs = EffortDeviationObserver(window_size_steps=2)
     obs.dt = 0.002
+    obs.update(np.zeros(2), np.zeros(12))
+    assert obs.consecutive_in_bounds == 0
+    assert obs.joint_bias is not None and float(np.sum(np.abs(obs.joint_bias))) == 0.0
     obs.update(np.zeros(2), np.zeros(12))
     assert obs.consecutive_in_bounds == 1
     assert (obs.consecutive_in_bounds * obs.dt) <= obs.clear_below_s
     obs.update(np.array([100.0, 0.0]), np.zeros(12))
     assert obs.consecutive_in_bounds == 0
+    assert obs.consecutive_out_of_bounds == 1
+
+
+def test_gear_search_hold_keeps_the_command_on_the_committed_gear():
+    import numpy as np
+    from loka.agent.model_state import actuator_torque_scale
+
+    class _Model:
+        nu = 2
+        actuator_gear = np.array([[1.0], [0.5]])
+
+    state = {"nominal_gears": np.array([1.0, 1.0])}
+    # The model is a probe at 0.5. The hold is the gear from before the search.
+    scale = actuator_torque_scale(
+        _Model(), state, belief_gear=np.array([1.0, 1.0])
+    )
+    assert scale == pytest.approx([1.0, 1.0])
+
+
+def test_belief_gear_scales_the_command_and_the_torque_limit():
+    import numpy as np
+    from loka.agent.model_state import actuator_torque_scale, joint_torque_to_command
+
+    class _Model:
+        nu = 2
+        actuator_gear = np.array([[1.0], [0.75]])
+
+    state = {"nominal_gears": np.array([1.0, 1.0])}
+    scale = actuator_torque_scale(_Model(), state)
+    assert scale == pytest.approx([1.0, 0.75])
+    limit = np.array([100.0, 100.0])
+    # A 10 Nm plan on a 0.75 motor is a command of 13.33, still inside the
+    # driver limit. Delivered joint torque is then scale * command.
+    command = joint_torque_to_command(np.array([10.0, 10.0]), scale, limit)
+    assert command == pytest.approx([10.0, 10.0 / 0.75])
+    assert scale * command == pytest.approx([10.0, 10.0])
+    # A dead constant sends nothing, and a plan past the reduced limit clips
+    # at the driver command limit.
+    assert joint_torque_to_command(np.array([5.0]), np.array([0.0]), np.array([40.0])) == pytest.approx([0.0])
+    saturated = joint_torque_to_command(np.array([100.0]), np.array([0.75]), np.array([40.0]))
+    assert saturated == pytest.approx([40.0])
+
+
+def test_walk_residual_waits_for_two_steps():
+    import numpy as np
+    from loka.agent.anomaly import EffortDeviationObserver
+
+    obs = EffortDeviationObserver(window_size_steps=4)
+    obs.dt = 0.5
+    obs.step_period = 0.5
+    obs.is_walking = True
+    obs.update(np.array([100.0, 0.0]), np.zeros(12))
+    assert not obs.out_of_bounds
+    assert obs.consecutive_out_of_bounds == 0
+    obs.update(np.array([100.0, 0.0]), np.zeros(12))
     assert obs.consecutive_out_of_bounds == 1
 
 

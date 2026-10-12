@@ -96,6 +96,9 @@ def _render_clip_worker(job: dict) -> None:
     import mujoco
 
     model = mujoco.MjModel.from_xml_path(job["model_path"])
+    from loka.viz import hide_foot_contact_markers
+
+    hide_foot_contact_markers(model)
     data = mujoco.MjData(model)
     qpos_frames = np.load(job["frames_path"])["qpos"]
     camera = job["camera"]

@@ -43,8 +43,9 @@ def motor_deficit(model, belief_gear, nominal_gear, ctrl, qfrc_actuator):
 
     ``qfrc_actuator`` is the sim stand-in for current-derived torque. Expected
     torque scales with the believed gear, so a gear search can drive this to
-    zero. ``gear_error`` is ``(belief_gear - plant_gear)`` on actuators whose
-    command is large enough to divide; positive means the belief gear is high.
+    zero. ``gear_error`` is ``(belief_gear / nominal - plant_gear)`` on
+    actuators whose command is large enough to divide; positive means the
+    belief gear is high.
     """
     ctrl = np.asarray(ctrl, dtype=float).reshape(-1)
     applied = np.asarray(qfrc_actuator, dtype=float).reshape(-1)
@@ -142,24 +143,39 @@ class EffortDeviationObserver:
             gear_bias = np.mean(np.stack(self._gear_samples), axis=0)
             slip_m = float(np.mean(self._slip_samples))
         avg_cost = np.mean(np.stack(self.costs), axis=0)
-        total_bias = float(np.sum(np.abs(joint_bias)))
-        motor_nm = float(np.sum(np.abs(motor_bias)))
+        if self.is_walking:
+            ready = len(self._walk) >= n
+        else:
+            ready = len(self.torque_deviations) >= self.window_size
         if self.is_walking != self._was_walking:
             self.consecutive_out_of_bounds = 0
             self.consecutive_in_bounds = 0
             self._was_walking = self.is_walking
-        threshold = self.walk_threshold_nm if self.is_walking else self.stand_threshold_nm
-        self.out_of_bounds = (
-            total_bias > threshold
-            or motor_nm > self.motor_threshold_nm
-            or slip_m > self.slip_threshold_mps
-        )
-        if self.out_of_bounds:
-            self.consecutive_out_of_bounds += 1
-            self.consecutive_in_bounds = 0
+        # A one-sample mean is the startup spike. Publish zeros, and do not
+        # count the step, until the standing window or the two-step walk
+        # window is full.
+        if not ready:
+            joint_bias = np.zeros_like(delta_tau)
+            motor_bias = np.zeros_like(motor)
+            slip_m = 0.0
+            total_bias = 0.0
+            motor_nm = 0.0
+            self.out_of_bounds = False
         else:
-            self.consecutive_out_of_bounds = 0
-            self.consecutive_in_bounds += 1
+            total_bias = float(np.sum(np.abs(joint_bias)))
+            motor_nm = float(np.sum(np.abs(motor_bias)))
+            threshold = self.walk_threshold_nm if self.is_walking else self.stand_threshold_nm
+            self.out_of_bounds = (
+                total_bias > threshold
+                or motor_nm > self.motor_threshold_nm
+                or slip_m > self.slip_threshold_mps
+            )
+            if self.out_of_bounds:
+                self.consecutive_out_of_bounds += 1
+                self.consecutive_in_bounds = 0
+            else:
+                self.consecutive_out_of_bounds = 0
+                self.consecutive_in_bounds += 1
         self.joint_bias = joint_bias
         self.motor_bias = motor_bias
         self.gear_error = gear_bias

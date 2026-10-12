@@ -12,7 +12,12 @@ from pathlib import Path
 import numpy as np
 
 from loka.control.locomotion import CONTACT_HEIGHT_TOLERANCE, LocomotionController
-from loka.agent.model_state import apply_loka_mutations, zero_dead_actuator_commands
+from loka.agent.model_state import (
+    actuator_torque_scale,
+    apply_loka_mutations,
+    joint_torque_to_command,
+    zero_dead_actuator_commands,
+)
 from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
@@ -152,6 +157,10 @@ class LokaRuntime:
                 f"faults={len(self.faults)}"
             )
 
+        # Driver command limit in actuator units. After a gear search accepts,
+        # the QP's joint-torque limit is this times that belief, refreshed
+        # every step.
+        self._command_limit = self.controller.robot.torque_limit.copy()
         self.effort_observer = EffortDeviationObserver()
         self.effort_observer.dt = float(self.sim.config.control_dt)
         self.effort_observer.names = tuple(
@@ -512,15 +521,30 @@ class LokaRuntime:
         import mujoco
 
         sim = self.sim
+        # The command scale is the committed belief gear. A gear search holds
+        # the previous constant while it probes, and the accepted value is
+        # what the QP plans against on the next step. On hardware the command
+        # is the current or torque setpoint. The plant gear is not read.
+        robot = self.controller.robot
+        scale = actuator_torque_scale(
+            robot.model,
+            self.loka_state,
+            belief_gear=self.belief_search.command_gear_hold,
+        )
+        achievable = self._command_limit * scale
+        robot.torque_limit[:] = achievable
+        if self.controller.wbc.torque_limit is not robot.torque_limit:
+            self.controller.wbc.torque_limit[:] = achievable
         torque = self.controller.compute_torque(sim.data.qpos, sim.data.qvel)
         zero_dead_actuator_commands(torque, self.loka_state)
-        sim.torque = torque
+        command = joint_torque_to_command(torque, scale, self._command_limit)
+        sim.torque = command
         force = sim._applied_force()
         self.viz.external_force = force.copy()
         self.viz.external_body_id = sim.pelvis_id
 
         for _ in range(sim.steps_per_control):
-            sim.data.ctrl[:] = torque
+            sim.data.ctrl[:] = command
             sim.data.xfrc_applied[sim.pelvis_id, :3] = force
             mujoco.mj_step(sim.model, sim.data)
 
@@ -779,6 +803,7 @@ class LokaRuntime:
         if not bool(frame.get("walking")) and not gait.wants_walk():
             return False
         self.controller.set_task_targets({"gait.mode": "stand", "gait.speed": 0.0})
+        gait.mark_strict_stop()
         self._walk_fault_stand = True
         frame["walking"] = False
         frame["cmd_mode"] = float(gait.config.mode)

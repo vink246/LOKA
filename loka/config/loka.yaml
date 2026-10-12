@@ -16,6 +16,8 @@
 # clear_below_s is how long |bias| must stay at or below the mode threshold
 # before that failure episode closes. A shorter dip does not close it.
 # stand_window_steps is the standing average (walking uses two step periods).
+# Neither average is published, and neither can open a fault, until that
+# window is full. A single startup sample is not a residual.
 # stand_on_fault: true commands gait.mode=stand when a walking fault
 # opens and the LLM is on. --no-llm never stands for a fault.
 # false leaves the robot walking through the fault.
@@ -28,7 +30,7 @@ effort_bias:
   consecutive_steps: 250
   stand_threshold_nm: 5.0
   walk_threshold_nm: 5.0
-  motor_threshold_nm: 1.5
+  motor_threshold_nm: 0.75
   slip_threshold_mps: 0.25
   stand_window_steps: 100
   clear_below_s: 0.5

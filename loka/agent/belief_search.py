@@ -336,6 +336,10 @@ class BeliefSearchRunner:
         self._target: dict | None = None
         self._saved_gait: dict | None = None
         self._hold_for_stand = False
+        # Gear vector the controller plans with. Set for the whole gear search
+        # so probes change only the residual, and cleared when the search
+        # accepts or restores the previous belief.
+        self.command_gear_hold: np.ndarray | None = None
 
     @property
     def busy(self) -> bool:
@@ -422,6 +426,7 @@ class BeliefSearchRunner:
             if decision.reason == "bias did not move":
                 self._restore()
                 self._restore_gait()
+                self.command_gear_hold = None
                 print(
                     f"[search] {label} stopped: effort bias did not move. "
                     f"Restored the previous belief."
@@ -463,6 +468,12 @@ class BeliefSearchRunner:
         origin = float(target["origin"])
         self._search = make_search(spec.kind, start, axis=spec.axis, origin=origin)
         self.active = True
+        if spec.kind == "gear":
+            self.command_gear_hold = np.asarray(
+                self.runtime.controller.robot.model.actuator_gear[:, 0], dtype=float
+            ).copy()
+        else:
+            self.command_gear_hold = None
         now = float(self.runtime.sim.data.time)
         self._engage_measurement_gait()
         if self._hold_for_stand:
@@ -618,6 +629,7 @@ class BeliefSearchRunner:
         self._restore()
         self._restore_gait()
         print("[search] cancelled; belief restored")
+        self.command_gear_hold = None
         self.active = False
         self._hold_for_stand = False
         self._search = None
@@ -630,6 +642,7 @@ class BeliefSearchRunner:
 
     def _finish(self, reason: str, value: float) -> None:
         print(f"[search] {self._label()} done  value={value:.4g}  ({reason})")
+        self.command_gear_hold = None
         self._record(value, reason)
         self._restore_gait()
         self._search = None

@@ -63,7 +63,7 @@ tasks:
     goal:
       xy: [3.0, 0.0]
       speed: 0.15
-      radius: 0.15
+      radius: 0.2
       hold_s: 0.0
     command_time_s: 0.0
     perturbation_time_s: 4.0

@@ -227,6 +227,9 @@ STOP_FORCE_STEPS = 8
 #: arrived tips it.
 STOP_SPEED = 0.12
 STOP_OFFSET = 0.06
+#: Footholds land about 1 cm inside the planned width, so a goal or commanded
+#: stop accepts a gap this much narrower. Fault stands keep the exact width.
+STOP_GAP_SLACK = 0.02  # m
 
 #: Plant-side go-to-point (``gait.goal_*``). The scheduler re-aims
 #: ``heading`` at the goal and sets ``speed`` every tick, so the orchestrator
@@ -238,8 +241,12 @@ GOAL_DEFAULT_SPEED = 0.20  # m/s cruise when a goal arrives with no gait.speed
 #: last heading is held instead of chasing it.
 GOAL_HEADING_FREEZE = 0.30  # m
 GOAL_HEADING_DEADBAND = 0.03  # rad; smaller bearing changes leave heading alone
-#: After arriving, walk back only once pushed this many tolerances away.
-GOAL_REENGAGE = 2.0
+#: The arrival stop is requested at this fraction of the tolerance. Stepping
+#: in place sways the pelvis back a few centimetres before the stand.
+GOAL_STOP_FRACTION = 0.8
+#: A latched stand walks again only this far past the tolerance, so stand
+#: sway on the boundary does not restart the walk.
+GOAL_REENGAGE_MARGIN = 0.05  # m
 
 
 class LegPhase(str, Enum):
@@ -631,6 +638,7 @@ class GaitScheduler:
         self._use_speed_schedule = False
         # Goal state survives reset(): arriving ends the walk, which resets.
         self._goal_arrived = False
+        self._goal_stopping = False
         self._goal_cruise = GOAL_DEFAULT_SPEED
         self._goal_cmd = None
         self._goal_point = None
@@ -663,6 +671,7 @@ class GaitScheduler:
         self._capture_hot = False
         self._stop_requested = False
         self._stop_extra = 0
+        self._stop_loose = False
         self._stand_yaw = 0.0
         self._initial_yaws = np.zeros(2)
         self._latch_valid = False
@@ -760,7 +769,10 @@ class GaitScheduler:
                 self._user_gait_fields.clear()
                 if self._active:
                     # Finish the step in the air. Resetting here drops the
-                    # swing foot and the next tick names it stance.
+                    # swing foot and the next tick names it stance. A
+                    # pending fault stand keeps its strict gate.
+                    if not self._stop_requested:
+                        self._stop_loose = True
                     self._stop_requested = True
                 else:
                     self.reset()
@@ -790,11 +802,15 @@ class GaitScheduler:
             applied["gait.goal_active"] = float(cfg.goal_active)
         if not active:
             self._goal_arrived = False
+            self._goal_stopping = False
             self._goal_point = None
             return
         point = (round(float(cfg.goal_x), 4), round(float(cfg.goal_y), 4))
         if (moved or not was_active) and point != self._goal_point:
             self._goal_arrived = False
+            if self._goal_stopping and "gait.mode" not in applied:
+                self._release_stop()
+            self._goal_stopping = False
             self._goal_point = point
         if "gait.speed" in applied:
             self._goal_cruise = float(applied["gait.speed"])
@@ -816,20 +832,30 @@ class GaitScheduler:
         """Drop a stand request so a new walk can command a speed."""
         self._stop_requested = False
         self._stop_extra = 0
+        self._stop_loose = False
 
-    def _steer_to_goal(self, com_xy: np.ndarray) -> None:
+    def mark_strict_stop(self) -> None:
+        """Make the pending stop wait for the exact stance width (fault stands)."""
+        self._stop_loose = False
+
+    def _steer_to_goal(self, com_xy: np.ndarray, pelvis_xy: np.ndarray | None = None) -> None:
         """Aim heading at the goal and command the approach speed.
 
         ``gait.speed`` stays the cruise the operator set. The approach speed is
-        ``_goal_cmd``. Inside the tolerance the walk stops and the mode becomes
-        stand; the goal stays armed so a later push can walk back.
+        ``_goal_cmd``. Heading and distance both use the pelvis. Crossing
+        ``GOAL_STOP_FRACTION`` of the tolerance requests a stop that is held
+        until the clock finishes it, whatever the sway does meanwhile. The
+        arrival latches if the pelvis then sits inside the tolerance; if it
+        settled outside, or a settled stand drifts out, the walk resumes.
         """
         cfg = self.config
         mode = float(cfg.mode)
         if float(cfg.goal_active) < 0.5 or mode == MODE_TREAD:
             self._goal_cmd = None
             return
-        delta = np.array([float(cfg.goal_x), float(cfg.goal_y)]) - com_xy
+        goal = np.array([float(cfg.goal_x), float(cfg.goal_y)])
+        here = com_xy if pelvis_xy is None else np.asarray(pelvis_xy, dtype=float).reshape(-1)[:2]
+        delta = goal - here
         dist = float(np.hypot(delta[0], delta[1]))
         tol = float(cfg.goal_tolerance)
         if self._goal_arrived:
@@ -837,7 +863,7 @@ class GaitScheduler:
                 self._goal_cmd = 0.0
                 self._stop_requested = True
                 return
-            if dist < GOAL_REENGAGE * tol:
+            if dist <= tol + GOAL_REENGAGE_MARGIN:
                 self._goal_cmd = 0.0
                 cfg.mode = MODE_STAND
                 return
@@ -847,15 +873,31 @@ class GaitScheduler:
                 cfg.mode = MODE_STAND
                 return
             cfg.mode = MODE_WALK
+            cfg.heading = float(np.arctan2(delta[1], delta[0]))
             self._release_stop()
-        if dist <= tol:
-            self._goal_arrived = True
+        if self._goal_stopping:
+            if self._active:
+                self._goal_cmd = 0.0
+                self._stop_requested = True
+                return
+            self._goal_stopping = False
+            if dist <= tol:
+                self._goal_cmd = 0.0
+                self._goal_arrived = True
+                cfg.mode = MODE_STAND
+                return
+            cfg.heading = float(np.arctan2(delta[1], delta[0]))
+            mode = float(cfg.mode)
+        if dist <= GOAL_STOP_FRACTION * tol:
             self._goal_cmd = 0.0
             cfg.heading = self._stance_yaw()
             if self._active:
+                self._goal_stopping = True
                 self._stop_requested = True
-            else:
-                cfg.mode = MODE_STAND
+                self._stop_loose = True
+                return
+            self._goal_arrived = True
+            cfg.mode = MODE_STAND
             return
         if mode < MODE_WALK:
             if self.block_walk:
@@ -1713,6 +1755,8 @@ class GaitScheduler:
         _, left = heading_frame(self._stance_yaw())
         gap = abs(float(np.dot(feet[0, :2] - feet[1, :2], left)))
         width = float(self._width if self._latch_valid else self.config.stance_width)
+        if self._stop_requested and self._stop_loose:
+            width -= STOP_GAP_SLACK
         return gap + 1e-4 >= width
 
     def _stand_output(self, measured_mask: np.ndarray, feet_xy: np.ndarray) -> GaitOutput:
@@ -1749,6 +1793,7 @@ class GaitScheduler:
         measured_mask: np.ndarray,
         foot_yaws: np.ndarray | None = None,
         L_meas: np.ndarray | None = None,
+        pelvis_xy: np.ndarray | None = None,
     ) -> GaitOutput:
         com_xy = np.asarray(com[:2], dtype=float)
         com_vel_xy = np.asarray(com_vel[:2], dtype=float)
@@ -1760,7 +1805,7 @@ class GaitScheduler:
             yaws = np.asarray(foot_yaws, dtype=float).reshape(2)
         self._L_meas = np.zeros(3) if L_meas is None else np.asarray(L_meas, dtype=float).reshape(3)
         self._stand_yaw = float(circ_mid(yaws[0], yaws[1]))
-        self._steer_to_goal(com_xy)
+        self._steer_to_goal(com_xy, pelvis_xy=pelvis_xy)
         forward_h, _ = heading_frame(self._stance_yaw())
         self._meas_speed = float(np.dot(com_vel_xy, forward_h))
         self._update_turning(at_boundary=False)

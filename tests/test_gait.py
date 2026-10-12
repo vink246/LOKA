@@ -23,6 +23,7 @@ import pytest
 from loka.control.gait import (
     HEADING_CRAWL_SPEED,
     MAX_DCM_CORRECTION,
+    MODE_STAND,
     MODE_WALK,
     SCHED_UP_LAG,
     STOP_FORCE_STEPS,
@@ -88,6 +89,115 @@ def walking_scheduler(**overrides):
     )
     cfg.update(overrides)
     return GaitScheduler(GaitConfig(**cfg))
+
+
+def test_goal_arrival_waits_until_the_stand_settles():
+    sched = walking_scheduler(mode=MODE_WALK, speed=0.15)
+    cfg = sched.config
+    cfg.goal_active = 1.0
+    cfg.goal_x = 1.0
+    cfg.goal_y = 0.0
+    cfg.goal_tolerance = 0.15
+    sched._goal_cruise = 0.15
+    sched._active = True
+
+    # On the boundary the walk keeps approaching. The stop is requested a
+    # little inside, so the settle sway does not carry the pelvis back out.
+    sched._steer_to_goal(np.array([0.86, 0.0]))
+    assert not sched._stop_requested
+    assert sched._goal_cmd == pytest.approx(0.10)
+
+    # Crossing the stop radius while the walk is active only requests the stop.
+    sched._steer_to_goal(np.array([0.90, 0.0]))
+    assert sched._stop_requested
+    assert not sched._goal_arrived
+    assert cfg.mode == MODE_WALK
+
+    # Sway back across the boundary keeps the stop until the clock ends the walk.
+    sched._steer_to_goal(np.array([0.84, 0.0]))
+    assert sched._stop_requested
+    assert sched._goal_cmd == 0.0
+
+    # A finished stop that settled outside walks back in, aimed at the goal.
+    sched._active = False
+    sched._stop_requested = False
+    cfg.heading = 1.0
+    sched._steer_to_goal(np.array([0.80, 0.1]))
+    assert not sched._goal_arrived
+    assert cfg.mode == MODE_WALK
+    assert cfg.heading == pytest.approx(np.arctan2(-0.1, 0.2))
+    assert sched._goal_cmd == pytest.approx(0.10)
+
+    # The second stop finishes inside and latches.
+    sched._active = True
+    sched._steer_to_goal(np.array([0.90, 0.0]))
+    sched._active = False
+    sched._stop_requested = False
+    sched._steer_to_goal(np.array([0.86, 0.0]))
+    assert sched._goal_arrived
+    assert cfg.mode == MODE_STAND
+
+    # Stand sway a little past the boundary stays latched.
+    sched._steer_to_goal(np.array([0.82, 0.0]))
+    assert sched._goal_arrived
+    assert cfg.mode == MODE_STAND
+
+    # Drifting clearly out walks back.
+    sched._steer_to_goal(np.array([0.75, 0.0]))
+    assert not sched._goal_arrived
+    assert cfg.mode == MODE_WALK
+
+
+def test_goal_and_commanded_stops_accept_a_narrow_stance_but_fault_stops_do_not():
+    sched = walking_scheduler(mode=MODE_WALK, speed=0.15)
+    sched._latch_valid = True
+    sched._width = 0.22
+    narrow = np.array([[0.0, 0.105, 0.0], [0.0, -0.105, 0.0]])
+    mask = np.ones(8, dtype=bool)
+
+    # Goal arrival.
+    sched._stop_requested = True
+    sched._stop_loose = True
+    assert sched._stance_planted(narrow, 0.0, mask)
+
+    # A fault stand keeps the exact width.
+    sched.mark_strict_stop()
+    assert not sched._stance_planted(narrow, 0.0, mask)
+
+    # A commanded stand while the walk is active starts a quick stop, but
+    # does not loosen a fault stand that is already pending.
+    sched._release_stop()
+    sched._active = True
+    sched.apply_updates({"gait.mode": "stand"})
+    assert sched._stop_requested and sched._stop_loose
+    sched.mark_strict_stop()
+    sched.apply_updates({"gait.mode": "stand"})
+    assert not sched._stop_loose
+
+    # Without a stop pending the width stays exact.
+    sched._release_stop()
+    assert not sched._stance_planted(narrow, 0.0, mask)
+
+
+def test_goal_stop_waits_until_the_pelvis_is_inside():
+    sched = walking_scheduler(mode=MODE_WALK, speed=0.15)
+    cfg = sched.config
+    cfg.goal_active = 1.0
+    cfg.goal_x = 1.0
+    cfg.goal_y = 0.0
+    cfg.goal_tolerance = 0.15
+    sched._goal_cruise = 0.15
+    sched._active = False
+
+    # The CoM is inside. Arrival uses the pelvis, which is not, so it keeps approaching.
+    sched._steer_to_goal(np.array([0.92, 0.0]), pelvis_xy=np.array([0.70, 0.0]))
+    assert not sched._goal_arrived
+    assert cfg.mode == MODE_WALK
+    assert sched._goal_cmd == pytest.approx(0.10)
+
+    sched._steer_to_goal(np.array([0.90, 0.0]), pelvis_xy=np.array([0.90, 0.0]))
+    assert sched._goal_arrived
+    assert cfg.mode == MODE_STAND
 
 
 # -- 1. swing arc ---------------------------------------------------------
