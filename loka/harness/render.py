@@ -100,9 +100,11 @@ def _render_worker(job: dict) -> None:
         WEIGHT_ARROW_SCALE,
         add_arrow,
         add_sphere,
+        hide_foot_contact_markers,
     )
 
     model = mujoco.MjModel.from_xml_path(job["model_path"])
+    hide_foot_contact_markers(model)
     data = mujoco.MjData(model)
     with np.load(job["frames_path"]) as blob:
         times = np.asarray(blob["times"])

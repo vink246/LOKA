@@ -32,6 +32,38 @@ PUSH = (0.10, 0.85, 1.00, 0.95)
 ADDED_MASS = (1.00, 0.45, 0.05, 0.90)
 
 
+# Group 3 is off in MuJoCo's default viewer and the offscreen renderer.
+_HIDDEN_GROUP = 3
+_FOOT_CONTACT_GEOMS = (
+    "left_foot_heel_out",
+    "left_foot_heel_in",
+    "left_foot_toe_out",
+    "left_foot_toe_in",
+    "right_foot_heel_out",
+    "right_foot_heel_in",
+    "right_foot_toe_out",
+    "right_foot_toe_in",
+)
+
+
+def hide_foot_contact_markers(model) -> None:
+    """Keep sole contact sites and spheres out of a rendered frame.
+
+    The markers stay in the model for the controller. Only their draw group
+    changes, and group 3 is not shown by the default renderer.
+    """
+    from loka.control.robot import CONTACT_SITES, FOOT_CENTER_SITES
+
+    for name in (*CONTACT_SITES, *FOOT_CENTER_SITES):
+        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
+        if site_id >= 0:
+            model.site_group[site_id] = _HIDDEN_GROUP
+    for name in _FOOT_CONTACT_GEOMS:
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if geom_id >= 0:
+            model.geom_group[geom_id] = _HIDDEN_GROUP
+
+
 def begin_frame(viewer) -> None:
     """Drop last frame's overlays. Call once, before the first draw."""
     viewer.user_scn.ngeom = 0
