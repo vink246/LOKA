@@ -13,6 +13,9 @@ from scipy import stats as scipy_stats
 
 from loka.harness.storage import json_ready
 
+# These are 0/1 per trial. The reported value is the count, with no interval.
+_COUNTS = {"num_successes", "num_falls"}
+
 _SKIP = {
     "task",
     "perturbation",
@@ -93,6 +96,13 @@ def summarize_rows(rows: list[dict]) -> dict[str, Any]:
         for key in metric_keys(trials):
             values = _values(trials, key)
             mean, std, low, high = t_interval(values)
+            if key in _COUNTS:
+                condition[f"{key}_mean"] = None if values.size == 0 else float(values.sum())
+                condition[f"{key}_std"] = None
+                condition[f"{key}_ci95_low"] = None
+                condition[f"{key}_ci95_high"] = None
+                condition[f"{key}_n"] = int(values.size)
+                continue
             condition[f"{key}_mean"] = mean
             condition[f"{key}_std"] = std
             condition[f"{key}_ci95_low"] = low

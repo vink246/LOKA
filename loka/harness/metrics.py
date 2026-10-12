@@ -29,11 +29,26 @@ def success(episode: EpisodeData) -> float:
     return 1.0 if episode.metadata.get("outcome") == "success" else 0.0
 
 
+@register_metric("num_successes", scope="episode")
+def num_successes(episode: EpisodeData) -> float:
+    """1 when the episode arrived, else 0. Plots sum this across trials."""
+    return success(episode)
+
+
 @register_metric("time_to_goal_s", scope="episode")
 def time_to_goal_s(episode: EpisodeData):
+    """Sim time to arrival. Failures are omitted, not scored as the timeout."""
     if episode.metadata.get("outcome") != "success":
         return None
     return _finite(episode.metadata.get("time_to_goal_s", episode.metadata.get("t_end")))
+
+
+@register_metric("wall_time_to_goal_s", scope="episode")
+def wall_time_to_goal_s(episode: EpisodeData):
+    """Wall-clock seconds until arrival. Failures are omitted."""
+    if episode.metadata.get("outcome") != "success":
+        return None
+    return _finite(episode.metadata.get("wall_s"))
 
 
 @register_metric("final_goal_error_m", scope="episode")
@@ -53,6 +68,12 @@ def fell(episode: EpisodeData) -> float:
     return 1.0 if episode.metadata.get("fell") else 0.0
 
 
+@register_metric("num_falls", scope="episode")
+def num_falls(episode: EpisodeData) -> float:
+    """1 when the episode fell, else 0. Plots sum this across trials."""
+    return fell(episode)
+
+
 @register_metric("t_first_fall_s", scope="episode")
 def t_first_fall_s(episode: EpisodeData):
     return _finite(episode.metadata.get("t_first_fall"))
@@ -69,7 +90,12 @@ def path_length_m(episode: EpisodeData):
 
 @register_metric("path_efficiency", scope="episode")
 def path_efficiency(episode: EpisodeData):
-    """Straight-line distance from the start to the goal, over the path taken."""
+    """Straight-line distance from the start to the goal, over the path taken.
+
+    Failures are omitted. A short path that never arrives is not a high score.
+    """
+    if episode.metadata.get("outcome") != "success":
+        return None
     length = path_length_m(episode)
     if length is None:
         return None

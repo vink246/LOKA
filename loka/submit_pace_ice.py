@@ -690,9 +690,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"Submit error: {exc}", file=sys.stderr)
         return 2
+    recording = "on" if suite.recording.enabled else "off"
     print(
         f"[pace] {len(jobs)} units, at most {args.max_in_flight} running, "
-        f"at most {args.max_submitted} submitted, {args.cpus} CPUs each"
+        f"at most {args.max_submitted} submitted, {args.cpus} CPUs each, "
+        f"recording {recording}"
     )
     print(f"[pace] run directory {run_dir}")
     chain_path = _chain_args_path(run_dir, "jobs.json")

@@ -23,10 +23,13 @@ from loka.harness.metrics import (
     fell,
     final_goal_error_m,
     max_push_force_n,
+    num_falls,
+    num_successes,
     path_efficiency,
     path_length_m,
     success,
     time_to_goal_s,
+    wall_time_to_goal_s,
 )
 from loka.harness.registry import get_baseline, register_baseline
 from loka.harness.search import FellBeforePush, bisect_force, run_force_search
@@ -68,6 +71,81 @@ def test_shipped_suite_and_round_trip():
     assert units[0].id == "stand_push__shoulder_mass__low_level__trial_00"
     again = parse_suite(suite.to_dict())
     assert [unit.id for unit in iter_units(again)] == [unit.id for unit in units]
+    assert suite.recording.enabled is True
+    goto = next(task for task in suite.tasks if task.name == "goto_goal")
+    assert goto.metrics == [
+        "num_successes",
+        "num_falls",
+        "time_to_goal_s",
+        "wall_time_to_goal_s",
+        "path_efficiency",
+    ]
+
+
+def test_recording_follows_the_yaml_unless_a_flag_is_set():
+    import argparse
+
+    from loka.harness.config import apply_cli_overrides
+
+    suite = load_suite_yaml(SUITE)
+    kept = apply_cli_overrides(suite, argparse.Namespace())
+    assert kept.recording.enabled is True
+    forced_off = apply_cli_overrides(suite, argparse.Namespace(no_record=True))
+    assert forced_off.recording.enabled is False
+    forced_on = apply_cli_overrides(forced_off, argparse.Namespace(record=True))
+    assert forced_on.recording.enabled is True
+
+
+def test_goto_plot_is_one_figure_per_perturbation(tmp_path: Path):
+    from loka.harness.plots import _panel_values, plot_run
+
+    rows = [
+        {
+            "task": "goto_goal",
+            "perturbation": "nominal",
+            "baseline": "low_level",
+            "num_successes": 1.0,
+            "num_falls": 0.0,
+            "time_to_goal_s": 10.0,
+            "wall_time_to_goal_s": 12.0,
+            "path_efficiency": 0.9,
+            "goal_xy": [3.0, 0.0],
+            "goal_radius": 0.15,
+        },
+        {
+            "task": "goto_goal",
+            "perturbation": "nominal",
+            "baseline": "loka",
+            "num_successes": 0.0,
+            "num_falls": 1.0,
+            "time_to_goal_s": None,
+            "wall_time_to_goal_s": None,
+            "path_efficiency": None,
+            "goal_xy": [3.0, 0.0],
+            "goal_radius": 0.15,
+        },
+    ]
+    counts, _errors = _panel_values(rows, ["low_level", "loka"], "num_successes", "count")
+    assert counts.tolist() == [1.0, 0.0]
+    times, _time_err = _panel_values(rows, ["low_level", "loka"], "time_to_goal_s", "mean")
+    assert times[0] == pytest.approx(10.0)
+    assert np.isnan(times[1])
+    stats = {
+        "conditions": [
+            {
+                "task": "stand_push",
+                "perturbation": "shoulder_mass",
+                "baseline": "low_level",
+                "max_push_force_n_mean": 80.0,
+                "max_push_force_n_ci95_low": 70.0,
+                "max_push_force_n_ci95_high": 90.0,
+            }
+        ]
+    }
+    written = {path.name for path in plot_run(tmp_path, rows, stats)}
+    assert "goto_goal_nominal.png" in written
+    assert "stand_push_max_push_force_n.png" in written
+    assert "goto_goal_success.png" not in written
 
 
 def test_unknown_names(tmp_path: Path):
@@ -132,14 +210,20 @@ def test_metrics_from_stored_episode():
         final_goal_error_m=0.1,
     )
     assert success(episode) == 1.0
+    assert num_successes(episode) == 1.0
     assert time_to_goal_s(episode) == 4.0
+    assert wall_time_to_goal_s(_episode(outcome="success", wall_s=3.5)) == 3.5
     assert final_goal_error_m(episode) == pytest.approx(0.1)
     assert fell(episode) == 0.0
     assert path_length_m(episode) == pytest.approx(1.0)
     assert path_efficiency(episode) == pytest.approx(1.0)
-    missed = _episode(outcome="timeout", fell=True, t_first_fall=1.5, goal_xy=[1.0, 0.0])
+    missed = _episode(outcome="timeout", fell=True, t_first_fall=1.5, goal_xy=[1.0, 0.0], wall_s=9.0)
     assert success(missed) == 0.0
+    assert num_successes(missed) == 0.0
+    assert num_falls(missed) == 1.0
     assert time_to_goal_s(missed) is None
+    assert wall_time_to_goal_s(missed) is None
+    assert path_efficiency(missed) is None
     survived = _episode(fell=False, fell_before_push=False, push_force_n=4.0)
     toppled = _episode(fell=True, fell_before_push=False, push_force_n=6.0)
     assert max_push_force_n([survived, toppled]) == 4.0

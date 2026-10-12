@@ -40,7 +40,8 @@ def run_unit(suite: SuiteConfig, unit, run_dir: Path) -> dict:
         return json.loads(done_path.read_text(encoding="utf-8"))
     unit_dir.mkdir(parents=True, exist_ok=True)
     task_spec = suite.task(unit.task)
-    print(f"\n=== {unit.id} seed={unit.seed} ===")
+    recording = "on" if suite.recording.enabled else "off"
+    print(f"\n=== {unit.id} seed={unit.seed} recording={recording} ===")
     row = get_task(task_spec.type)(task_spec).run(suite, unit, unit_dir)
     row.update(unit.to_dict())
     _apply_metrics(row, task_spec.metrics, unit_dir)

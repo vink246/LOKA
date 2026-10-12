@@ -40,9 +40,16 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Run only this unit id (task__perturbation__baseline__trial_XX).",
     )
-    parser.add_argument("--record", action="store_true", help="Encode episode videos.")
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Encode episode videos even when the YAML has recording disabled.",
+    )
     parser.add_argument(
         "--no-record",
         action="store_true",
-        help="Do not encode videos. render.npz is still written.",
+        help=(
+            "Do not encode videos, even when the YAML enables them. "
+            "render.npz is still written."
+        ),
     )
