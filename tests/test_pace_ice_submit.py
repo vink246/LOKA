@@ -74,7 +74,8 @@ def test_jobs_are_stable_and_worker_script_is_cpu_only(tmp_path: Path, monkeypat
     ]
     worker = (run_dir / "slurm" / "worker.sh").read_text(encoding="utf-8")
     assert "#SBATCH --array=0-7%10" in worker
-    assert "export MUJOCO_GL=egl" in worker
+    assert "MUJOCO_GL" not in worker
+    assert "XDG_RUNTIME_DIR" not in worker
     assert "--gres" not in worker
     assert "OPENAI" not in worker
     assert 'expected="$(cd' in worker
@@ -123,7 +124,6 @@ def test_worker_selects_the_array_index(tmp_path: Path, monkeypatch):
         account=None,
         qos=None,
         constraint=None,
-        mujoco_gl=None,
     )
     monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "1")
     monkeypatch.setenv("LOKA_JOBS_FILE", str(run_dir / "slurm" / "jobs.json"))

@@ -1,9 +1,9 @@
 """Offscreen isometric clips. Perturbations are drawn; controller overlays are not.
 
 The clip is rendered after the episode from ``render.npz``, in a spawned
-process so the GL backend is chosen before MuJoCo is imported. ``MUJOCO_GL``
-is honored (``egl`` by default). If EGL fails, the render is retried with
-``osmesa``.
+process. The GL backend is the walker suite's: OSMesa on a headless CPU node,
+EGL when a display is present. MuJoCo locks that choice at import, so it is
+set in this process before the child starts.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+
+from loka.recording import prepare_offscreen_env, start_offscreen
 
 ICE_RGBA = np.array([0.15, 0.75, 1.0, 1.0], dtype=np.float32)
 WEAK_RGBA = np.array([1.0, 0.45, 0.05, 1.0], dtype=np.float32)
@@ -37,34 +39,18 @@ def render_episode_dir(directory, *, recording, model_path: str) -> Path:
     if times.size == 0 or qpos.size == 0:
         raise ValueError(f"No frames in {blob_path}")
     out_path = directory / "episode.mp4"
-    gl = os.environ.get("MUJOCO_GL", "egl")
-    try:
-        _spawn_render(
-            model_path=model_path,
-            times=times,
-            qpos=qpos,
-            overlays=overlays,
-            out_path=out_path,
-            recording=recording,
-            mujoco_gl=gl,
-        )
-    except Exception:
-        if gl == "osmesa":
-            raise
-        print(f"[eval] {gl} render failed; retrying with osmesa")
-        _spawn_render(
-            model_path=model_path,
-            times=times,
-            qpos=qpos,
-            overlays=overlays,
-            out_path=out_path,
-            recording=recording,
-            mujoco_gl="osmesa",
-        )
+    _spawn_render(
+        model_path=model_path,
+        times=times,
+        qpos=qpos,
+        overlays=overlays,
+        out_path=out_path,
+        recording=recording,
+    )
     return out_path
 
 
-def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, mujoco_gl: str) -> None:
+def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording) -> None:
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
         frames_path = tmp.name
     np.savez_compressed(
@@ -77,7 +63,6 @@ def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, muj
         "model_path": str(model_path),
         "frames_path": frames_path,
         "out_path": str(out_path),
-        "mujoco_gl": mujoco_gl,
         "fps": float(recording.fps),
         "width": int(recording.width),
         "height": int(recording.height),
@@ -92,29 +77,19 @@ def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, muj
     # the worker is too late: on a headless node the default is GLFW, and
     # GLFW exits because DISPLAY is unset.
     ctx = mp.get_context("spawn")
-    previous = os.environ.get("MUJOCO_GL")
-    os.environ["MUJOCO_GL"] = str(mujoco_gl)
-    proc = None
-    try:
-        proc = ctx.Process(target=_render_worker, args=(job,))
-        proc.start()
-    finally:
-        if previous is None:
-            os.environ.pop("MUJOCO_GL", None)
-        else:
-            os.environ["MUJOCO_GL"] = previous
-    if proc is not None:
-        proc.join()
+    proc = ctx.Process(target=_render_worker, args=(job,))
+    backend = start_offscreen(proc)
+    proc.join()
     try:
         os.remove(frames_path)
     except OSError:
         pass
     if proc.exitcode != 0:
-        raise RuntimeError(f"render subprocess failed (exit {proc.exitcode}, gl={mujoco_gl})")
+        raise RuntimeError(f"render subprocess failed (exit {proc.exitcode}, gl={backend})")
 
 
 def _render_worker(job: dict) -> None:
-    os.environ["MUJOCO_GL"] = str(job["mujoco_gl"])
+    prepare_offscreen_env()
     import mediapy as media
     import mujoco
 

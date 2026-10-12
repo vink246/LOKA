@@ -98,11 +98,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Conda env directory to activate, for example ~/scratch/envs/loka.",
     )
-    parser.add_argument(
-        "--mujoco-gl",
-        default=None,
-        help="MUJOCO_GL for the job (egl or osmesa). Unset keeps the cluster default.",
-    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true")
     parser.add_argument(
@@ -161,7 +156,6 @@ def _preamble(
     repo: Path,
     conda_env: str,
     conda_prefix: str | None,
-    mujoco_gl: str | None,
     jobs_file: Path,
 ) -> list[str]:
     repo_q = shlex.quote(str(repo))
@@ -201,9 +195,6 @@ def _preamble(
         "export MKL_NUM_THREADS=1",
         f"export LOKA_JOBS_FILE={shlex.quote(str(jobs_file))}",
     ]
-    # Headless compute nodes have no DISPLAY. Export this before Python
-    # starts so MuJoCo does not bind GLFW during import.
-    lines.append(f"export MUJOCO_GL={shlex.quote(mujoco_gl or 'egl')}")
     return lines
 
 
@@ -223,7 +214,6 @@ def render_worker_script(
     account: str | None = None,
     qos: str | None = None,
     constraint: str | None = None,
-    mujoco_gl: str | None = None,
     label: str = "loka-eval",
     offset: int = 0,
 ) -> str:
@@ -251,7 +241,7 @@ def render_worker_script(
     )
     lines += [
         "# CPU only. This script does not request a GPU.",
-        *_preamble(repo, conda_env, conda_prefix, mujoco_gl, jobs_file),
+        *_preamble(repo, conda_env, conda_prefix, jobs_file),
         f"export LOKA_JOB_OFFSET={int(offset)}",
         f'"$CONDA_PREFIX/bin/python" -m loka.submit_pace_ice --worker --run-dir {run_q}',
         "",
@@ -270,7 +260,6 @@ def render_chain_script(
     account: str | None = None,
     qos: str | None = None,
     constraint: str | None = None,
-    mujoco_gl: str | None = None,
     jobs_file: Path,
 ) -> str:
     """A one-task job that submits the next wave after this one has finished."""
@@ -290,7 +279,7 @@ def render_chain_script(
     lines += [
         "# CPU only. This script does not request a GPU.",
         "# Submits the next wave once the previous array has left the queue.",
-        *_preamble(repo, conda_env, conda_prefix, mujoco_gl, jobs_file),
+        *_preamble(repo, conda_env, conda_prefix, jobs_file),
         f"export LOKA_CHAIN_ARGS={shlex.quote(str(chain_args))}",
         f'"$CONDA_PREFIX/bin/python" -m loka.submit_pace_ice --advance --run-dir {run_q}',
         "",
@@ -308,7 +297,6 @@ def render_merge_script(
     account: str | None = None,
     qos: str | None = None,
     constraint: str | None = None,
-    mujoco_gl: str | None = None,
 ) -> str:
     run_q = shlex.quote(str(run_dir))
     lines = _sbatch_headers(
@@ -325,7 +313,7 @@ def render_merge_script(
     )
     lines += [
         "# CPU only. This script does not request a GPU.",
-        *_preamble(repo, conda_env, conda_prefix, mujoco_gl, run_dir / "slurm" / "jobs.json"),
+        *_preamble(repo, conda_env, conda_prefix, run_dir / "slurm" / "jobs.json"),
         f'"$CONDA_PREFIX/bin/python" -m loka.submit_pace_ice --merge {run_q}',
         "",
     ]
@@ -372,7 +360,6 @@ def prepare_run(
     account: str | None,
     qos: str | None,
     constraint: str | None,
-    mujoco_gl: str | None,
     jobs: list[dict] | None = None,
     jobs_name: str = "jobs.json",
     worker_name: str = "worker.sh",
@@ -414,7 +401,6 @@ def prepare_run(
             account=account,
             qos=qos,
             constraint=constraint,
-            mujoco_gl=mujoco_gl,
         ),
         encoding="utf-8",
     )
@@ -429,7 +415,6 @@ def prepare_run(
             account=account,
             qos=qos,
             constraint=constraint,
-            mujoco_gl=mujoco_gl,
         ),
         encoding="utf-8",
     )
@@ -488,7 +473,6 @@ def _slurm_kwargs(args) -> dict:
         "account": args.account,
         "qos": args.qos,
         "constraint": args.constraint,
-        "mujoco_gl": args.mujoco_gl,
     }
 
 
@@ -507,7 +491,6 @@ def _chain_payload(args, repo: Path, jobs_name: str) -> dict:
         "constraint": args.constraint,
         "conda_env": args.conda_env,
         "conda_prefix": args.conda_prefix,
-        "mujoco_gl": args.mujoco_gl,
     }
 
 
@@ -538,7 +521,6 @@ def _write_wave_scripts(
         account=chain["account"],
         qos=chain["qos"],
         constraint=chain["constraint"],
-        mujoco_gl=chain["mujoco_gl"],
     )
     worker = slurm_dir / worker_name
     worker.write_text(

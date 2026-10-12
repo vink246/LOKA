@@ -82,7 +82,7 @@ def test_shipped_suite_and_round_trip():
     ]
 
 
-def test_render_child_inherits_mujoco_gl_before_import(monkeypatch, tmp_path: Path):
+def test_headless_render_uses_osmesa_before_import(monkeypatch, tmp_path: Path):
     import os
 
     from loka.harness import render as render_mod
@@ -94,19 +94,27 @@ def test_render_child_inherits_mujoco_gl_before_import(monkeypatch, tmp_path: Pa
         exitcode = 0
 
         def start(self):
-            seen["during"] = os.environ.get("MUJOCO_GL")
+            seen["gl"] = os.environ.get("MUJOCO_GL")
+            seen["platform"] = os.environ.get("PYOPENGL_PLATFORM")
+            seen["ld"] = os.environ.get("LD_LIBRARY_PATH", "")
 
         def join(self):
             return None
 
     class _Ctx:
         def Process(self, target, args):
-            del target
-            seen["job_gl"] = args[0]["mujoco_gl"]
+            del target, args
             return _Proc()
 
+    lib = tmp_path / "lib"
+    lib.mkdir()
     monkeypatch.setattr(render_mod.mp, "get_context", lambda _name: _Ctx())
-    monkeypatch.setenv("MUJOCO_GL", "glfw")
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("PYOPENGL_PLATFORM", raising=False)
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
     render_mod._spawn_render(
         model_path="models/g1/scene.xml",
         times=[0.0],
@@ -114,11 +122,13 @@ def test_render_child_inherits_mujoco_gl_before_import(monkeypatch, tmp_path: Pa
         overlays=[],
         out_path=tmp_path / "episode.mp4",
         recording=RecordingSpec(fps=10, width=64, height=48),
-        mujoco_gl="osmesa",
     )
-    assert seen["during"] == "osmesa"
-    assert seen["job_gl"] == "osmesa"
-    assert os.environ["MUJOCO_GL"] == "glfw"
+    assert seen["gl"] == "osmesa"
+    assert seen["platform"] == "osmesa"
+    assert seen["ld"].split(":")[0] == str(lib)
+    assert "MUJOCO_GL" not in os.environ
+    assert "PYOPENGL_PLATFORM" not in os.environ
+    assert "LD_LIBRARY_PATH" not in os.environ
 
 
 def test_recording_follows_the_yaml_unless_a_flag_is_set():
