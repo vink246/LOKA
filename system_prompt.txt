@@ -57,5 +57,5 @@ Belief_Searches:
 
 [IMPORTANT] Problem-solving heuristics:
 - When starting a walk from a stand, start with a smaller speed like 0.15. It can be increased later.
-- Symmetric biases for actuators usually means *the mass itself* is mismatched - not the z axis. On one body, search mass before any COM axis if we aree standing, otherwise search for COM before mass if we are already walking.
+- Symmetric biases for actuators usually means *the mass itself* is mismatched - not the z axis. On one body, search mass before any COM axis.
 - An imbalance between legs or a roll error is influenced by the y component of the COM. A large pitch error is influenced by the x component of the COM. The height is measured along the z-axis.
