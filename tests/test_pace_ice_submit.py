@@ -192,6 +192,33 @@ def test_loka_baseline_requires_an_api_key(tmp_path: Path, monkeypatch):
     assert "test-key" not in script
 
 
+def test_unit_flag_submits_only_that_job(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("loka.submit_pace_ice._require_openai", lambda *_a, **_k: None)
+    config = tmp_path / "suite.yaml"
+    _suite(config, trials=2)
+    run_dir = tmp_path / "run"
+    code = main(
+        [
+            "--config",
+            str(config),
+            "--run-dir",
+            str(run_dir),
+            "--dry-run",
+            "--baselines",
+            "low_level",
+            "--num-trials",
+            "1",
+            "--unit",
+            "goto_goal__nominal__low_level__trial_00",
+        ]
+    )
+    assert code == 0
+    jobs = json.loads((run_dir / "slurm" / "jobs.json").read_text(encoding="utf-8"))["jobs"]
+    assert [job["id"] for job in jobs] == ["goto_goal__nominal__low_level__trial_00"]
+    worker = (run_dir / "slurm" / "worker.sh").read_text(encoding="utf-8")
+    assert "#SBATCH --array=0-0%10" in worker
+
+
 def test_first_wave_stays_within_the_pace_cap():
     # 70 units, cap 50: 49 array tasks plus the chaining job.
     assert first_wave(70, 50, self_counts=False) == (49, "chain")

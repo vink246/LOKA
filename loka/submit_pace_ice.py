@@ -383,6 +383,10 @@ def prepare_run(
     write_resolved_config(run_dir, suite)
     if jobs is None:
         jobs = [unit.to_dict() for unit in iter_units(suite)]
+        if suite.unit is not None:
+            jobs = [job for job in jobs if job["id"] == suite.unit]
+            if not jobs:
+                raise ValueError(f"Unknown unit {suite.unit!r}")
     if not jobs:
         raise ValueError("No jobs to submit")
     jobs_path = slurm_dir / jobs_name
