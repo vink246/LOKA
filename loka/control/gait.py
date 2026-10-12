@@ -742,7 +742,7 @@ class GaitScheduler:
                     if self.block_walk and value >= MODE_WALK:
                         print(
                             "     * [WARN] gait.mode=walk ignored: "
-                            "|bias| is above the threshold"
+                            "effort, motor, or slip is above its threshold"
                         )
                         continue
                 else:
@@ -805,7 +805,7 @@ class GaitScheduler:
             if self.block_walk:
                 print(
                     "     * [WARN] gait.mode=walk ignored: "
-                    "|bias| is above the threshold"
+                    "effort, motor, or slip is above its threshold"
                 )
             else:
                 cfg.mode = MODE_WALK

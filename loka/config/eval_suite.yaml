@@ -74,6 +74,6 @@ tasks:
       - {name: torso_mass, kind: mass, body: torso_link, delta_kg: 10.0}
       - {name: shoulder_mass, kind: mass, body: left_shoulder_roll_link, delta_kg: 7.0}
       - {name: weak_right_knee, kind: actuator_gear, actuator: right_knee, scale: 0.75}
-      - {name: low_friction, kind: friction, mu: 0.3}
+      - {name: low_friction, kind: friction, mu: 0.5}
       - {name: shove, kind: push, force_n: 150.0, direction: [0.0, 1.0], duration_s: 0.1}
     metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency]

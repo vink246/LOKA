@@ -15,12 +15,15 @@ _COST_NAMES = ("roll", "pitch", "yaw", "x", "y", "z", "wx", "wy", "wz", "vx", "v
 
 
 def belief_actuator_deviation(plant_bias, belief_bias, contact_jacobian) -> np.ndarray:
-    """Plant bias minus belief bias, in actuator torques.
+    """Model residual in actuator torques.
 
-    Torso mass and COM land on the floating base, not on the leg-joint entries
-    of ``qfrc_bias``. The base wrench is resolved through the sole Jacobian,
-    ``J_base.T @ f = Δ_base``, and the actuator value is ``J_joint.T @ f`` plus
-    the joint residual. The result is zero when the two models agree.
+    ``plant_bias`` is the measured generalized force: actuator torque (current),
+    contact force (foot sensors), and any known external force. ``belief_bias``
+    is the belief model's inverse dynamics at the measured position, velocity,
+    and acceleration. Their difference is zero when the belief explains the
+    motion. Torso mass and COM land on the floating base, so the base wrench is
+    resolved through the sole Jacobian, ``J_base.T @ f = Δ_base``, and the
+    actuator value is ``J_joint.T @ f`` plus the joint residual.
     """
     plant = np.asarray(plant_bias, dtype=float).reshape(-1)
     belief = np.asarray(belief_bias, dtype=float).reshape(-1)
@@ -33,6 +36,35 @@ def belief_actuator_deviation(plant_bias, belief_bias, contact_jacobian) -> np.n
     j_joint = jac[:, QVEL_JOINT0:QVEL_JOINT0 + joints.size]
     forces, *_ = np.linalg.lstsq(j_base.T, delta[:QVEL_JOINT0], rcond=None)
     return j_joint.T @ forces + joints
+
+
+def motor_deficit(model, belief_gear, nominal_gear, ctrl, qfrc_actuator):
+    """Commanded torque minus the torque the motors applied, per actuator.
+
+    ``qfrc_actuator`` is the sim stand-in for current-derived torque. Expected
+    torque scales with the believed gear, so a gear search can drive this to
+    zero. ``gear_error`` is ``(belief_gear - plant_gear)`` on actuators whose
+    command is large enough to divide; positive means the belief gear is high.
+    """
+    ctrl = np.asarray(ctrl, dtype=float).reshape(-1)
+    applied = np.asarray(qfrc_actuator, dtype=float).reshape(-1)
+    belief = np.asarray(belief_gear, dtype=float).reshape(-1)
+    nominal = np.asarray(nominal_gear, dtype=float).reshape(-1)
+    deficit = np.zeros(model.nu, dtype=float)
+    gear_error = np.zeros(model.nu, dtype=float)
+    for i in range(model.nu):
+        joint_id = int(model.actuator_trnid[i, 0])
+        if joint_id < 0:
+            continue
+        dof = int(model.jnt_dofadr[joint_id])
+        if dof < 0 or dof >= applied.size:
+            continue
+        base = float(nominal[i]) if abs(float(nominal[i])) > 1e-9 else 1.0
+        expected = (float(belief[i]) / base) * float(ctrl[i])
+        deficit[i] = expected - float(applied[dof])
+        if abs(float(ctrl[i])) > 1.0:
+            gear_error[i] = deficit[i] / float(ctrl[i])
+    return deficit, gear_error
 
 
 class EffortDeviationObserver:
@@ -51,47 +83,88 @@ class EffortDeviationObserver:
         self.consecutive_steps = int(bias["consecutive_steps"])
         self.stand_threshold_nm = float(bias["stand_threshold_nm"])
         self.walk_threshold_nm = float(bias["walk_threshold_nm"])
+        # |commanded - applied|. Healthy motors sit at 0. A standing knee at
+        # 75% gear is about 4 Nm, so 1.5 Nm is above noise and below that fault.
+        self.motor_threshold_nm = float(bias.get("motor_threshold_nm", 1.5))
+        # Planted-sole tangential speed. A healthy walk averages under 0.11 m/s.
+        self.slip_threshold_mps = float(bias.get("slip_threshold_mps", 0.25))
         self.clear_below_s = float(bias.get("clear_below_s", 0.5))
         self.consecutive_out_of_bounds = 0
         self.consecutive_in_bounds = 0
         self.joint_bias = None
+        self.motor_bias = None
+        self.gear_error = None
+        self.motor_nm = 0.0
+        self.slip_mps = 0.0
+        self.out_of_bounds = False
         self.avg_cost = None
         self._walk = deque()
+        self._walk_motor = deque()
+        self._walk_gear = deque()
+        self._walk_slip = deque()
+        self._motor_samples = deque(maxlen=window_size_steps)
+        self._gear_samples = deque(maxlen=window_size_steps)
+        self._slip_samples = deque(maxlen=window_size_steps)
         self._was_walking = False
         self._line_width = 0
         self._named = False
         self.xyz = None
 
-    def update(self, delta_tau, cost, printout=False, xyz=None):
+    def update(self, delta_tau, cost, printout=False, xyz=None, motor=None, slip=0.0, gear_error=None):
         # Signed actuator image of plant bias minus belief bias.
         delta_tau = np.asarray(delta_tau, dtype=float)
         self.torque_deviations.append(delta_tau)
         self.costs.append(np.asarray(cost, dtype=float))
+        if motor is None:
+            motor = np.zeros(delta_tau.shape, dtype=float)
+        motor = np.asarray(motor, dtype=float)
+        if gear_error is None:
+            gear_error = np.zeros(motor.shape, dtype=float)
+        gear_error = np.asarray(gear_error, dtype=float)
+        self._motor_samples.append(motor)
+        self._gear_samples.append(gear_error)
+        self._slip_samples.append(float(slip))
 
         if self.is_walking:
             # Mean over two step periods. Uniform dt makes the mean the integral mean.
             n = max(1, int(round(2.0 * self.step_period / self.dt)))
-            self._walk.append(delta_tau)
-            while len(self._walk) > n:
-                self._walk.popleft()
-            joint_bias = np.mean(np.stack(self._walk), axis=0)
+            joint_bias = self._push_walk(self._walk, delta_tau, n)
+            motor_bias = self._push_walk(self._walk_motor, motor, n)
+            gear_bias = self._push_walk(self._walk_gear, gear_error, n)
+            slip_m = float(self._push_walk(self._walk_slip, float(slip), n))
         else:
             self._walk.clear()
+            self._walk_motor.clear()
+            self._walk_gear.clear()
+            self._walk_slip.clear()
             joint_bias = np.mean(np.stack(self.torque_deviations), axis=0)
+            motor_bias = np.mean(np.stack(self._motor_samples), axis=0)
+            gear_bias = np.mean(np.stack(self._gear_samples), axis=0)
+            slip_m = float(np.mean(self._slip_samples))
         avg_cost = np.mean(np.stack(self.costs), axis=0)
         total_bias = float(np.sum(np.abs(joint_bias)))
+        motor_nm = float(np.sum(np.abs(motor_bias)))
         if self.is_walking != self._was_walking:
             self.consecutive_out_of_bounds = 0
             self.consecutive_in_bounds = 0
             self._was_walking = self.is_walking
         threshold = self.walk_threshold_nm if self.is_walking else self.stand_threshold_nm
-        if total_bias > threshold:
+        self.out_of_bounds = (
+            total_bias > threshold
+            or motor_nm > self.motor_threshold_nm
+            or slip_m > self.slip_threshold_mps
+        )
+        if self.out_of_bounds:
             self.consecutive_out_of_bounds += 1
             self.consecutive_in_bounds = 0
         else:
             self.consecutive_out_of_bounds = 0
             self.consecutive_in_bounds += 1
         self.joint_bias = joint_bias
+        self.motor_bias = motor_bias
+        self.gear_error = gear_bias
+        self.motor_nm = motor_nm
+        self.slip_mps = slip_m
         self.avg_cost = avg_cost
         if xyz is not None:
             self.xyz = np.asarray(xyz, dtype=float).reshape(3)
@@ -100,6 +173,13 @@ class EffortDeviationObserver:
             self._write(avg_cost, joint_bias, total_bias)
 
         return total_bias, joint_bias, avg_cost
+
+    @staticmethod
+    def _push_walk(buf: deque, sample, n: int):
+        buf.append(sample)
+        while len(buf) > n:
+            buf.popleft()
+        return np.mean(np.stack(buf), axis=0)
 
     def _write(self, avg_cost, joint_bias, total_bias) -> None:
         if not self._named:
@@ -121,8 +201,16 @@ class EffortDeviationObserver:
             pos = (
                 f"  xyz={self.xyz[0]:+.3f} {self.xyz[1]:+.3f} {self.xyz[2]:+.3f}"
             )
+        motor_txt = ""
+        if self.motor_bias is not None and self.motor_bias.size:
+            slot = int(np.argmax(np.abs(self.motor_bias)))
+            motor_name = names[slot] if slot < len(names) else str(slot)
+            motor_txt = (
+                f" motor={self.motor_nm:4.1f}({motor_name}={float(self.motor_bias[slot]):+.1f})"
+            )
         line = (
-            f"[effort] |bias|={total_bias:5.1f} "
+            f"[effort] |bias|={total_bias:5.1f}{motor_txt}"
+            f" slip={self.slip_mps:4.2f} "
             f"oob={self.consecutive_out_of_bounds} {worst_txt}  {vals}{pos}"
         )
         self._line_width = max(self._line_width, len(line))

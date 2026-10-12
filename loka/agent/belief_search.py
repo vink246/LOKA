@@ -11,8 +11,9 @@ says which way the live belief is wrong:
 - com x: pitch residual. Positive means the COM is too far back.
 - com y: waist-roll residual. Positive means the COM is too far right.
 - com z: pitch residual, much weaker than x. Positive means the COM is too low.
-- friction and gear do not enter this residual. Their searches still run, and
-  stop if a probe leaves the residual unchanged.
+- friction does not enter this residual. Its search still runs, and stops
+  if a probe leaves the residual unchanged. A gear search reads the motor
+  deficit instead: commanded torque minus applied torque.
 
 Unbounded binary search: while the sign stays the same, double the last step
 (mass, friction, and gear multiply; a COM axis doubles its offset from the
@@ -187,9 +188,13 @@ def make_search(kind: str, start: float, *, axis: str | None = None, origin: flo
             lo=0.02, hi=5.0,
         )
     if kind == "gear":
+        # error is belief_gear - plant_gear, not an Nm residual. 0.05 is a
+        # 5% gear match. The Nm tolerance used for mass would treat a 25%
+        # weak knee as already settled.
         return UnboundedSearch(
             start, mode="mul", expand=2.0, origin=origin,
-            error_tol=0.4, value_tol=max(0.02, 0.05 * abs(start)),
+            error_tol=0.05, value_tol=max(0.02, 0.05 * abs(start)),
+            unchanged_tol=0.02,
             lo=0.0, hi=max(5.0, abs(start) * 4.0),
         )
     raise ValueError(f"unknown search kind {kind!r}")
@@ -395,7 +400,17 @@ class BeliefSearchRunner:
         bias = np.asarray(obs.joint_bias, dtype=float)
         total = float(np.sum(np.abs(bias)))
         names = list(obs.names or ())
-        error = signed_error(self._request.kind, self._request.axis, bias, names)
+        if self._request.kind == "gear" and obs.gear_error is not None:
+            gear = np.asarray(obs.gear_error, dtype=float)
+            try:
+                slot = names.index(self._request.name)
+            except ValueError:
+                slot = None
+            # Positive gear_error means the believed gear is stronger than the
+            # motor. The search raises its parameter on a positive error.
+            error = 0.0 if slot is None else -float(gear[slot])
+        else:
+            error = signed_error(self._request.kind, self._request.axis, bias, names)
         decision = self._search.observe(error, total)
         label = self._label()
         print(

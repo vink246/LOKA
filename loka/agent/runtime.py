@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from loka.control.locomotion import LocomotionController
+from loka.control.locomotion import CONTACT_HEIGHT_TOLERANCE, LocomotionController
 from loka.agent.model_state import apply_loka_mutations, zero_dead_actuator_commands
 from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Simulation
@@ -24,7 +24,11 @@ from loka.agent.context import (
     format_stand_configuration,
 )
 from loka.agent.robot_context import build_robot_model_context
-from loka.agent.anomaly import EffortDeviationObserver, belief_actuator_deviation
+from loka.agent.anomaly import (
+    EffortDeviationObserver,
+    belief_actuator_deviation,
+    motor_deficit,
+)
 from loka.agent.belief_search import BeliefSearchRunner, parse_belief_searches
 from loka.agent.faults import FaultSpec, capture_nominal_params
 from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
@@ -522,17 +526,41 @@ class LokaRuntime:
 
         sim.data.xfrc_applied[sim.pelvis_id, :3] = 0.0
 
-        # Post-step qpos is ahead of xpos. Refresh kinematics, then compare
-        # inverse-dynamics bias on the plant and the belief at that same state.
+        # Post-step qpos is ahead of xpos. The mass residual is the measured
+        # generalized force minus the belief model's inverse dynamics at that
+        # state. Actuator torque stands in for current, and the contact
+        # constraint force for foot sensors. The plant's inertias are not read.
         mujoco.mj_kinematics(sim.model, sim.data)
         mujoco.mj_comPos(sim.model, sim.data)
-        plant_bias = np.empty(sim.model.nv)
-        mujoco.mj_rne(sim.model, sim.data, 0, plant_bias)
         robot = self.controller.robot
         robot.update(sim.data.qpos, sim.data.qvel)
-        deviation = belief_actuator_deviation(
-            plant_bias, robot.data.qfrc_bias, robot.contact_jacobian()
+        contact_jac = robot.contact_jacobian()
+        belief = robot.data
+        belief.qacc[:] = sim.data.qacc
+        belief_inverse = np.empty(robot.model.nv)
+        mujoco.mj_rne(robot.model, belief, 1, belief_inverse)
+        measured = (
+            sim.data.qfrc_actuator
+            + sim.data.qfrc_constraint
+            + sim.data.qfrc_applied
         )
+        deviation = belief_actuator_deviation(
+            measured, belief_inverse, contact_jac
+        )
+        deficit, gear_error = motor_deficit(
+            sim.model,
+            robot.model.actuator_gear[:, 0],
+            self.loka_state["nominal_gears"],
+            sim.data.ctrl,
+            sim.data.qfrc_actuator,
+        )
+        heights = robot.data.site_xpos[robot.contact_site_ids][:, 2]
+        planted = heights < self.controller._ground_height + CONTACT_HEIGHT_TOLERANCE
+        tang = np.linalg.norm(
+            (contact_jac @ sim.data.qvel).reshape(-1, 3)[:, :2],
+            axis=1,
+        )
+        slip = float(tang[planted].max()) if np.any(planted) else 0.0
         tel = self.controller.telemetry
         self.effort_observer.is_walking = bool(tel is not None and tel.walking)
         self.effort_observer.step_period = float(self.controller.gait.config.step_period)
@@ -541,6 +569,9 @@ class LokaRuntime:
             self.controller.mpc.cost_components,
             printout=self.effort_observer.printout,
             xyz=sim.data.qpos[:3],
+            motor=deficit,
+            slip=slip,
+            gear_error=gear_error,
         )
         self._sync_walk_block()
 
@@ -731,7 +762,7 @@ class LokaRuntime:
         if total is None:
             self.controller.gait.block_walk = False
             return
-        self.controller.gait.block_walk = total > self._bias_threshold_nm()
+        self.controller.gait.block_walk = self.effort_observer.out_of_bounds
 
     def _stand_for_walking_bias(self, now: float, frame: dict) -> bool:
         """Stand before the orchestrator is invoked for a walking effort fault.
