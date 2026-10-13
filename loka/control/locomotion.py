@@ -300,6 +300,10 @@ class LocomotionController:
         self._refresh_posture_gains()
         self._build_knee_table()
 
+    def recalibrate_stance(self) -> None:
+        """Re-measure the nominal stance after the model's mass changes."""
+        self._calibrate_nominal_pose()
+
     def _refresh_posture_gains(self) -> None:
         """Pre-build the per-joint posture gains for both leg states.
 
@@ -765,6 +769,37 @@ class LocomotionController:
             if swing.s <= SWING_ANKLE_RELEASE_S:
                 for local in (ANKLE_PITCH, ANKLE_ROLL):
                     hold_joint(j0 + local, SWING_ANKLE_KP, SWING_ANKLE_KD, SWING_ANKLE_W)
+
+        if not walking:
+            # A stand that starts on a toe-first landing sees only the toe
+            # sites. The QP then loads the toe, the ankle torque lifts the
+            # heel further, and nothing brings it back. Level that sole about
+            # the sites that are down. Yaw stays free. With both soles rocked
+            # the whole body is tilted, and leveling one foot fights that.
+            per_foot = robot.num_contacts // 2
+            planted = [int(measured_mask[leg * per_foot : (leg + 1) * per_foot].sum()) for leg in (0, 1)]
+            partial = [leg for leg in (0, 1) if 0 < planted[leg] < per_foot]
+            if len(partial) == 1 and planted[1 - partial[0]] == per_foot:
+                leg = partial[0]
+                site_id = int(robot.foot_center_site_ids[leg])
+                _, j_w = robot.site_spatial_jacobian(site_id)
+                _, bias_ang = robot.site_spatial_bias_acc(site_id, qvel_arr)
+                foot_quat = robot.site_quat(site_id)
+                yaw = float(foot_yaws_now[leg])
+                flat = np.array([np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)])
+                err_world = quat_to_mat(foot_quat) @ orientation_error(foot_quat, flat)
+                omega = j_w @ qvel_arr
+                level_acc = np.clip(
+                    wbc_cfg.kp_swing_orient * err_world
+                    - wbc_cfg.kd_swing_orient * omega
+                    - bias_ang,
+                    -cfg.max_swing_ang_acc,
+                    cfg.max_swing_ang_acc,
+                )
+                swing_orient_jacobian = j_w.copy()
+                swing_orient_jacobian[2] = 0.0
+                swing_orient_acc = level_acc.copy()
+                swing_orient_acc[2] = 0.0
 
         knee_guard = np.zeros(2, dtype=bool)
         if walking:

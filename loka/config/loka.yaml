@@ -31,7 +31,7 @@ effort_bias:
   stand_threshold_nm: 5.0
   walk_threshold_nm: 5.0
   motor_threshold_nm: 0.75
-  slip_threshold_mps: 0.25
+  slip_threshold_mps: 0.15
   stand_window_steps: 100
   clear_below_s: 0.5
   stand_on_fault: true

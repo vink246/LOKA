@@ -11,9 +11,10 @@ says which way the live belief is wrong:
 - com x: pitch residual. Positive means the COM is too far back.
 - com y: waist-roll residual. Positive means the COM is too far right.
 - com z: pitch residual, much weaker than x. Positive means the COM is too low.
-- friction does not enter this residual. Its search still runs, and stops
-  if a probe leaves the residual unchanged. A gear search reads the motor
-  deficit instead: commanded torque minus applied torque.
+- friction does not enter this residual. Its search is not probed: it reads
+  mu off the contact-force ratio of sliding feet in the window captured when
+  the fault tripped. A gear search reads the motor deficit instead:
+  commanded torque minus applied torque.
 
 Unbounded binary search: while the sign stays the same, double the last step
 (mass, friction, and gear multiply; a COM axis doubles its offset from the
@@ -466,6 +467,9 @@ class BeliefSearchRunner:
         self._target = target
         start = float(target["start"])
         origin = float(target["origin"])
+        if spec.kind == "friction":
+            self._estimate_friction(start)
+            return
         self._search = make_search(spec.kind, start, axis=spec.axis, origin=origin)
         self.active = True
         if spec.kind == "gear":
@@ -489,6 +493,26 @@ class BeliefSearchRunner:
             f"\n[search] {self._label()} started at {start:.4g} "
             f"(nominal {origin:.4g}). Settling {settle:.2f}s between probes."
         )
+
+    def _estimate_friction(self, start: float) -> None:
+        """Friction leaves the effort residual alone, so it is not probed.
+
+        A sliding planted contact sits on its friction cone. The runtime keeps
+        |f_t| / f_n of those contacts and copies the window when the fault
+        trips; mu is read from that window in one shot.
+        """
+        estimate = getattr(self.runtime, "estimate_friction", lambda: None)()
+        label = self._label()
+        if estimate is None:
+            print(f"\n[search] {label}: no sliding contacts in the fault window. Belief unchanged.")
+            self._record(start, "unobservable: no sliding contacts in the fault window")
+        else:
+            mu, count = estimate
+            mu = float(np.clip(mu, 0.02, 5.0))
+            self._write(mu)
+            print(f"\n[search] {label} done  value={mu:.3g}  (contact force ratio, {count} sliding samples)")
+            self._record(mu, f"contact force ratio over {count} sliding samples")
+        self._start_next()
 
     def _engage_measurement_gait(self) -> None:
         """Keep a fault stand. A live walk may still use the slow search gait.
