@@ -2,9 +2,10 @@
 
 ``low_level`` is the MPC + whole-body controller with no orchestrator.
 ``loka`` is that same controller with the language orchestrator in the loop.
+``unitree_rl`` is the unitree_rl_lab velocity policy on the same plant.
 
-A future RL or VLA baseline subclasses :class:`Baseline`, registers a name,
-and is selected from the suite YAML as ``{name, type, options}``.
+A new baseline subclasses :class:`Baseline`, registers a name, and is
+selected from the suite YAML as ``{name, type, options}``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from loka.agent.runtime import LokaConfig, LokaRuntime
 from loka.control.locomotion import LocomotionConfig
 from loka.harness.registry import get_baseline, register_baseline
 from loka.harness.stochastic import apply_seeded_state_noise
-from loka.sim import Simulation
+from loka.sim import Simulation, UnitreeRLSimulation
 
 
 def locomotion_config(suite) -> LocomotionConfig:
@@ -135,6 +136,27 @@ class LowLevelBaseline(Baseline):
     @property
     def viz(self) -> FaultVizState:
         return self._viz
+
+
+@register_baseline("unitree_rl")
+class UnitreeRLBaseline(LowLevelBaseline):
+    """The unitree_rl_lab G1-29dof velocity policy, sim2sim on the same scene.
+
+    Options: ``policy_dir`` (a directory with ``deploy.yaml`` and
+    ``policy.npz``; default is the vendored v0 policy) and ``min_speed``
+    (slowest walking command [m/s]).
+    """
+
+    def __init__(self, spec, suite, log_path: Path | None = None) -> None:
+        del log_path
+        options = dict(spec.options or {})
+        self._sim = UnitreeRLSimulation(
+            locomotion_config(suite),
+            policy_dir=options.get("policy_dir"),
+            min_speed=options.get("min_speed"),
+        )
+        self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
+        self._goal_xy = None
 
 
 @register_baseline("loka")

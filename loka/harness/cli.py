@@ -17,7 +17,7 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--baselines",
         default=None,
-        help="Comma-separated baseline names (low_level, loka, or a registered type).",
+        help="Comma-separated baseline names (low_level, loka, unitree_rl, or a registered type).",
     )
     parser.add_argument("--num-trials", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
