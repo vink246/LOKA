@@ -23,7 +23,7 @@ orchestrator:
   request_timeout_s: 120.0
 
 recording:
-  enabled: true
+  enabled: false
   fps: 30
   width: 1280
   height: 720
@@ -36,8 +36,10 @@ recording:
   stand_push_probes: boundary
   min_push_visible_s: 0.3
 
-# A baseline is a name, or {name, type, options} for a future RL / VLA entry.
-baselines: [low_level, loka]
+# A baseline is a name, or {name, type, options}. unitree_rl takes
+# options.policy_dir (default models/unitree_rl/g1_29dof_velocity_v0) and
+# options.min_speed (0.30 m/s; the v0 policy stands still below ~0.25).
+baselines: [low_level, loka, unitree_rl]
 
 tasks:
   - name: stand_push
@@ -66,7 +68,7 @@ tasks:
       radius: 0.2
       hold_s: 0.0
     command_time_s: 0.0
-    perturbation_time_s: 4.0
+    perturbation_time_s: 5.0
     timeout_s: 60.0
     goal_via: directive
     perturbations:
@@ -74,6 +76,6 @@ tasks:
       - {name: torso_mass, kind: mass, body: torso_link, delta_kg: 10.0}
       - {name: shoulder_mass, kind: mass, body: left_shoulder_roll_link, delta_kg: 7.0}
       - {name: weak_right_knee, kind: actuator_gear, actuator: right_knee, scale: 0.75}
-      - {name: low_friction, kind: friction, mu: 0.5}
-      - {name: shove, kind: push, force_n: 100.0, direction: [0.0, 1.0], duration_s: 0.1}
+      - {name: low_friction, kind: friction, mu: 0.4}
+      - {name: shove, kind: push, force_n: 120.0, direction: [0.0, 1.0], duration_s: 0.05}
     metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency]

@@ -66,8 +66,8 @@ def test_registry_extension():
 def test_shipped_suite_and_round_trip():
     suite = load_suite_yaml(SUITE)
     units = iter_units(suite)
-    # stand_push plus six goto perturbations, two baselines, five trials.
-    assert len(units) == 7 * 2 * 5
+    # stand_push plus six goto perturbations, three baselines, five trials.
+    assert len(units) == 7 * 3 * 5
     assert units[0].id == "stand_push__shoulder_mass__low_level__trial_00"
     again = parse_suite(suite.to_dict())
     assert [unit.id for unit in iter_units(again)] == [unit.id for unit in units]

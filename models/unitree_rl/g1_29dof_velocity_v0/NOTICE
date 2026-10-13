@@ -1,0 +1,10 @@
+G1 29-DoF velocity-tracking policy (v0) from unitree_rl_lab.
+
+Source:  https://github.com/unitreerobotics/unitree_rl_lab
+Commit:  4960b84732b0c2ec593dccbfe963fda1bcd7b1e3
+Files:   deploy/robots/g1_29dof/config/policy/velocity/v0/exported/policy.onnx
+         deploy/robots/g1_29dof/config/policy/velocity/v0/params/deploy.yaml
+License: Apache License 2.0, Copyright (c) 2025 Unitree Robotics Co., Ltd.
+
+policy.onnx and deploy.yaml are unmodified copies. policy.npz holds the same
+weights, written by scripts/export_unitree_policy.py.

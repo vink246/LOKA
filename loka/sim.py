@@ -2,7 +2,8 @@
 
 The controller reads ``qpos`` / ``qvel`` straight out of ``MjData`` and writes
 torques into ``ctrl`` -- one process, no state estimator, no network. That
-keeps the control law the only thing under test.
+keeps the control law the only thing under test. ``UnitreeRLSimulation`` puts
+the unitree_rl_lab velocity policy on the same plant.
 """
 
 from __future__ import annotations
@@ -166,6 +167,80 @@ class Simulation:
             torque_peak=float(columns["torque"].max()),
             solve_ms_mean=float(columns["solve_ms"].mean()),
             solve_ms_p95=float(np.percentile(columns["solve_ms"], 95)),
+        )
+
+
+class UnitreeRLSimulation(Simulation):
+    """The unitree_rl_lab velocity policy driving the same MuJoCo scene.
+
+    One :meth:`step` is still ``config.control_dt``. The policy runs every
+    ``step_dt`` (50 Hz for v0) and the PD law on every physics substep, as the
+    motor drivers do on the robot.
+    """
+
+    def __init__(
+        self,
+        config: LocomotionConfig | None = None,
+        model_path: str | Path | None = None,
+        pushes: list[Push] | None = None,
+        policy_dir: str | Path | None = None,
+        min_speed: float | None = None,
+    ) -> None:
+        from loka.control.unitree_rl import MIN_WALK_SPEED, UnitreeRLController
+
+        self.config = config or LocomotionConfig()
+        if model_path is not None:
+            self.config.model_path = str(model_path)
+        self.model = mujoco.MjModel.from_xml_path(self.config.model_path)
+        self.data = mujoco.MjData(self.model)
+        self.pelvis_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+        )
+        self.controller = UnitreeRLController(
+            self.model,
+            policy_dir,
+            min_speed=MIN_WALK_SPEED if min_speed is None else float(min_speed),
+        )
+        self.steps_per_control = max(
+            1, int(round(self.config.control_dt / self.model.opt.timestep))
+        )
+        self.policy_decimation = max(
+            1, int(round(self.controller.policy.step_dt / self.config.control_dt))
+        )
+        self.pushes = list(pushes or [])
+        self.history: list[dict] = []
+        self.reset()
+
+    def reset(self) -> None:
+        mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        self.controller.reset()
+        self.controller.place_default_pose(self.data)
+        self.history.clear()
+        self.torque = np.zeros(self.model.nu)
+        self._ticks = 0
+
+    def step(self) -> None:
+        if self._ticks % self.policy_decimation == 0:
+            self.controller.policy_step(self.data.qpos, self.data.qvel)
+        self._ticks += 1
+        force = self._applied_force()
+        for _ in range(self.steps_per_control):
+            self.torque = self.controller.compute_torque(self.data.qpos, self.data.qvel)
+            self.data.ctrl[:] = self.torque
+            self.data.xfrc_applied[self.pelvis_id, :3] = force
+            mujoco.mj_step(self.model, self.data)
+        self.data.xfrc_applied[self.pelvis_id, :3] = 0.0
+
+        telemetry = self.controller.telemetry
+        self.history.append(
+            {
+                "t": self.data.time,
+                "com_error": 0.0,
+                "tilt": float(np.linalg.norm(telemetry.rpy[:2])),
+                "torque": float(np.abs(self.torque).max()),
+                "solve_ms": telemetry.solve_ms,
+                "pelvis_z": float(self.data.qpos[2]),
+            }
         )
 
 

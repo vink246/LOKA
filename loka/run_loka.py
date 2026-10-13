@@ -6,8 +6,12 @@
     python -m loka.run_loka --operator "lean left and crouch"
     python -m loka.run_loka --no-llm --goal 3,3
     python -m loka.run_loka --fault mass --headless -T 12
+    python -m loka.run_loka --unitree-rl --goal 3,3 --goal-heading 1.57
 
 ``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``).
+``--unitree-rl`` swaps the MPC plant for the unitree_rl_lab velocity policy on
+the same scene. It has no orchestrator, so it implies ``--no-llm``; goals,
+``--mode walk``, faults and the fault keys work as they do for the plant.
 ``--no-llm`` accepts a world goal (``--goal 3,3`` or ``goal 3 3`` on
 stdin) and structured ``--task`` setpoints. The control loop never blocks on
 the model.
@@ -45,15 +49,18 @@ import mujoco
 
 from loka.control.locomotion import DEFAULT_MODEL, LocomotionConfig, TASK_PARAMETER_NAMES
 from loka.control.stacks import add_stack_argument, apply_stack_arg
-from loka.sim import Simulation
+from loka.sim import Simulation, UnitreeRLSimulation
 from loka.agent.faults import FaultSpec
 from loka.agent.belief_search import parse_search_command, search_for_keycode
 from loka.agent.interactive import (
     FAULT_HELP,
+    FaultVizState,
     KeyDebounce,
+    commit_fault,
     fault_for_keycode,
     parse_fault_command,
     parse_goal_command,
+    restore_faults,
 )
 from loka.agent.runtime import LokaConfig, LokaRuntime
 from loka.agent.session_log import default_log_path
@@ -173,8 +180,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="Initial gait.heading [rad] world-frame travel direction",
     )
+    parser.add_argument(
+        "--unitree-rl",
+        action="store_true",
+        help="Run the unitree_rl_lab velocity policy instead of the MPC plant (implies --no-llm)",
+    )
+    parser.add_argument(
+        "--policy-dir",
+        type=Path,
+        default=None,
+        help="unitree_rl policy directory with deploy.yaml and policy.npz "
+        "(default: models/unitree_rl/g1_29dof_velocity_v0)",
+    )
+    parser.add_argument(
+        "--goal-heading",
+        type=float,
+        default=None,
+        help="World yaw [rad] to face while walking to --goal and at it. --unitree-rl only",
+    )
     add_stack_argument(parser)
     args = parser.parse_args(argv)
+    if args.unitree_rl:
+        if args.operator or args.task:
+            parser.error("--unitree-rl has no orchestrator; drop --operator / --task")
+        args.no_llm = True
+    elif args.policy_dir is not None or args.goal_heading is not None:
+        parser.error("--policy-dir and --goal-heading need --unitree-rl")
     if args.operator and args.no_llm:
         parser.error(
             "--operator is language and requires the LLM; "
@@ -228,10 +259,50 @@ def build_faults(args: argparse.Namespace) -> list[FaultSpec]:
     return []
 
 
+class _PlantRuntime:
+    """Faults and stepping for a plant with no orchestrator (``--unitree-rl``)."""
+
+    belief_search = None
+
+    def __init__(self, sim: Simulation, faults: list[FaultSpec]) -> None:
+        self.sim = sim
+        self.controller = sim.controller
+        self.viz = FaultVizState(external_body_id=sim.pelvis_id)
+        self.faults = list(faults)
+        self._fired: set[int] = set()
+
+    def inject_fault_now(self, fault: FaultSpec) -> bool:
+        ok, message = commit_fault(self.sim, self.viz, fault)
+        print(message)
+        return ok
+
+    def clear_interactive_faults(self) -> None:
+        print(restore_faults(self.sim, self.viz) or "[FAULT] nothing to clear")
+
+    def step(self) -> None:
+        now = float(self.sim.data.time)
+        for index, fault in enumerate(self.faults):
+            if index not in self._fired and now >= fault.time:
+                self._fired.add(index)
+                self.inject_fault_now(fault)
+        self.sim.step()
+        self.viz.external_force = self.sim._applied_force()
+
+    def run(self, duration: float, stop_on_fall: bool = True) -> list[dict]:
+        while self.sim.data.time < duration:
+            self.step()
+            if stop_on_fall and self.sim.fell:
+                break
+        return self.sim.history
+
+
 def _handle_interactive_line(
     runtime: LokaRuntime, line: str, *, llm_enabled: bool
 ) -> None:
     if line.strip().lower().startswith("search"):
+        if runtime.belief_search is None:
+            print("[!] belief search needs the MPC plant")
+            return
         spec = parse_search_command(line)
         if spec is not None:
             runtime.belief_search.request(spec)
@@ -264,17 +335,24 @@ def _handle_interactive_line(
         )
 
 
-def _apply_goal(runtime: LokaRuntime, x: float, y: float, speed: float | None) -> None:
+def _apply_goal(
+    runtime: LokaRuntime,
+    x: float,
+    y: float,
+    speed: float | None,
+    heading: float | None = None,
+) -> None:
     """Arm a world goal on the plant. The gait stands once it is inside tolerance."""
     cruise = 0.15 if speed is None else float(speed)
-    applied = runtime.controller.set_task_targets(
-        {
-            "gait.mode": "walk",
-            "gait.speed": cruise,
-            "gait.goal_x": float(x),
-            "gait.goal_y": float(y),
-        }
-    )
+    targets = {
+        "gait.mode": "walk",
+        "gait.speed": cruise,
+        "gait.goal_x": float(x),
+        "gait.goal_y": float(y),
+    }
+    if heading is not None:
+        targets["gait.goal_heading"] = float(heading)
+    applied = runtime.controller.set_task_targets(targets)
     print(f"[goal] walk to ({x:g}, {y:g}) at {cruise:g} m/s: {applied}")
 
 
@@ -300,6 +378,8 @@ def _make_key_callback(runtime: LokaRuntime):
         # GLFW keycodes: digits and letters are their Unicode code points.
         action = fault_for_keycode(keycode)
         if action is None:
+            if runtime.belief_search is None:
+                return
             spec = search_for_keycode(keycode)
             if spec is not None and keys.allow(keycode):
                 runtime.belief_search.request(spec)
@@ -321,21 +401,25 @@ def main(argv: list[str] | None = None) -> int:
     llm_enabled = not args.no_llm
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
     apply_stack_arg(config, args)
-    sim = Simulation(config, model_path=args.model)
-    log_path = None
-    if not args.no_log:
-        log_path = default_log_path(args.log_dir)
-    runtime = LokaRuntime(
-        sim,
-        LokaConfig(
-            enable_llm=llm_enabled,
-            enable_session_log=not args.no_log,
-            log_path=log_path,
-            print_compressor=not args.quiet_compressor,
-        ),
-        faults=build_faults(args),
-    )
-    runtime.effort_observer.printout = True
+    if args.unitree_rl:
+        sim = UnitreeRLSimulation(config, model_path=args.model, policy_dir=args.policy_dir)
+        runtime = _PlantRuntime(sim, build_faults(args))
+    else:
+        sim = Simulation(config, model_path=args.model)
+        log_path = None
+        if not args.no_log:
+            log_path = default_log_path(args.log_dir)
+        runtime = LokaRuntime(
+            sim,
+            LokaConfig(
+                enable_llm=llm_enabled,
+                enable_session_log=not args.no_log,
+                log_path=log_path,
+                print_compressor=not args.quiet_compressor,
+            ),
+            faults=build_faults(args),
+        )
+        runtime.effort_observer.printout = True
     if args.mode == "walk":
         applied = runtime.controller.set_task_targets(
             {
@@ -359,14 +443,21 @@ def main(argv: list[str] | None = None) -> int:
                 applied = runtime.controller.set_task_targets(args.task)
                 print(f"[ablation] Task_Targets applied: {applied}")
             if args.goal_xy is not None:
-                _apply_goal(runtime, args.goal_xy[0], args.goal_xy[1], args.goal_speed)
+                _apply_goal(
+                    runtime,
+                    args.goal_xy[0],
+                    args.goal_xy[1],
+                    args.goal_speed,
+                    args.goal_heading,
+                )
             elif args.operator:
                 runtime.submit_operator(args.operator)
 
         threading.Thread(target=_queue_later, daemon=True).start()
 
+    plant = "unitree_rl policy" if args.unitree_rl else "MPC plant"
     print(
-        f"G1 stand: orchestrator {'on' if llm_enabled else 'off'}  fault={args.fault}"
+        f"G1 {plant}: orchestrator {'on' if llm_enabled else 'off'}  fault={args.fault}"
     )
 
     if args.headless:
@@ -374,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
         fell = sim.fell
         print(sim.stats().report())
         print(f"tracking samples: {len(history)}  fell={fell}")
+        x, y = (float(v) for v in sim.data.qpos[:2])
+        print(f"final pelvis xy : ({x:.3f}, {y:.3f})")
         return 1 if fell else 0
 
     import mujoco.viewer
@@ -409,7 +502,8 @@ def main(argv: list[str] | None = None) -> int:
                         break
                 begin_frame(viewer)
                 render_fault_overlays(viewer, sim.model, sim.data, runtime.viz)
-                render_gait_overlays(viewer, runtime.controller)
+                if not args.unitree_rl:
+                    render_gait_overlays(viewer, runtime.controller)
                 viewer.sync()
                 next_frame += frame_dt
                 sleep = next_frame - time.perf_counter()
