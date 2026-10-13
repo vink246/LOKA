@@ -26,6 +26,7 @@ from loka.control.gait import (
     MODE_STAND,
     MODE_WALK,
     SCHED_UP_LAG,
+    STOP_FORCE_MAX_STEPS,
     STOP_FORCE_STEPS,
     SWING_TOUCHDOWN_VZ,
     SWING_TOUCHDOWN_Z,
@@ -148,35 +149,38 @@ def test_goal_arrival_waits_until_the_stand_settles():
     assert cfg.mode == MODE_WALK
 
 
-def test_goal_and_commanded_stops_accept_a_narrow_stance_but_fault_stops_do_not():
+def test_a_requested_stop_accepts_a_slightly_narrow_stance():
     sched = walking_scheduler(mode=MODE_WALK, speed=0.15)
     sched._latch_valid = True
     sched._width = 0.22
     narrow = np.array([[0.0, 0.105, 0.0], [0.0, -0.105, 0.0]])
     mask = np.ones(8, dtype=bool)
 
-    # Goal arrival.
     sched._stop_requested = True
-    sched._stop_loose = True
     assert sched._stance_planted(narrow, 0.0, mask)
-
-    # A fault stand keeps the exact width.
-    sched.mark_strict_stop()
-    assert not sched._stance_planted(narrow, 0.0, mask)
-
-    # A commanded stand while the walk is active starts a quick stop, but
-    # does not loosen a fault stand that is already pending.
-    sched._release_stop()
-    sched._active = True
-    sched.apply_updates({"gait.mode": "stand"})
-    assert sched._stop_requested and sched._stop_loose
-    sched.mark_strict_stop()
-    sched.apply_updates({"gait.mode": "stand"})
-    assert not sched._stop_loose
 
     # Without a stop pending the width stays exact.
     sched._release_stop()
     assert not sched._stance_planted(narrow, 0.0, mask)
+
+
+def test_a_forced_stand_waits_for_both_soles_then_gives_up():
+    sched = walking_scheduler(mode=MODE_WALK, speed=0.15)
+    sched._stop_requested = True
+    planted = np.array([[0.0, 0.12, 0.0], [0.0, -0.12, 0.0]])
+    lifting = np.array([[0.0, 0.12, 0.0], [0.0, -0.12, 0.05]])
+    mask = np.ones(8, dtype=bool)
+
+    sched._stop_extra = STOP_FORCE_STEPS
+    assert not sched._force_stand(lifting, 0.0, mask)
+    assert sched._stand_pending
+    assert sched._force_stand(planted, 0.0, mask)
+
+    sched._stop_extra = STOP_FORCE_MAX_STEPS
+    assert sched._force_stand(lifting, 0.0, mask)
+
+    sched._release_stop()
+    assert not sched._stand_pending
 
 
 def test_goal_stop_waits_until_the_pelvis_is_inside():

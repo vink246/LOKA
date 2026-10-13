@@ -44,6 +44,12 @@ import mujoco
 _SESSION = loka_config()["session"]
 _BIAS = loka_config().get("effort_bias", {})
 
+MU_SLIDE_MPS = 0.05  # planted-site speed that counts as sliding
+MU_MIN_NORMAL_N = 20.0
+MU_WINDOW_S = 2.0
+MU_MIN_SAMPLES = 50
+MU_PERCENTILE = 75.0  # partly stuck contacts read below the cone
+
 
 @dataclass
 class LokaConfig:
@@ -168,6 +174,19 @@ class LokaRuntime:
             for i in range(self.sim.model.nu)
         )
         self.belief_search = BeliefSearchRunner(self)
+        self._stance_model_key = self._mass_model_key()
+        # Contact-force ratio |f_t| / f_n on sliding planted feet. A sliding
+        # contact sits on its friction cone, so the ratio reads mu. The window
+        # is copied when an out-of-bounds streak trips, for the friction search.
+        self._mu_samples: deque = deque()
+        self.mu_fault_window: list[float] = []
+        self._foot_geom_leg = self._foot_geoms(self.sim.model)
+        self._floor_geom = mujoco.mj_name2id(self.sim.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        self._mu_capped = False
+        self._base_friction_mu = (
+            float(self.controller.config.mpc.friction_mu),
+            float(self.controller.config.wbc.friction_mu),
+        )
 
     def note_search_result(self, line: str) -> None:
         """Attach a finished search to the fix the next orchestrator turn reads."""
@@ -298,6 +317,90 @@ class LokaRuntime:
         robot.total_mass = float(robot.model.body_mass.sum())
         if hasattr(self.controller, "mpc") and hasattr(self.controller.mpc, "mass"):
             self.controller.mpc.mass = float(robot.total_mass)
+        # The stance height and walking knee posture come from the keyframe
+        # CoM, which moves with the mass belief. A search probe is a trial
+        # value, so only a settled belief retunes the stance.
+        key = self._mass_model_key()
+        if key != self._stance_model_key and not self.belief_search.busy:
+            self._stance_model_key = key
+            if hasattr(self.controller, "recalibrate_stance"):
+                self.controller.recalibrate_stance()
+
+    def _refresh_belief_friction(self) -> None:
+        """Cap the MPC and WBC friction cones at the believed floor friction.
+
+        Both QPs use a square pyramid, |f_x|, |f_y| <= mu f_n, whose corners
+        reach sqrt(2) mu. Dividing by sqrt(2) keeps the pyramid inside the
+        believed cone. A belief at or above nominal leaves the configured mu.
+        """
+        model = self.controller.robot.model
+        floor = self._floor_geom
+        if floor < 0:
+            return
+        feet = list(self._foot_geom_leg)
+        floor_mu = float(model.geom_friction[floor, 0])
+        if feet and int(model.geom_priority[floor]) <= int(model.geom_priority[feet].max()):
+            floor_mu = max(floor_mu, float(model.geom_friction[feet, 0].max()))
+        cap = floor_mu / np.sqrt(2.0)
+        base_mpc, base_wbc = self._base_friction_mu
+        cfg = self.controller.config
+        if cap < base_mpc - 1e-6 or cap < base_wbc - 1e-6:
+            want = {"mpc.friction_mu": min(base_mpc, cap), "wbc.friction_mu": min(base_wbc, cap)}
+            self._mu_capped = True
+        elif self._mu_capped:
+            want = {"mpc.friction_mu": base_mpc, "wbc.friction_mu": base_wbc}
+            self._mu_capped = False
+        else:
+            return
+        if (
+            abs(float(cfg.mpc.friction_mu) - want["mpc.friction_mu"]) > 1e-6
+            or abs(float(cfg.wbc.friction_mu) - want["wbc.friction_mu"]) > 1e-6
+        ):
+            self.controller.update_weights(**want)
+
+    @staticmethod
+    def _foot_geoms(model) -> dict[int, int]:
+        legs = {}
+        for g in range(model.ngeom):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+            if name.startswith("left_foot"):
+                legs[g] = 0
+            elif name.startswith("right_foot"):
+                legs[g] = 1
+        return legs
+
+    def _sample_friction_ratio(self, tang: np.ndarray, planted: np.ndarray) -> None:
+        sim = self.sim
+        now = float(sim.data.time)
+        per_foot = len(tang) // 2
+        sliding = [
+            bool(np.any(planted[leg * per_foot:(leg + 1) * per_foot]))
+            and float(tang[leg * per_foot:(leg + 1) * per_foot][planted[leg * per_foot:(leg + 1) * per_foot]].max()) > MU_SLIDE_MPS
+            for leg in (0, 1)
+        ]
+        if any(sliding):
+            force = np.zeros(6)
+            for i in range(sim.data.ncon):
+                con = sim.data.contact[i]
+                leg = self._foot_geom_leg.get(int(con.geom1), self._foot_geom_leg.get(int(con.geom2)))
+                if leg is None or not sliding[leg]:
+                    continue
+                mujoco.mj_contactForce(sim.model, sim.data, i, force)
+                if force[0] > MU_MIN_NORMAL_N:
+                    self._mu_samples.append((now, float(np.hypot(force[1], force[2]) / force[0])))
+        while self._mu_samples and self._mu_samples[0][0] < now - MU_WINDOW_S:
+            self._mu_samples.popleft()
+
+    def estimate_friction(self) -> tuple[float, int] | None:
+        """Floor mu from the window captured when the fault tripped."""
+        ratios = np.array([r for _, r in self.mu_fault_window], dtype=float)
+        if ratios.size < MU_MIN_SAMPLES:
+            return None
+        return float(np.percentile(ratios, MU_PERCENTILE)), int(ratios.size)
+
+    def _mass_model_key(self) -> bytes:
+        model = self.controller.robot.model
+        return model.body_mass.tobytes() + model.body_ipos.tobytes()
 
     # -- LLM dispatch -------------------------------------------------------
 
@@ -585,6 +688,7 @@ class LokaRuntime:
             axis=1,
         )
         slip = float(tang[planted].max()) if np.any(planted) else 0.0
+        self._sample_friction_ratio(tang, planted)
         tel = self.controller.telemetry
         self.effort_observer.is_walking = bool(tel is not None and tel.walking)
         self.effort_observer.step_period = float(self.controller.gait.config.step_period)
@@ -622,6 +726,7 @@ class LokaRuntime:
             self.loka_state["nominal_gears"],
         )
         self._refresh_belief_mass()
+        self._refresh_belief_friction()
 
         self._control_step()
         self.belief_search.tick()
@@ -691,6 +796,8 @@ class LokaRuntime:
 
         obs = self.effort_observer
         effort_fault = obs.consecutive_out_of_bounds >= obs.consecutive_steps
+        if obs.consecutive_out_of_bounds == obs.consecutive_steps:
+            self.mu_fault_window = list(self._mu_samples)
         recovered = (obs.consecutive_in_bounds * obs.dt) > obs.clear_below_s
         just_stood = False
         if effort_fault and self.config.enable_llm and self.config.stand_on_fault:
@@ -803,7 +910,6 @@ class LokaRuntime:
         if not bool(frame.get("walking")) and not gait.wants_walk():
             return False
         self.controller.set_task_targets({"gait.mode": "stand", "gait.speed": 0.0})
-        gait.mark_strict_stop()
         self._walk_fault_stand = True
         frame["walking"] = False
         frame["cmd_mode"] = float(gait.config.mode)
