@@ -41,13 +41,18 @@ def load_stand_system_prompt(
     return "\n\n".join(blocks)
 
 
-def stand_llm_worker(api_messages, result_queue) -> None:
-    """Background thread: never call from the control loop."""
+def stand_llm_worker(api_messages, result_queue, model=None) -> None:
+    """Background thread: never call from the control loop.
+
+    ``model`` overrides the ``LOKA_STAND_MODEL`` environment variable. When
+    both are unset the worker uses ``gpt-5.4-mini``.
+    """
     try:
         if not os.environ.get("OPENAI_API_KEY"):
             raise RuntimeError("OPENAI_API_KEY is not set")
+        chosen = model or os.environ.get("LOKA_STAND_MODEL", "gpt-6-luna")
         response = client.chat.completions.create(
-            model=os.environ.get("LOKA_STAND_MODEL", "gpt-5.4-mini"),
+            model=chosen,
             messages=api_messages,
             # temperature=0.1,
         )

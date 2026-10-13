@@ -109,3 +109,21 @@ def test_a_force_too_small_to_matter_draws_no_arrow(walking):
     viz.render_fault_overlays(viewer, walking.model, walking.data, state)
 
     assert viewer.user_scn.ngeom == 0
+
+
+def test_recordings_hide_foot_contact_markers():
+    from loka.control.locomotion import REPO_ROOT
+
+    model = mujoco.MjModel.from_xml_path(str(REPO_ROOT / "models" / "g1" / "scene.xml"))
+    viz.hide_foot_contact_markers(model)
+
+    contact = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left_foot_c0")
+    center = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left_foot_center")
+    imu = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "imu")
+    sphere = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_foot_heel_out")
+    mesh = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    assert int(model.site_group[contact]) == 3
+    assert int(model.site_group[center]) == 3
+    assert int(model.site_group[imu]) == 0
+    assert int(model.geom_group[sphere]) == 3
+    assert int(model.geom_group[mesh]) == 0

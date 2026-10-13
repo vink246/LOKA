@@ -11,8 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
-from loka.control.locomotion import LocomotionController
-from loka.agent.model_state import apply_loka_mutations, zero_dead_actuator_commands
+from loka.control.locomotion import CONTACT_HEIGHT_TOLERANCE, LocomotionController
+from loka.agent.model_state import (
+    actuator_torque_scale,
+    apply_loka_mutations,
+    joint_torque_to_command,
+    zero_dead_actuator_commands,
+)
 from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
@@ -24,7 +29,11 @@ from loka.agent.context import (
     format_stand_configuration,
 )
 from loka.agent.robot_context import build_robot_model_context
-from loka.agent.anomaly import EffortDeviationObserver, belief_actuator_deviation
+from loka.agent.anomaly import (
+    EffortDeviationObserver,
+    belief_actuator_deviation,
+    motor_deficit,
+)
 from loka.agent.belief_search import BeliefSearchRunner, parse_belief_searches
 from loka.agent.faults import FaultSpec, capture_nominal_params
 from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
@@ -45,12 +54,30 @@ class LokaConfig:
     max_turns: int = int(_SESSION.get("max_turns", 5))
     max_memory: int = int(_SESSION.get("max_memory", _SESSION.get("max_turns", 5)))
     stand_on_fault: bool = bool(_BIAS.get("stand_on_fault", True))
+    #: Orchestrator model. None keeps ``LOKA_STAND_MODEL`` / the worker default.
+    llm_model: str | None = None
+    #: ``wall`` applies a reply on the step it arrives. ``fixed_sim`` lets the
+    #: plant run for ``llm_latency_s`` of sim time after the dispatch, then
+    #: blocks until the reply (or ``llm_request_timeout_s`` of wall time).
+    #: ``pause`` is ``fixed_sim`` with a latency of 0.
+    llm_latency_mode: str = "wall"
+    llm_latency_s: float = 2.0
+    llm_request_timeout_s: float = 120.0
 
     def __post_init__(self) -> None:
         assert 0 <= self.max_memory <= self.max_turns, (
             f"session.max_memory ({self.max_memory}) must be <= "
             f"session.max_turns ({self.max_turns})"
         )
+        if self.llm_latency_mode not in ("wall", "fixed_sim", "pause"):
+            raise ValueError(
+                f"llm_latency_mode must be wall, fixed_sim, or pause, "
+                f"got {self.llm_latency_mode!r}"
+            )
+        if float(self.llm_latency_s) < 0.0:
+            raise ValueError("llm_latency_s must be >= 0")
+        if float(self.llm_request_timeout_s) < 0.0:
+            raise ValueError("llm_request_timeout_s must be >= 0")
     objective: str = field(default_factory=default_stand_objective)
     log_path: Path | None = None
     print_compressor: bool = True
@@ -105,6 +132,9 @@ class LokaRuntime:
 
         self.llm_queue: queue.Queue = queue.Queue()
         self.llm_busy = False
+        self.turns: list[dict] = []
+        self._dispatch_sim_t = 0.0
+        self._dispatch_wall_t = 0.0
         self.operator_queue: queue.Queue = queue.Queue()
         self.history: list[dict] = []
         self._pending_user_content: str | None = None
@@ -127,6 +157,10 @@ class LokaRuntime:
                 f"faults={len(self.faults)}"
             )
 
+        # Driver command limit in actuator units. After a gear search accepts,
+        # the QP's joint-torque limit is this times that belief, refreshed
+        # every step.
+        self._command_limit = self.controller.robot.torque_limit.copy()
         self.effort_observer = EffortDeviationObserver()
         self.effort_observer.dt = float(self.sim.config.control_dt)
         self.effort_observer.names = tuple(
@@ -308,6 +342,11 @@ class LokaRuntime:
         self._pending_user_content = user_content
         self._pending_dispatch_reason = reason
         self._last_invoke_t = now
+        self._dispatch_sim_t = now
+        self._dispatch_wall_t = time.perf_counter()
+        # A fresh queue so a reply abandoned after a timeout cannot be
+        # applied as the next turn.
+        self.llm_queue = queue.Queue()
         messages = session.compose_api_messages(
             self.system_prompt,
             user_content,
@@ -316,6 +355,7 @@ class LokaRuntime:
         thread = threading.Thread(
             target=stand_llm_worker,
             args=(messages, self.llm_queue),
+            kwargs={"model": self.config.llm_model},
             daemon=True,
         )
         thread.start()
@@ -340,23 +380,59 @@ class LokaRuntime:
         return True
 
     def _drain_llm(self) -> None:
-        try:
-            result = self.llm_queue.get_nowait()
-        except queue.Empty:
+        if not self.llm_busy:
             return
+        mode = self.config.llm_latency_mode
+        now = float(self.sim.data.time)
+        timed_out = False
+        if mode in ("fixed_sim", "pause"):
+            latency = 0.0 if mode == "pause" else float(self.config.llm_latency_s)
+            if now + 1e-9 < float(self._dispatch_sim_t) + latency:
+                return
+            timeout = max(0.0, float(self.config.llm_request_timeout_s))
+            try:
+                result = self.llm_queue.get(timeout=timeout)
+            except queue.Empty:
+                result = None
+                timed_out = True
+                self.llm_queue = queue.Queue()
+        else:
+            try:
+                result = self.llm_queue.get_nowait()
+            except queue.Empty:
+                return
+        self._accept_llm_result(result, timed_out=timed_out)
+
+    def _accept_llm_result(self, result, *, timed_out: bool) -> None:
         self.llm_busy = False
         now = float(self.sim.data.time)
         self._last_edit_t = now
-        if not result or not result.get("scratchpad"):
-            print(
-                f"[LOKA] empty orchestrator result; "
-                f"cooldown {self.config.cooldown_s:.1f}s"
+        wall_latency = time.perf_counter() - float(self._dispatch_wall_t)
+        reason = self._pending_dispatch_reason
+        user_content = self._pending_user_content
+        if timed_out or not result or not result.get("scratchpad"):
+            note = (
+                f"orchestrator timed out after {self.config.llm_request_timeout_s:.0f}s"
+                if timed_out
+                else "empty orchestrator result"
             )
+            print(f"[LOKA] {note}; cooldown {self.config.cooldown_s:.1f}s")
             if self.log is not None:
-                self.log.note(
-                    "empty orchestrator result",
-                    sim_time=now,
-                )
+                self.log.note(note, sim_time=now)
+            self.turns.append(
+                {
+                    "reason": reason,
+                    "sim_time": float(self._dispatch_sim_t),
+                    "applied_sim_time": now,
+                    "wall_latency_s": wall_latency,
+                    "user_content": user_content,
+                    "raw_yaml": None if not result else result.get("raw_yaml"),
+                    "scratchpad": None,
+                    "summary": None,
+                    "timed_out": timed_out,
+                    "model": self.config.llm_model,
+                }
+            )
             self._pending_user_content = None
             return
         scratchpad = result["scratchpad"]
@@ -387,6 +463,20 @@ class LokaRuntime:
             self.belief_search.enqueue(searches)
         if self.log is not None:
             self.log.apply_summary(sim_time=now, summary=summary)
+        self.turns.append(
+            {
+                "reason": reason,
+                "sim_time": float(self._dispatch_sim_t),
+                "applied_sim_time": now,
+                "wall_latency_s": wall_latency,
+                "user_content": user_content,
+                "raw_yaml": raw,
+                "scratchpad": scratchpad if isinstance(scratchpad, dict) else None,
+                "summary": summary,
+                "timed_out": False,
+                "model": self.config.llm_model,
+            }
+        )
         self._rebuild_prompt()
         print(
             f"[LOKA] edit applied at t={now:.2f}s; "
@@ -431,31 +521,70 @@ class LokaRuntime:
         import mujoco
 
         sim = self.sim
+        # The command scale is the committed belief gear. A gear search holds
+        # the previous constant while it probes, and the accepted value is
+        # what the QP plans against on the next step. On hardware the command
+        # is the current or torque setpoint. The plant gear is not read.
+        robot = self.controller.robot
+        scale = actuator_torque_scale(
+            robot.model,
+            self.loka_state,
+            belief_gear=self.belief_search.command_gear_hold,
+        )
+        achievable = self._command_limit * scale
+        robot.torque_limit[:] = achievable
+        if self.controller.wbc.torque_limit is not robot.torque_limit:
+            self.controller.wbc.torque_limit[:] = achievable
         torque = self.controller.compute_torque(sim.data.qpos, sim.data.qvel)
         zero_dead_actuator_commands(torque, self.loka_state)
-        sim.torque = torque
+        command = joint_torque_to_command(torque, scale, self._command_limit)
+        sim.torque = command
         force = sim._applied_force()
         self.viz.external_force = force.copy()
         self.viz.external_body_id = sim.pelvis_id
 
         for _ in range(sim.steps_per_control):
-            sim.data.ctrl[:] = torque
+            sim.data.ctrl[:] = command
             sim.data.xfrc_applied[sim.pelvis_id, :3] = force
             mujoco.mj_step(sim.model, sim.data)
 
         sim.data.xfrc_applied[sim.pelvis_id, :3] = 0.0
 
-        # Post-step qpos is ahead of xpos. Refresh kinematics, then compare
-        # inverse-dynamics bias on the plant and the belief at that same state.
+        # Post-step qpos is ahead of xpos. The mass residual is the measured
+        # generalized force minus the belief model's inverse dynamics at that
+        # state. Actuator torque stands in for current, and the contact
+        # constraint force for foot sensors. The plant's inertias are not read.
         mujoco.mj_kinematics(sim.model, sim.data)
         mujoco.mj_comPos(sim.model, sim.data)
-        plant_bias = np.empty(sim.model.nv)
-        mujoco.mj_rne(sim.model, sim.data, 0, plant_bias)
         robot = self.controller.robot
         robot.update(sim.data.qpos, sim.data.qvel)
-        deviation = belief_actuator_deviation(
-            plant_bias, robot.data.qfrc_bias, robot.contact_jacobian()
+        contact_jac = robot.contact_jacobian()
+        belief = robot.data
+        belief.qacc[:] = sim.data.qacc
+        belief_inverse = np.empty(robot.model.nv)
+        mujoco.mj_rne(robot.model, belief, 1, belief_inverse)
+        measured = (
+            sim.data.qfrc_actuator
+            + sim.data.qfrc_constraint
+            + sim.data.qfrc_applied
         )
+        deviation = belief_actuator_deviation(
+            measured, belief_inverse, contact_jac
+        )
+        deficit, gear_error = motor_deficit(
+            sim.model,
+            robot.model.actuator_gear[:, 0],
+            self.loka_state["nominal_gears"],
+            sim.data.ctrl,
+            sim.data.qfrc_actuator,
+        )
+        heights = robot.data.site_xpos[robot.contact_site_ids][:, 2]
+        planted = heights < self.controller._ground_height + CONTACT_HEIGHT_TOLERANCE
+        tang = np.linalg.norm(
+            (contact_jac @ sim.data.qvel).reshape(-1, 3)[:, :2],
+            axis=1,
+        )
+        slip = float(tang[planted].max()) if np.any(planted) else 0.0
         tel = self.controller.telemetry
         self.effort_observer.is_walking = bool(tel is not None and tel.walking)
         self.effort_observer.step_period = float(self.controller.gait.config.step_period)
@@ -464,6 +593,9 @@ class LokaRuntime:
             self.controller.mpc.cost_components,
             printout=self.effort_observer.printout,
             xyz=sim.data.qpos[:3],
+            motor=deficit,
+            slip=slip,
+            gear_error=gear_error,
         )
         self._sync_walk_block()
 
@@ -654,7 +786,7 @@ class LokaRuntime:
         if total is None:
             self.controller.gait.block_walk = False
             return
-        self.controller.gait.block_walk = total > self._bias_threshold_nm()
+        self.controller.gait.block_walk = self.effort_observer.out_of_bounds
 
     def _stand_for_walking_bias(self, now: float, frame: dict) -> bool:
         """Stand before the orchestrator is invoked for a walking effort fault.
@@ -671,6 +803,7 @@ class LokaRuntime:
         if not bool(frame.get("walking")) and not gait.wants_walk():
             return False
         self.controller.set_task_targets({"gait.mode": "stand", "gait.speed": 0.0})
+        gait.mark_strict_stop()
         self._walk_fault_stand = True
         frame["walking"] = False
         frame["cmd_mode"] = float(gait.config.mode)
