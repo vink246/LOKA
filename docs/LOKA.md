@@ -2,9 +2,9 @@
 
 **Working methodology document.** This is the long-form source for the Methodology section of the paper in `paper/`. It is deliberately more detailed than the paper will be. The paper version should keep the structure and equations and drop most of the numeric detail, which is kept here so that every claim in the paper can be traced to the implementation.
 
-**Scope of this revision:** motivation and methodology (architecture, low-level controller, anomaly detector, telemetry compressor, orchestrator, scratchpad, belief search). Experiments, results and discussion are not yet covered.
+**Scope of this revision:** motivation, methodology (architecture, low-level controller, anomaly detector, telemetry compressor, orchestrator, scratchpad, belief search) and experimental setup. Results and discussion are not yet covered.
 
-**Source of truth:** the implementation as of October 2026, in its default configuration (Unitree G1, 29 actuated degrees of freedom, MuJoCo plant, convex-MPC + whole-body-QP stack with DCM footholds). Where earlier project notes or the current paper draft disagree with the implementation, this document follows the implementation; the disagreements are listed in Section 11.
+**Source of truth:** the implementation as of October 2026, in its default configuration (Unitree G1, 29 actuated degrees of freedom, MuJoCo plant, convex-MPC + whole-body-QP stack with DCM footholds). Where earlier project notes or the current paper draft disagree with the implementation, this document follows the implementation; the disagreements are listed in Section 12.
 
 ---
 
@@ -750,7 +750,68 @@ Each 2 ms control tick executes the following steps. Only step 4 is on the criti
 
 ---
 
-## 11. Notes for Drafting the Paper
+## 11. Experimental Setup
+
+The experiments ask whether LOKA makes a model-based humanoid controller robust to changes in the robot and its environment that its model does not know about, and how that robustness compares with a learned locomotion policy, without any training. Section 11.1 describes the experiments run so far; Section 11.2 describes the planned extension to a public benchmark and to vision-language-action baselines.
+
+### 11.1 Current evaluation
+
+**Platform and common protocol.** All experiments use the Unitree G1 with 29 actuated joints [46] simulated in MuJoCo [47], with the controller of Section 4 in its default configuration and the scene of Section 4.2: a flat floor with a sliding friction coefficient of 1.0. Each condition is run for five trials. Trial $k$ uses the same random seed for every baseline, so that baselines are compared from identical initial states. Each episode starts from the standing keyframe; a uniform perturbation of at most 0.005 (in radians and radians per second) is then added to every joint position and joint velocity, leaving the floating-base pose untouched. Episodes run offscreen, without a real-time throttle, and the state is logged at 100 Hz. A *fall* is declared when the pelvis drops below 0.45 m, and ends the episode. Every perturbation is applied to the simulated plant only; the controller's belief model is never told (Section 4.2).
+
+For LOKA, the orchestrator uses a commercial language model through its API with the text-only interface (the camera of Section 7.3 is disabled), the default session limits of Section 7 (six turns per failure episode, three turns of memory), and stand-on-fault enabled. The simulation keeps stepping while an orchestrator call is in flight, and the reply is applied at the control tick at which it arrives, so the robot experiences the call's real latency in simulated time at the speed at which the simulation runs; a call that does not return within 120 s is abandoned.
+
+**Experiment 1: walking to a goal under a perturbation.** The robot starts standing at the origin and is asked, at $t = 0$, to walk to the world point (3, 0) m at 0.15 m/s and to stop within 0.2 m of it. LOKA receives this request as a natural-language operator directive ("Walk to the world coordinate (3, 0) at 0.15 m/s and stop within 0.2 m."), which it must translate into targets itself. Baselines without a language interface receive the same goal, speed and tolerance written directly into their goal-following input. At $t = 5$ s, while the robot is walking, one of the six perturbations in Table 6 is applied. An episode succeeds when the pelvis is within 0.2 m of the goal; it fails on a fall, or on a timeout at 60 s of simulated time.
+
+**Table 6. Perturbations in Experiment 1.** All are applied at $t = 5$ s.
+
+| Condition | Change to the plant | Unknown to the controller as |
+|---|---|---|
+| Nominal | none | – |
+| Torso payload | +10 kg on the torso | body mass |
+| Shoulder payload | +7 kg on the left shoulder | body mass and an off-centre CoM |
+| Weak knee | right-knee actuator strength reduced to 75 % | actuator gear |
+| Low friction | floor friction coefficient reduced from 1.0 to 0.4 | surface friction |
+| Lateral shove | 120 N for 50 ms at the pelvis, to the robot's left (6 N·s) | an external impulse; no model change |
+
+The shove is a control condition: it changes no model parameter, so a correct response from LOKA is to recover and continue without identifying anything.
+
+**Experiment 2: push resistance while standing with an asymmetric payload.** The robot stands. At $t = 2$ s a 10 kg mass is added to its left shoulder. After a further 10 s, which gives LOKA time to detect and correct the model error, a 50 ms lateral push is applied at the pelvis, and the robot is observed for 10 s more. The measured quantity is the largest push force the robot survives. It is found with the same unbounded search as in Section 9: starting from a bracket of 0 to 200 N, the upper bound is doubled (up to 2000 N) until a push topples the robot, and the bracket is then bisected to a resolution of 0.2 N. Every probe is a fresh episode from the same seed, and the search assumes that a force that topples the robot topples it at every larger force. If the payload alone topples the robot before the push, the score is zero.
+
+**Baselines.**
+
+1. *Low-level controller.* The MPC and WBC of Section 4 with the same goal-following law, but without the anomaly detector, the orchestrator or the belief search. It isolates what LOKA adds: any difference between it and LOKA is due to detection, reasoning and belief correction.
+2. *LOKA.* The same controller with the full system of Sections 5 to 9.
+3. *Reinforcement-learning policy.* The open-source velocity-tracking policy for the G1 released with Unitree's reinforcement-learning framework [42], trained by its authors with domain randomisation, run on the same MuJoCo scene and subjected to the same plant perturbations. Because the policy accepts only a body-frame velocity command, the goal is converted into one by a proportional heading-and-speed law with the same arrival tolerance; commands below 0.30 m/s are raised to 0.30 m/s, because the released policy does not walk below about 0.25 m/s. This baseline represents the robustness that learned locomotion obtains from training, against which LOKA's training-free robustness is compared.
+
+**Metrics.** For Experiment 1 we record, per condition and baseline:
+
+- *Successes* and *falls*: the number of the five trials that reached the goal and that fell. The success rate is reported with a Wilson score interval [68], which remains meaningful at five trials and at rates of 0 or 1.
+- *Time to goal*: simulated time from the request to arrival, over successful trials only; a failure is not scored as the timeout.
+- *Wall-clock time to goal*: real time from the start of the episode to arrival, over successful trials only. For LOKA it includes the time spent waiting for the language model.
+- *Path efficiency*: the straight-line distance from the starting pelvis position to the goal, divided by the length of the pelvis path actually walked, over successful trials only.
+- *Auxiliary quantities*: the final distance to the goal, the time of the first fall, the number of orchestrator calls, and the wall-clock duration of the episode.
+
+For Experiment 2 the metric is the largest survived push force. Continuous metrics are reported as the mean, the sample standard deviation and a 95 % Student-$t$ interval over trials.
+
+### 11.2 Planned evaluation
+
+**Benchmark navigation tasks.** The current experiments use one goal on a flat, empty floor. The next step is to evaluate on HumanoidBench [66], a MuJoCo benchmark of whole-body humanoid tasks, so that results are comparable with other methods. The first target is a goal-reaching navigation task in which the direct line to the goal is blocked, such as the benchmark's maze task. It exercises the parts of LOKA that the current experiments do not: the camera image of Section 7.3, waypoint planning in the self-assigned plan, and proximity listeners. As the scope widens, tasks with uneven ground, such as stairs and hurdles, would follow. These require footholds off the floor plane, which the current gait planner does not produce (Section 8.2), so they also depend on an extension of the low-level controller. HumanoidBench is built around the Unitree H1 by default, whereas the controller here is tuned for the G1. The evaluation will therefore either use a G1 version of the benchmark scenes, or port the task geometry and success criteria into the G1 scene.
+
+**Vision-language-action baselines.** To compare LOKA with methods that obtain generality from large-scale training, the planned evaluation adds a humanoid vision-language-action (VLA) model that can be run in the same MuJoCo environment. Candidates include GR00T N1 [23], an open humanoid foundation model with a slow vision-language module and a fast learned action module, and LeVERB [69], which conditions a learned whole-body humanoid controller on vision and language. RT-2 [20] is a natural reference, but its weights are not public, so it can only be discussed rather than run. Most other VLAs, such as OpenVLA [21] and π0 [22], target arm manipulation and do not control humanoid balance. Each VLA will be given the same instruction and observations as LOKA, plus whatever robot-specific fine-tuning it requires, and the amount of data and training this involves will be reported as part of the comparison. The reinforcement-learning policy and the low-level controller of Section 11.1 will be retained.
+
+**Planned metrics.**
+
+- *Success rate*, with Wilson intervals, as defined by the benchmark task.
+- *Time to completion*, in both simulated and wall-clock time.
+- *Number of falls*.
+- *Number of orchestrator invocations*, broken down by trigger (anomaly, listener, directive, heartbeat). This measures how much language-model reasoning a task needs.
+- *Orchestrator cost*: per-call latency, and tokens and API cost per episode.
+- *Training cost*: the robot-specific data and compute each method requires before deployment. This is zero for LOKA and the low-level controller, and is the quantity on which LOKA's claim rests.
+- *Path efficiency* on navigation tasks, measured to the boundary of the goal region (see Section 12).
+
+---
+
+## 12. Notes for Drafting the Paper
 
 These points are for the authors and should not appear in the paper.
 
@@ -758,6 +819,9 @@ These points are for the authors and should not appear in the paper.
 2. **Bibliography corrections.** SayTap is by Tang et al., not Ji et al. Sleiman et al. appeared in IEEE Robotics and Automation Letters, not Transactions on Robotics. Galliker et al.'s Humanoids 2022 title is "Planar bipedal locomotion with nonlinear model predictive control." Several entries in `paper/sections/references.tex` are placeholders ("Anonymous et al.") and need real author lists before submission.
 3. **Hardware path.** All detector inputs exist on hardware (Section 5.7), but no estimator is in the loop yet: the simulation uses ground-truth state. The paper should say so plainly.
 4. **Numbers to re-check before submission.** Thresholds and bands above are the October 2026 defaults. If they change, Sections 4.8, 5.5 and 9.3 need updating.
+5. **Comparability caveats in Experiment 1.** The reinforcement-learning baseline walks at no less than 0.30 m/s while the other two walk at 0.15 m/s, so its time to goal is not comparable with theirs; either rerun the model-based baselines at 0.30 m/s or report time to goal only between the two model-based baselines. Path efficiency divides by the distance to the goal centre, but arrival is declared at 0.2 m from it, so a policy that stops at the edge of the goal region can score above 1 (the reinforcement-learning baseline does). Measuring the straight-line distance to the goal boundary fixes this.
+6. **Simulated latency depends on compute speed.** With the latency mode used so far, an orchestrator call costs as much simulated time as the simulation advances during the call's wall-clock duration, which depends on the machine and its load. For reproducibility, the paper should either report the simulation's real-time factor or rerun with the mode that charges a fixed simulated latency per call.
+7. **Language model name.** The configuration names the orchestrator model; the paper should name the exact model and version, and the decoding settings.
 
 ---
 
@@ -896,3 +960,7 @@ These points are for the authors and should not appear in the paper.
 [66] C. Sferrazza, D.-M. Huang, X. Lin, Y. Lee, and P. Abbeel, "HumanoidBench: Simulated humanoid benchmark for whole-body locomotion and manipulation," in *Proc. Robot.: Sci. Syst. (RSS)*, 2024.
 
 [67] J. L. Bentley and A. C.-C. Yao, "An almost optimal algorithm for unbounded searching," *Inf. Process. Lett.*, vol. 5, no. 3, pp. 82–87, 1976.
+
+[68] E. B. Wilson, "Probable inference, the law of succession, and statistical inference," *J. Amer. Statist. Assoc.*, vol. 22, no. 158, pp. 209–212, 1927.
+
+[69] H. Xue et al., "LeVERB: Humanoid whole-body control with latent vision-language instruction," arXiv:2506.13751, 2025.
