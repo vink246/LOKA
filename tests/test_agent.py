@@ -43,7 +43,7 @@ def test_lean_and_height_are_clamped():
     assert abs(applied["yaw"]) <= 0.8
 
 
-def test_apply_scratchpad_task_and_weights():
+def test_apply_scratchpad_task_targets():
     controller = LocomotionController()
     loka_state = {
         "mutations": [],
@@ -54,10 +54,6 @@ def test_apply_scratchpad_task_and_weights():
             "Hypothesis": "operator crouch",
             "Analysis": "test",
         },
-        "Controller_Targets": {
-            "wbc.kp_base_position": 35.0,
-            "mpc.friction_mu": 0.4,
-        },
         "Task_Targets": {
             "height": 0.62,
             "lean_x": 0.02,
@@ -67,51 +63,27 @@ def test_apply_scratchpad_task_and_weights():
     }
     summary = apply_stand_scratchpad(controller, scratchpad, loka_state)
     assert summary["ok"]
-    assert controller.config.wbc.kp_base_position == pytest.approx(35.0)
-    assert controller.config.mpc.friction_mu == pytest.approx(0.4)
     snap = controller.task_snapshot()
     assert snap["height"] == pytest.approx(0.62)
     assert snap["lean_x"] == pytest.approx(0.02)
     assert snap["lean_y"] == pytest.approx(-0.01)
 
 
-def test_apply_rejects_ambiguous_bare_weight_name():
+def test_apply_never_changes_controller_tunables():
     controller = LocomotionController()
-    loka_state = {"mutations": [], "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy()}
-    scratchpad = {
-        "Semantic_State": {"Hypothesis": "x", "Analysis": "y"},
-        "Controller_Targets": {"weight_force": 1e-4},
-    }
-    summary = apply_stand_scratchpad(controller, scratchpad, loka_state)
-    # Should not crash; bare name must not silently write both layers.
-    assert controller.config.mpc.weight_force == pytest.approx(1e-6)
-    assert controller.config.wbc.weight_force == pytest.approx(5e-3)
-    assert summary["controller_targets"] == {}
-    assert "weight_force" in summary["rejected_controller_targets"]
-
-
-def test_apply_locks_robot_tuned_mpc_weights():
-    controller = LocomotionController()
-    before_z = controller.config.mpc.weight_position[2]
-    before_contact = controller.config.wbc.weight_contact
+    before = controller.tunables()
     loka_state = {"mutations": [], "nominal_gears": controller.robot.model.actuator_gear[:, 0].copy()}
     scratchpad = {
         "Semantic_State": {"Hypothesis": "retune everything", "Analysis": "bad"},
         "Controller_Targets": {
             "mpc.weight_position_z": 6000.0,
-            "wbc.weight_contact": 9000.0,
             "wbc.kp_base_position": 40.0,
-            "stand.max_linear_acc": 12.0,
+            "mpc.friction_mu": 0.1,
         },
     }
     summary = apply_stand_scratchpad(controller, scratchpad, loka_state)
-    assert controller.config.mpc.weight_position[2] == pytest.approx(before_z)
-    assert controller.config.wbc.weight_contact == pytest.approx(before_contact)
-    assert controller.config.wbc.kp_base_position == pytest.approx(40.0)
-    assert "mpc.weight_position_z" in summary["rejected_controller_targets"]
-    assert "wbc.weight_contact" in summary["rejected_controller_targets"]
-    assert "stand.max_linear_acc" in summary["rejected_controller_targets"]
-    assert "wbc.kp_base_position" in summary["controller_targets"]
+    assert summary["ok"]
+    assert controller.tunables() == before
 
 
 def test_compressor_emits_state_effort_and_cost():

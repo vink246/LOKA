@@ -165,6 +165,9 @@ IN_PLACE_SPEED = 0.02  # m/s
 IN_PLACE_RETURN_GAIN = 2.0  # 1/s
 IN_PLACE_RETURN_SPEED = 0.10  # m/s
 
+#: Heading change [rad] at walk start past which the right foot swings first.
+FIRST_STEP_TURN = 0.02
+
 #: Heading error past which forward speed is cut, and the crawl it is cut to.
 HEADING_ERR_FREE = 0.35  # rad
 HEADING_ERR_CRAWL = 0.85  # rad
@@ -1647,8 +1650,15 @@ class GaitScheduler:
     # -- start / stop ------------------------------------------------------
 
     def _begin(self, *, feet_xy: np.ndarray, com_xy: np.ndarray, foot_yaws: np.ndarray) -> None:
-        """Seed the plan from the current stance."""
-        stance = 1  # right supports first, so the left steps out
+        """Seed the plan from the current stance.
+
+        The foot on the inside of a pending turn swings first. Stepping the
+        outside foot first yaws its foothold in toward the planted foot.
+        """
+        yaws = np.asarray(foot_yaws, dtype=float).reshape(2)
+        turn = wrap_angle(self._heading_goal() - circ_mid(yaws[0], yaws[1]))
+        # Right (1) supports first, so the left steps out; mirrored for a right turn.
+        stance = 0 if turn < -FIRST_STEP_TURN else 1
         yaw = float(foot_yaws[stance])
         self._com_ref = com_xy.copy()
         self._com_vel_ref = np.zeros(2)

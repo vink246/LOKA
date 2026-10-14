@@ -187,6 +187,42 @@ def _is_float(token: str) -> bool:
         return False
 
 
+def parse_prop_command(line: str) -> tuple | None:
+    """Parse a prop command into a :class:`loka.scene_props.PropManager` call.
+
+    Returns ``(method, *args)`` or None. The grammar is strict so that free
+    text such as "move forward two metres" still reaches the orchestrator:
+    ``move`` and ``remove`` need a slot name like ``chair_0`` and ``spawn``
+    needs one kind word and numeric coordinates (unknown kinds are reported
+    by the manager).
+    """
+    from loka.scene_props import is_slot_name
+
+    parts = line.strip().lower().replace(",", " ").split()
+    if not parts:
+        return None
+    if parts == ["props"]:
+        return ("list",)
+    if parts == ["clear", "props"]:
+        return ("clear",)
+    if parts == ["scenes"]:
+        return ("scenes",)
+    if len(parts) == 3 and parts[0] == "scene" and parts[1] in ("save", "load"):
+        name = line.strip().split()[2]
+        return ("save_scene" if parts[1] == "save" else "load_scene", name)
+    numbers = parts[2:]
+    if not all(_is_float(token) for token in numbers):
+        return None
+    coords = [float(token) for token in numbers]
+    if parts[0] == "spawn" and len(parts) >= 2 and len(coords) in (2, 3):
+        return ("spawn", parts[1], *coords)
+    if parts[0] == "move" and len(parts) >= 2 and is_slot_name(parts[1]) and len(coords) in (2, 3):
+        return ("move", parts[1], *coords)
+    if parts[0] == "remove" and len(parts) == 2 and is_slot_name(parts[1]):
+        return ("remove", parts[1])
+    return None
+
+
 FAULT_HELP = """\
 Interactive commands (type then Enter):
   mass [kg] [torso|left|right]   add mass (default 5 kg on torso)
@@ -206,6 +242,15 @@ Interactive commands (type then Enter):
   search stop                    cancel the search and restore the belief
   goal x y [speed]               walk to that world point (also with --no-llm)
   go to x,y                      same as goal
+  spawn chair|table|box|cube|shelf x y [yaw]
+                                 place a prop (run_loka; yaw in rad, 0 faces +x)
+  move <prop> x y [yaw]          move a placed prop, e.g. move chair_0 2 1
+  remove <prop>                  park a prop off-scene
+  props                          list placed props and free slots
+  clear props                    park every prop
+  scene save <name>              save placed props to loka/config/scenes/<name>.yaml
+  scene load <name>              clear props, then place a saved scene
+  scenes                         list saved scenes
   <any other text>               locked mission directive (LLM pursues it)
 
 Viewer keys (run_loka and the dashboard MuJoCo window, or the dashboard GUI):

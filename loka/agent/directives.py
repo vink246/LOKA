@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from loka.agent.loka_config import loka_config
+
+HEARTBEAT_S = float(loka_config()["session"]["heartbeat_s"])
+
 LISTENER_KINDS = frozenset(
     {
         "near_xy",
@@ -129,7 +133,7 @@ def parse_listeners(raw, *, armed_at: float) -> list[Listener]:
 def format_listeners(loka_state: dict) -> str:
     listeners = loka_state.get("listeners") or []
     if not listeners:
-        return "None armed. A periodic check still runs every 30 s."
+        return f"None armed. A periodic check still runs every {HEARTBEAT_S:g} s."
     return "\n".join(listener.format_line() for listener in listeners)
 
 

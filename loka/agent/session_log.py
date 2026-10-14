@@ -17,10 +17,17 @@ SESSION_JSONL_NAME = "session.jsonl"
 
 
 def _log_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Drop the system prompt, which also carries the robot model reference."""
+    """Drop the system prompt (robot model reference) and any inline image."""
     if message.get("role") == "system":
         size = len(str(message.get("content") or ""))
         return {"role": "system", "content": f"(omitted, {size} chars)"}
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "") if part.get("type") == "text" else "(image omitted; see frames/)"
+            for part in content
+        ]
+        return {**message, "content": "\n\n".join(parts)}
     return message
 
 
@@ -144,3 +151,8 @@ class StandSessionLog:
 
     def note(self, message: str, *, sim_time: float | None = None) -> None:
         self.event("NOTE", message, sim_time=sim_time)
+
+    def frame(self, *, sim_time: float, path: Path | str, size: int | None = None) -> None:
+        """Record where the camera frame sent with the last dispatch was saved."""
+        extra = f" ({size} bytes)" if size else ""
+        self.event("CAMERA_FRAME", f"{path}{extra}", sim_time=sim_time)

@@ -144,7 +144,7 @@ class Dashboard:
         self._origin = np.array(sim.data.qpos[:2], dtype=float)
         self._last_wall = time.perf_counter()
         self._realtime = 0.0
-        self.recording = RecordingToggle(sim.model, sim.config.model_path)
+        self.recording = RecordingToggle(sim.model, sim.config.model_path, recipe=sim.recipe)
         self.faults = InteractivePlant(sim)
 
     # -- controller plumbing ----------------------------------------------

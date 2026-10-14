@@ -133,9 +133,11 @@ def scenario_friction_fault_no_loka() -> ScenarioResult:
 def scenario_mass_fault_scripted_recovery() -> ScenarioResult:
     """Ablation stand-in for multi-turn LLM recovery: two scripted scratchpads.
 
-    Turn 1 softens CoM gains / friction belief; turn 2 crouches slightly.
+    Turn 1 corrects the torso mass belief; turn 2 crouches slightly.
     Exercises the apply path without an API key.
     """
+    import mujoco
+
     from loka.agent.apply import apply_stand_scratchpad
 
     sim = Simulation(_active_config())
@@ -144,6 +146,9 @@ def scenario_mass_fault_scripted_recovery() -> ScenarioResult:
         LokaConfig(enable_llm=False),
         faults=[FaultSpec("mass", 2.5, {"delta_kg": 6.0, "body": "torso_link"})],
     )
+    belief = runtime.controller.robot.model
+    torso = mujoco.mj_name2id(belief, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+    torso_mass = float(belief.body_mass[torso]) + 6.0
     turn1_at, turn2_at = 3.5, 5.5
     applied = {1: False, 2: False}
     while sim.data.time < 12.0:
@@ -157,11 +162,14 @@ def scenario_mass_fault_scripted_recovery() -> ScenarioResult:
                         "Hypothesis": "added torso mass",
                         "Analysis": "scripted turn 1",
                     },
-                    "Controller_Targets": {
-                        "wbc.kp_base_position": 35.0,
-                        "mpc.friction_mu": 0.45,
-                        "wbc.friction_mu": 0.45,
-                    },
+                    "Model_Mutations": [
+                        {
+                            "object_type": "body",
+                            "name": "torso_link",
+                            "attribute": "mass",
+                            "value": torso_mass,
+                        }
+                    ],
                 },
                 runtime.loka_state,
                 plant_model=sim.model,

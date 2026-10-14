@@ -92,6 +92,36 @@ def walking_scheduler(**overrides):
     return GaitScheduler(GaitConfig(**cfg))
 
 
+@pytest.mark.parametrize(
+    ("heading", "swing_leg"),
+    [(0.0, 0), (0.5, 0), (-0.01, 0), (-0.5, 1), (-1.57, 1)],
+)
+def test_walk_start_swings_the_foot_on_the_inside_of_the_turn(heading, swing_leg):
+    """Legs are 0 = left, 1 = right. A right turn opens with the right foot.
+
+    Opening with the outside foot yawed its foothold in toward the planted
+    foot, and a standing start toward any goal right of the stance fell.
+    """
+    sched = walking_scheduler(speed=0.15, heading=heading)
+    drive(sched, com=np.array([0.0, 0.0, HEIGHT]), com_vel=np.zeros(3))
+    assert sched.walking
+    stance = sched._first_leg
+    assert 1 - stance == swing_leg
+
+
+@pytest.mark.slow
+def test_standing_start_toward_a_goal_on_the_right_stays_up():
+    """The session-log case: from a stand, goal (0, -0.9), a 90 deg right turn."""
+    sim = Simulation()
+    sim.run(1.0)
+    sim.controller.set_task_targets(
+        {"gait.mode": "walk", "gait.speed": 0.15, "gait.goal_x": 0.0, "gait.goal_y": -0.9}
+    )
+    stats = sim.run(9.0)
+    assert not stats.fell
+    assert np.hypot(sim.data.qpos[0], sim.data.qpos[1] + 0.9) < 0.3
+
+
 def test_goal_arrival_waits_until_the_stand_settles():
     sched = walking_scheduler(mode=MODE_WALK, speed=0.15)
     cfg = sched.config

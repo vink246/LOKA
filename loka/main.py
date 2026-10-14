@@ -95,7 +95,7 @@ def run_viewer(sim: Simulation, duration: float | None) -> int:
 
     steps_per_frame = max(1, round(1.0 / (RENDER_HZ * sim.config.control_dt)))
     frame_dt = steps_per_frame * sim.config.control_dt
-    recording = RecordingToggle(sim.model, sim.config.model_path)
+    recording = RecordingToggle(sim.model, sim.config.model_path, recipe=sim.recipe)
     print("[LOKA] Press R in the MuJoCo viewer to start/stop recording.")
 
     def key_callback(keycode: int) -> None:

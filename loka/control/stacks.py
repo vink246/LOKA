@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from loka.agent.policy import LLM_STAND_CONTROLLER_ALLOWLIST
 from loka.control.footholds import AlipStepFootholdPolicy
 from loka.control.locomotion import LocomotionConfig, LocomotionController
 from loka.control.tuning import paths_for_stack
@@ -24,7 +23,6 @@ class StackSpec:
     description: str
     factory: Callable[[LocomotionConfig], LocomotionController]
     tunable_paths: frozenset[str]
-    llm_allowlist: frozenset[str]
     #: Knob names whose prompt text differs from the DCM catalogue.
     gait_knob_overrides: tuple[str, ...] = ()
 
@@ -51,7 +49,6 @@ SPECS: dict[str, StackSpec] = {
         ),
         factory=_legacy,
         tunable_paths=frozenset(paths_for_stack("legacy_dcm")),
-        llm_allowlist=LLM_STAND_CONTROLLER_ALLOWLIST,
         gait_knob_overrides=(),
     ),
     "alip_footstep": StackSpec(
@@ -65,7 +62,6 @@ SPECS: dict[str, StackSpec] = {
         ),
         factory=_footstep,
         tunable_paths=frozenset(paths_for_stack("alip_footstep")),
-        llm_allowlist=LLM_STAND_CONTROLLER_ALLOWLIST,
         gait_knob_overrides=("gait.capture_gain", "gait.foothold_retarget_s", "gait.turn_rate"),
     ),
 }

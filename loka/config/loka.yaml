@@ -53,3 +53,44 @@ session:
   telemetry_window_s: 2.0
   max_turns: 6
   max_memory: 3
+
+# Egocentric head camera (run_loka --vision). Every orchestrator user turn
+# carries one width x height RGB PNG from ego_cam on the G1 head, rendered at
+# the instant of dispatch. fovy_deg is the vertical field of view (square
+# pixels, so a square image has the same horizontal FOV). pitch_down_deg tilts
+# the optical axis below the head's forward axis. detail is the OpenAI image
+# detail level. save_frames writes each sent frame to logs/loka/frames/.
+# stream_hz caps the live window opened by run_loka --ego-view (frames are
+# dropped, never queued, when rendering falls behind).
+vision:
+  enabled: false
+  width: 512
+  height: 512
+  fovy_deg: 70.0
+  pitch_down_deg: 30.0
+  detail: high
+  save_frames: true
+  stream_hz: 15.0
+
+# run_loka --record: a fixed overview camera at +x/-y, looking along +y
+# (azimuth 90) and down elevation_deg, so the side-top view covers roughly
+# x in [-1, 6] and y in [-2, 8]; the start sits near the left edge. The mp4
+# is rendered after the run from the sampled state, in a separate offscreen
+# process.
+recording:
+  directory: recordings
+  pos: [2.5, -4.5, 3.0]
+  azimuth_deg: 90.0
+  elevation_deg: -35.0
+  fovy_deg: 45.0
+  fps: 30.0
+  width: 1920
+  height: 1080
+
+# Prop pool for run_loka (models/props/, from HumanoidBench). slots is how many
+# of each kind can be placed at once; they are parked off-scene until spawned
+# with --props or the spawn command. Kinds in static have no free joint and
+# do not move when pushed. run_loka --no-props builds the plain scene.
+props:
+  slots: {chair: 3, table: 2, box: 4, cube: 4, shelf: 1}
+  static: [shelf]

@@ -1,0 +1,34 @@
+<mujoco model="table">
+  <!-- Transcribed from HumanoidBench tasks/room.xml (MIT, see LICENSE.humanoidbench).
+       The body origin is on the floor. LOKA adds the free joint. HumanoidBench's
+       default densities make the table about 140 kg; explicit masses here (16 kg)
+       keep it pushable. The collision legs stop at the floor instead of 5 cm below
+       it, so a free table does not start in penetration. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <texture name="dark_wood" type="2d" file="textures/dark-wood.png"/>
+    <material name="dark_wooden_cover" texture="dark_wood" texuniform="false"/>
+  </asset>
+  <worldbody>
+    <body name="table">
+      <geom type="box" pos="0 0 0.9" size="0.5 0.5 0.05" material="dark_wooden_cover" class="visual"/>
+      <geom type="box" pos="0.4 0.4 0.425" size="0.05 0.05 0.425" material="dark_wooden_cover" class="visual"/>
+      <geom type="box" pos="0.4 -0.4 0.425" size="0.05 0.05 0.425" material="dark_wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.4 0.4 0.425" size="0.05 0.05 0.425" material="dark_wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.4 -0.4 0.425" size="0.05 0.05 0.425" material="dark_wooden_cover" class="visual"/>
+
+      <geom name="top" type="box" pos="0 0 0.9" size="0.5 0.5 0.05" mass="12" class="collision"/>
+      <geom name="leg_1" type="box" pos="0.4 0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+      <geom name="leg_2" type="box" pos="0.4 -0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+      <geom name="leg_3" type="box" pos="-0.4 0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+      <geom name="leg_4" type="box" pos="-0.4 -0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>
