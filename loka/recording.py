@@ -8,9 +8,12 @@ headless node uses OSMesa; a machine with a display uses EGL.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import os
+import pickle
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -95,7 +98,12 @@ def _render_clip_worker(job: dict) -> None:
     import mediapy as media
     import mujoco
 
-    model = mujoco.MjModel.from_xml_path(job["model_path"])
+    if job.get("recipe"):
+        from loka.scene_props import build_plant_model
+
+        model, _ = build_plant_model(job["recipe"])
+    else:
+        model = mujoco.MjModel.from_xml_path(job["model_path"])
     from loka.viz import hide_foot_contact_markers
 
     hide_foot_contact_markers(model)
@@ -142,8 +150,13 @@ def render_qpos_clip(
     fps: float = DEFAULT_RECORD_FPS,
     width: int = DEFAULT_RECORD_WIDTH,
     height: int = DEFAULT_RECORD_HEIGHT,
+    recipe: dict | None = None,
 ) -> None:
-    """Render ``qpos_frames`` to ``out_path`` in a spawned EGL process."""
+    """Render ``qpos_frames`` to ``out_path`` in a spawned EGL process.
+
+    ``recipe`` (``Simulation.recipe``) rebuilds a plant with props or the head
+    camera, whose ``nq`` differs from the plain MJCF at ``model_path``.
+    """
     if qpos_frames.size == 0:
         raise ValueError("No frames to render")
 
@@ -162,6 +175,7 @@ def render_qpos_clip(
         "fps": float(fps),
         "width": int(width),
         "height": int(height),
+        "recipe": recipe,
     }
     ctx = mp.get_context("spawn")
     proc = ctx.Process(target=_render_clip_worker, args=(job,))
@@ -186,6 +200,7 @@ class VideoRecorder:
         height: int = DEFAULT_RECORD_HEIGHT,
         start_time: float = 0.0,
         model_path: str | Path | None = None,
+        recipe: dict | None = None,
     ):
         if fps <= 0:
             raise ValueError(f"Recording fps must be positive, got {fps}")
@@ -197,6 +212,7 @@ class VideoRecorder:
 
         self.path = str(path)
         self.model_path = str(model_path)
+        self.recipe = recipe
         self.camera = camera
         self.fps = float(fps)
         self.width = int(width)
@@ -238,12 +254,162 @@ class VideoRecorder:
             fps=self.fps,
             width=self.width,
             height=self.height,
+            recipe=self.recipe,
         )
         self._qpos_frames.clear()
         print(
             f"[LOKA] Saved recording ({self.frame_count} frames @ {self.fps:.1f} fps) "
             f"to {self.path}"
         )
+
+
+@dataclass(frozen=True)
+class OverviewCamera:
+    """Fixed world camera for ``run_loka --record``.
+
+    The camera sits at ``pos`` and looks along ``azimuth_deg`` (CCW from +x;
+    90 is +y), tilted ``elevation_deg`` (negative is down). It never moves, so
+    the clip shows the whole scene rather than following the robot.
+    """
+
+    pos: tuple[float, float, float] = (2.5, -4.5, 3.0)
+    azimuth_deg: float = 90.0
+    elevation_deg: float = -35.0
+    fovy_deg: float = 45.0
+    fps: float = DEFAULT_RECORD_FPS
+    width: int = 1920
+    height: int = 1080
+
+    @classmethod
+    def from_config(cls, cfg: dict | None) -> "OverviewCamera":
+        cfg = dict(cfg or {})
+        fields = {key: cfg[key] for key in cls.__dataclass_fields__ if key in cfg}
+        if "pos" in fields:
+            fields["pos"] = tuple(float(v) for v in fields["pos"])
+        return cls(**fields)
+
+    def free_camera(self) -> dict:
+        """``mjvCamera`` free-camera fields: look at the floor point on the axis."""
+        az = math.radians(self.azimuth_deg)
+        el = math.radians(self.elevation_deg)
+        forward = np.array([math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
+        pos = np.asarray(self.pos, dtype=float)
+        distance = pos[2] / -forward[2] if forward[2] < -1e-3 else 5.0
+        return {
+            "lookat": (pos + distance * forward).tolist(),
+            "distance": float(distance),
+            "azimuth": float(self.azimuth_deg),
+            "elevation": float(self.elevation_deg),
+            "fovy": float(self.fovy_deg),
+        }
+
+
+def _render_session_worker(job: dict) -> None:
+    """Child-process entry: replay plant snapshots from the overview camera."""
+    prepare_offscreen_env()
+    import mediapy as media
+    import mujoco
+
+    from loka.scene_props import apply_snapshot, build_plant_model
+    from loka.viz import hide_foot_contact_markers
+
+    with open(job["frames_path"], "rb") as handle:
+        snapshots = pickle.load(handle)
+    model, _ = build_plant_model(job["recipe"])
+    hide_foot_contact_markers(model)
+    width, height = int(job["width"]), int(job["height"])
+    model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), width)
+    model.vis.global_.offheight = max(int(model.vis.global_.offheight), height)
+    view = job["view"]
+    model.vis.global_.fovy = float(view["fovy"])
+    data = mujoco.MjData(model)
+    cam = mujoco.MjvCamera()
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.lookat[:] = view["lookat"]
+    cam.distance = view["distance"]
+    cam.azimuth = view["azimuth"]
+    cam.elevation = view["elevation"]
+    renderer = mujoco.Renderer(model, height=height, width=width)
+    try:
+        with media.VideoWriter(job["out_path"], shape=(height, width), fps=float(job["fps"])) as writer:
+            for snapshot in snapshots:
+                apply_snapshot(model, data, snapshot)
+                renderer.update_scene(data, camera=cam)
+                writer.add_image(np.asarray(renderer.render()))
+    finally:
+        renderer.close()
+
+
+class SessionRecorder:
+    """Whole-session clip from :class:`OverviewCamera` for ``run_loka --record``.
+
+    :meth:`maybe_capture` copies the plant state (robot, props, static prop
+    poses) at ``camera.fps`` of sim time on the sim thread. :meth:`close`
+    renders the mp4 in a spawned offscreen process after the run.
+    """
+
+    def __init__(self, sim, path: str | Path, camera: OverviewCamera) -> None:
+        if camera.fps <= 0:
+            raise ValueError(f"Recording fps must be positive, got {camera.fps}")
+        self.sim = sim
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.camera = camera
+        self.frame_interval = 1.0 / float(camera.fps)
+        self.next_frame_time = float(sim.data.time)
+        self._snapshots: list[dict] = []
+        self._closed = False
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._snapshots)
+
+    def maybe_capture(self) -> None:
+        time_s = float(self.sim.data.time)
+        if self._closed or time_s + 1e-9 < self.next_frame_time:
+            return
+        self._snapshots.append(self.sim.snapshot())
+        while self.next_frame_time <= time_s + 1e-9:
+            self.next_frame_time += self.frame_interval
+
+    def close(self) -> Path | None:
+        if self._closed:
+            return None
+        self._closed = True
+        if not self._snapshots:
+            print(f"[record] nothing captured; {self.path} not written")
+            return None
+        cam = self.camera
+        print(
+            f"[record] encoding {self.frame_count} frames @ {cam.fps:g} fps "
+            f"({self.frame_count / cam.fps:.1f} s) -> {self.path} ..."
+        )
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+            pickle.dump(self._snapshots, tmp, protocol=pickle.HIGHEST_PROTOCOL)
+            frames_path = tmp.name
+        self._snapshots.clear()
+        job = {
+            "recipe": self.sim.recipe,
+            "frames_path": frames_path,
+            "out_path": str(self.path),
+            "fps": float(cam.fps),
+            "width": int(cam.width),
+            "height": int(cam.height),
+            "view": cam.free_camera(),
+        }
+        ctx = mp.get_context("spawn")
+        proc = ctx.Process(target=_render_session_worker, args=(job,))
+        backend = start_offscreen(proc)
+        proc.join()
+        try:
+            os.remove(frames_path)
+        except OSError:
+            pass
+        if proc.exitcode != 0:
+            print(f"[record] render failed (exit {proc.exitcode}, gl={backend})")
+            return None
+        print(f"[record] saved {self.path}")
+        return self.path
 
 
 class RecordingToggle:
@@ -262,9 +428,11 @@ class RecordingToggle:
         width: int = DEFAULT_RECORD_WIDTH,
         height: int = DEFAULT_RECORD_HEIGHT,
         directory: Path | str = DEFAULT_RECORDINGS_DIR,
+        recipe: dict | None = None,
     ):
         self.model = model
         self.model_path = str(model_path)
+        self.recipe = recipe
         self.camera = camera
         self.fps = fps
         self.width = width
@@ -299,6 +467,7 @@ class RecordingToggle:
             height=self.height,
             start_time=sim_time,
             model_path=self.model_path,
+            recipe=self.recipe,
         )
 
     def maybe_capture(self, data) -> None:

@@ -223,7 +223,7 @@ Bare names like `weight_force` are ambiguous across layers and are rejected.
 | `enable_llm` | `True` | If false: plant + faults only; no API dispatch |
 | `cooldown_s` | `4.0` | Min seconds between LLM dispatches |
 | `anomaly_collection_s` | from compressor (~1 s) | Collection window for **mission** breaches |
-| `heartbeat_s` | `30.0` | Reserved |
+| `heartbeat_s` | `15.0` | Periodic check-in when no other call has happened in that interval |
 | `objective` | default stand objective string | Primary mission text in the prompt |
 | `print_compressor` | `True` | Print full user turn to stdout |
 | `enable_session_log` | `False` | Write `session.log` / `.jsonl` |

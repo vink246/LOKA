@@ -67,13 +67,23 @@ class RunStats:
 
 
 class Simulation:
-    """One controller driving one MuJoCo model."""
+    """One controller driving one MuJoCo model.
+
+    ``props`` (slot count per kind) and ``camera`` (an ``EgoCameraSpec``
+    recipe) build the plant with :mod:`loka.scene_props`. Free-joint props sit
+    after the robot in ``qpos``, so anything that hands state to the robot
+    reads :attr:`robot_qpos` / :attr:`robot_qvel`, never the full vectors.
+    """
 
     def __init__(
         self,
         config: LocomotionConfig | None = None,
         model_path: str | Path | None = None,
         pushes: list[Push] | None = None,
+        *,
+        props: dict[str, int] | None = None,
+        static_props=None,
+        camera: dict | None = None,
     ) -> None:
         self.config = config or LocomotionConfig()
         if model_path is not None:
@@ -81,12 +91,7 @@ class Simulation:
         from loka.control.stacks import make as make_stack
 
         self.controller = make_stack(self.config)
-
-        self.model = mujoco.MjModel.from_xml_path(self.config.model_path)
-        self.data = mujoco.MjData(self.model)
-        self.pelvis_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
-        )
+        self._load_plant(props, static_props, camera)
         self.steps_per_control = max(
             1, int(round(self.config.control_dt / self.model.opt.timestep))
         )
@@ -94,8 +99,56 @@ class Simulation:
         self.history: list[dict] = []
         self.reset()
 
+    def _load_plant(self, props, static_props, camera) -> None:
+        from loka.scene_props import (
+            DEFAULT_STATIC_KINDS,
+            PropManager,
+            build_plant_model,
+            plant_recipe,
+        )
+
+        self.recipe = plant_recipe(
+            self.config.model_path,
+            props,
+            DEFAULT_STATIC_KINDS if static_props is None else static_props,
+            camera,
+        )
+        self.model, self.prop_layout = build_plant_model(self.recipe)
+        self.data = mujoco.MjData(self.model)
+        self.pelvis_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+        )
+        self.robot_nq = self.prop_layout.robot_nq
+        self.robot_nv = self.prop_layout.robot_nv
+        self.props = PropManager(self) if self.prop_layout.slots else None
+
+    @property
+    def robot_qpos(self) -> np.ndarray:
+        return self.data.qpos[: self.robot_nq]
+
+    @property
+    def robot_qvel(self) -> np.ndarray:
+        return self.data.qvel[: self.robot_nv]
+
+    @property
+    def has_camera(self) -> bool:
+        return bool(self.recipe.get("camera"))
+
+    def snapshot(self) -> dict:
+        """Copy of the plant state for the ego renderer (cheap; no rendering)."""
+        from loka.scene_props import plant_snapshot
+
+        return plant_snapshot(self.model, self.data, self.prop_layout)
+
+    def apply_prop_requests(self) -> None:
+        if self.props is not None:
+            for message in self.props.apply_pending():
+                print(message)
+
     def reset(self) -> None:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        if getattr(self, "props", None) is not None:
+            self.props.reset()
         mujoco.mj_forward(self.model, self.data)
         self.controller.reset()
         self.history.clear()
@@ -113,7 +166,8 @@ class Simulation:
 
     def step(self) -> None:
         """Advance one control period, holding the torque across substeps."""
-        self.torque = self.controller.compute_torque(self.data.qpos, self.data.qvel)
+        self.apply_prop_requests()
+        self.torque = self.controller.compute_torque(self.robot_qpos, self.robot_qvel)
         force = self._applied_force()
         for _ in range(self.steps_per_control):
             self.data.ctrl[:] = self.torque
@@ -185,17 +239,17 @@ class UnitreeRLSimulation(Simulation):
         pushes: list[Push] | None = None,
         policy_dir: str | Path | None = None,
         min_speed: float | None = None,
+        *,
+        props: dict[str, int] | None = None,
+        static_props=None,
+        camera: dict | None = None,
     ) -> None:
         from loka.control.unitree_rl import MIN_WALK_SPEED, UnitreeRLController
 
         self.config = config or LocomotionConfig()
         if model_path is not None:
             self.config.model_path = str(model_path)
-        self.model = mujoco.MjModel.from_xml_path(self.config.model_path)
-        self.data = mujoco.MjData(self.model)
-        self.pelvis_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
-        )
+        self._load_plant(props, static_props, camera)
         self.controller = UnitreeRLController(
             self.model,
             policy_dir,
@@ -213,6 +267,8 @@ class UnitreeRLSimulation(Simulation):
 
     def reset(self) -> None:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
+        if getattr(self, "props", None) is not None:
+            self.props.reset()
         self.controller.reset()
         self.controller.place_default_pose(self.data)
         self.history.clear()
@@ -220,12 +276,13 @@ class UnitreeRLSimulation(Simulation):
         self._ticks = 0
 
     def step(self) -> None:
+        self.apply_prop_requests()
         if self._ticks % self.policy_decimation == 0:
-            self.controller.policy_step(self.data.qpos, self.data.qvel)
+            self.controller.policy_step(self.robot_qpos, self.robot_qvel)
         self._ticks += 1
         force = self._applied_force()
         for _ in range(self.steps_per_control):
-            self.torque = self.controller.compute_torque(self.data.qpos, self.data.qvel)
+            self.torque = self.controller.compute_torque(self.robot_qpos, self.robot_qvel)
             self.data.ctrl[:] = self.torque
             self.data.xfrc_applied[self.pelvis_id, :3] = force
             mujoco.mj_step(self.model, self.data)

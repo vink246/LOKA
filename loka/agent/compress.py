@@ -210,6 +210,36 @@ def format_cost_section(observer) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_prop_contact_section(frames: Sequence[dict]) -> str:
+    """Robot-to-prop contact over the window. Empty when nothing was touched."""
+    peak: dict[str, dict] = {}
+    touching_steps: dict[str, int] = {}
+    for frame in frames:
+        for entry in frame.get("prop_contacts") or ():
+            name = entry["prop"]
+            touching_steps[name] = touching_steps.get(name, 0) + 1
+            best = peak.get(name)
+            if best is None or entry["force_n"] > best["force_n"]:
+                peak[name] = entry
+    if not peak:
+        return ""
+    latest = {e["prop"] for e in (frames[-1].get("prop_contacts") or ())}
+    lines = [
+        "PROP CONTACT",
+        "  The robot touched a prop in this window. Contact force enters the effort "
+        "residual as an external load. It is not a model error; do not queue a belief "
+        "search for it.",
+    ]
+    for name, entry in sorted(peak.items(), key=lambda kv: -kv[1]["force_n"]):
+        share = touching_steps[name] / max(len(frames), 1)
+        now = "touching now" if name in latest else "released"
+        lines.append(
+            f"  {name} ({entry['kind']}): peak normal {entry['force_n']:.1f} N, "
+            f"{share:.0%} of the window, {now}; links {', '.join(entry['links'])}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def synthesize_stand_telemetry(
     frames: Sequence[dict],
     *,
@@ -220,10 +250,10 @@ def synthesize_stand_telemetry(
     window = _window_frames(frames, control_dt)
     if not window:
         return "No telemetry available.\n"
-    return "\n".join(
-        [
-            format_full_state_section(window),
-            format_effort_section(observer),
-            format_cost_section(observer),
-        ]
-    )
+    sections = [
+        format_full_state_section(window),
+        format_effort_section(observer),
+        format_prop_contact_section(window),
+        format_cost_section(observer),
+    ]
+    return "\n".join(section for section in sections if section)

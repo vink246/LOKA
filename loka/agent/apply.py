@@ -9,8 +9,8 @@ import mujoco
 from loka.control.locomotion import LocomotionController
 from loka.agent.directives import LISTENER_KINDS, parse_listeners
 from loka.agent.model_state import resolve_mjcf_name
+from loka.agent.plan import apply_plan
 from loka.agent.context import format_stand_configuration
-from loka.agent.policy import filter_controller_targets
 
 
 _SCRATCHPAD_KEYS = {
@@ -19,11 +19,12 @@ _SCRATCHPAD_KEYS = {
     "belief_search": "Belief_Search",
     "task_targets": "Task_Targets",
     "listeners": "Listeners",
-    "controller_targets": "Controller_Targets",
     "planner_targets": "Planner_Targets",
     "model_mutations": "Model_Mutations",
     "mission_directives": "Mission_Directives",
     "primary_objective": "Primary_Objective",
+    "plan": "Plan",
+    "self_assigned_plan": "Plan",
 }
 _STATE_KEYS = {
     "hypothesis": "Hypothesis",
@@ -64,14 +65,9 @@ def apply_stand_scratchpad(
     ``controller.robot.model`` (the controller's private prior). Optional
     ``plant_model`` is only used to resolve names if the belief model lacks
     them — mutations still write the controller model.
-
-    ``Controller_Targets`` are hard-filtered by
-    :data:`loka.agent.policy.LLM_STAND_CONTROLLER_ALLOWLIST`.
     """
     summary: dict[str, Any] = {
         "ok": False,
-        "controller_targets": {},
-        "rejected_controller_targets": [],
         "task_targets": {},
         "mutations": 0,
         "listeners": 0,
@@ -91,43 +87,6 @@ def apply_stand_scratchpad(
 
     if episode is not None:
         episode.record_intervention(sim_time, scratchpad)
-
-    # -- Controller_Targets → allowlisted update_weights --------------------
-    raw_weights = scratchpad.get("Controller_Targets") or {}
-    weight_updates: dict[str, float] = {}
-    for name, value in raw_weights.items():
-        try:
-            weight_updates[str(name)] = float(value)
-        except (TypeError, ValueError):
-            print(f"     * [WARN] Non-numeric Controller_Targets '{name}' (ignored)")
-    if weight_updates:
-        stack = getattr(getattr(controller, "config", None), "stack", None)
-        allowed, rejected = filter_controller_targets(weight_updates, stack=stack)
-        summary["rejected_controller_targets"] = rejected
-        if rejected:
-            print("  -> Controller_Targets locked (ignored):")
-            for path in rejected:
-                print(f"     * {path}")
-        if allowed:
-            try:
-                applied = controller.update_weights(**allowed)
-                summary["controller_targets"] = applied
-                print("  -> Controller_Targets applied:")
-                for path, value in applied.items():
-                    print(f"     * {path} = {value:.4g}")
-            except KeyError as exc:
-                print(f"  -> Controller_Targets rejected: {exc}")
-                known = {
-                    k: v for k, v in allowed.items() if k in controller.tunables()
-                }
-                if known:
-                    applied = controller.update_weights(**known)
-                    summary["controller_targets"] = applied
-                    print("  -> Partial Controller_Targets applied:")
-                    for path, value in applied.items():
-                        print(f"     * {path} = {value:.4g}")
-        elif rejected:
-            print("  -> No allowlisted Controller_Targets to apply.")
 
     # Planner_Targets are MJPC-only; ignore with a note.
     if scratchpad.get("Planner_Targets"):
@@ -217,6 +176,11 @@ def apply_stand_scratchpad(
             print("  -> Listeners cleared.")
         if skipped:
             print(f"     * [WARN] {skipped} listener(s) dropped")
+
+    # -- Plan (LOKA's own; omit the key to keep it) ---------------------------
+    if "Plan" in scratchpad:
+        summary["plan"] = apply_plan(loka_state, scratchpad.get("Plan"), float(sim_time or 0.0))
+        print(f"  -> Self-assigned {summary['plan']}")
 
     if scratchpad.get("Mission_Directives") or scratchpad.get("Primary_Objective"):
         print(

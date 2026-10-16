@@ -1,0 +1,34 @@
+<mujoco model="chair">
+  <!-- Transcribed from HumanoidBench tasks/room.xml and sit_simple.xml (MIT, see
+       LICENSE.humanoidbench). The body origin is on the floor and the chair faces
+       +x (backrest at -x). LOKA adds the free joint. HumanoidBench's collision
+       densities make the chair about 200 kg; explicit masses here (6 kg) keep it
+       pushable. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <texture name="light_wood" type="2d" file="textures/light-wood.png"/>
+    <material name="wooden_cover" texture="light_wood" texuniform="false"/>
+  </asset>
+  <worldbody>
+    <body name="chair">
+      <geom type="box" pos="0.19 0.19 0.225" size="0.02 0.02 0.225" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="0.19 -0.19 0.225" size="0.02 0.02 0.225" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.19 0.19 0.225" size="0.02 0.02 0.225" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.19 -0.19 0.225" size="0.02 0.02 0.225" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="0 0 0.45" size="0.21 0.21 0.025" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.23 0.19 0.6375" size="0.02 0.02 0.2125" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.23 -0.19 0.6375" size="0.02 0.02 0.2125" material="wooden_cover" class="visual"/>
+      <geom type="box" pos="-0.23 0 0.77" size="0.02 0.21 0.08" material="wooden_cover" class="visual"/>
+
+      <geom name="back" type="box" pos="-0.23 0 0.65" size="0.02 0.21 0.2" mass="1.5" class="collision"/>
+      <geom name="seat" type="box" pos="0 0 0.2375" size="0.21 0.21 0.2375" mass="4.5" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

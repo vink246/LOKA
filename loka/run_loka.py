@@ -7,8 +7,23 @@
     python -m loka.run_loka --no-llm --goal 3,3
     python -m loka.run_loka --fault mass --headless -T 12
     python -m loka.run_loka --unitree-rl --goal 3,3 --goal-heading 1.57
+    python -m loka.run_loka --vision --props "chair:1.5,0.2,3.14;box:1,-0.4"
+    python -m loka.run_loka --no-llm --ego-view --props "table:2,0"
+    python -m loka.run_loka --record --goal 3,1        # recordings/run_loka_<stamp>.mp4
+    python -m loka.run_loka --scene obstacle_course --vision --ego-view --record
 
 ``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``).
+``--vision`` attaches a 512x512 head-camera frame to every orchestrator turn
+(settings in ``loka/config/loka.yaml`` under ``vision``). The scene carries a
+pool of HumanoidBench props (chair, table, box, cube, shelf) parked off-scene;
+``--props`` places some at startup and the ``spawn`` / ``move`` / ``remove``
+commands place them while running. ``--scene NAME`` places a saved layout
+from ``loka/config/scenes/`` (``scene save NAME`` on stdin writes one).
+``--no-props`` builds the plain scene.
+``--ego-view`` opens a second window streaming that head camera live (rate
+from ``vision.stream_hz``); it needs no LLM.
+``--record [PATH]`` saves the whole session as an mp4 from a fixed overview
+camera (``recording`` in ``loka.yaml``), headless or with the viewer.
 ``--unitree-rl`` swaps the MPC plant for the unitree_rl_lab velocity policy on
 the same scene. It has no orchestrator, so it implies ``--no-llm``; goals,
 ``--mode walk``, faults and the fault keys work as they do for the plant.
@@ -30,6 +45,7 @@ Session logs rewrite ``logs/loka/session.log`` (+ ``.jsonl``) each run.
 
 Interactive viewer commands (stdin) and keys:
   mass / friction|ice / push / dead / scale|weak / clear / help
+  spawn <kind> x y [yaw] | move <prop> x y [yaw] | remove <prop> | props | clear props
   search mass [body] | search com <x|y|z> [body] | search friction | search gear <actuator> | search stop
   Keys: 2 right knee at 75% torque, 3 push, 4 ice,
         5 left-shoulder +5 kg, 6 torso +5 kg,
@@ -43,6 +59,7 @@ import argparse
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import mujoco
@@ -60,10 +77,15 @@ from loka.agent.interactive import (
     fault_for_keycode,
     parse_fault_command,
     parse_goal_command,
+    parse_prop_command,
     restore_faults,
 )
+from loka.agent.loka_config import loka_config
 from loka.agent.runtime import LokaConfig, LokaRuntime
 from loka.agent.session_log import default_log_path
+from loka.recording import OverviewCamera, SessionRecorder
+from loka.scene_props import load_scene, parse_props_spec
+from loka.vision import EGO_CAMERA, EgoCameraSpec, EgoViewStream
 from loka.viz import begin_frame, render_fault_overlays, render_gait_overlays
 
 
@@ -198,8 +220,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="World yaw [rad] to face while walking to --goal and at it. --unitree-rl only",
     )
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="Attach a head-camera image to every orchestrator turn (needs the LLM). "
+        "Also on when vision.enabled is true in loka.yaml",
+    )
+    parser.add_argument(
+        "--ego-view",
+        action="store_true",
+        help="Open a live window streaming the head camera (ego_cam) next to the "
+        "viewer. Works with --no-llm and --unitree-rl; not with --headless",
+    )
+    parser.add_argument(
+        "--record",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Record the session to an mp4 from a fixed overview camera (+x/-y, "
+        "looking along +y). Default path recordings/run_loka_<timestamp>.mp4; "
+        "camera in loka.yaml under recording. Encoded when the run ends",
+    )
+    parser.add_argument(
+        "--props",
+        type=str,
+        default=None,
+        help='Props placed at startup, "kind:x,y[,yaw];..." e.g. "chair:2,0.5,1.57;box:1.5,-0.3"',
+    )
+    parser.add_argument(
+        "--scene",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Place a saved prop layout at startup: a name in loka/config/scenes/ "
+        "(e.g. obstacle_course) or a path to a scene .yaml. Combines with --props",
+    )
+    parser.add_argument(
+        "--no-props",
+        action="store_true",
+        help="Build the plain scene without the prop pool",
+    )
     add_stack_argument(parser)
     args = parser.parse_args(argv)
+    if args.vision and (args.no_llm or args.unitree_rl):
+        parser.error("--vision feeds the orchestrator; drop --no-llm / --unitree-rl")
+    if args.ego_view and args.headless:
+        parser.error("--ego-view opens a window; drop --headless")
+    args.prop_spawns = []
+    if args.no_props and (args.props is not None or args.scene is not None):
+        parser.error("--no-props removes the prop pool; drop --props / --scene")
+    if args.scene is not None:
+        try:
+            args.prop_spawns += load_scene(args.scene)
+        except ValueError as exc:
+            parser.error(f"--scene: {exc}")
+    if args.props is not None:
+        try:
+            args.prop_spawns += parse_props_spec(args.props)
+        except ValueError as exc:
+            parser.error(f"--props: {exc}")
     if args.unitree_rl:
         if args.operator or args.task:
             parser.error("--unitree-rl has no orchestrator; drop --operator / --task")
@@ -299,6 +379,15 @@ class _PlantRuntime:
 def _handle_interactive_line(
     runtime: LokaRuntime, line: str, *, llm_enabled: bool
 ) -> None:
+    prop_cmd = parse_prop_command(line)
+    if prop_cmd is not None:
+        props = runtime.sim.props
+        if props is None:
+            print("[!] no prop pool in this scene (started with --no-props)")
+        else:
+            # Applied by the simulation thread before its next control step.
+            props.submit(*prop_cmd)
+        return
     if line.strip().lower().startswith("search"):
         if runtime.belief_search is None:
             print("[!] belief search needs the MPC plant")
@@ -401,11 +490,24 @@ def main(argv: list[str] | None = None) -> int:
     llm_enabled = not args.no_llm
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
     apply_stack_arg(config, args)
+    settings = loka_config()
+    vision_cfg = settings.get("vision") or {}
+    vision = llm_enabled and (args.vision or bool(vision_cfg.get("enabled", False)))
+    camera = EgoCameraSpec.from_config(vision_cfg)
+    args.ego_hz = float(vision_cfg.get("stream_hz", 15.0))
+    prop_cfg = settings.get("props") or {}
+    plant = {
+        "props": None if args.no_props else dict(prop_cfg.get("slots") or {}),
+        "static_props": tuple(prop_cfg.get("static") or ()),
+        "camera": camera.recipe() if vision or args.ego_view else None,
+    }
     if args.unitree_rl:
-        sim = UnitreeRLSimulation(config, model_path=args.model, policy_dir=args.policy_dir)
+        sim = UnitreeRLSimulation(
+            config, model_path=args.model, policy_dir=args.policy_dir, **plant
+        )
         runtime = _PlantRuntime(sim, build_faults(args))
     else:
-        sim = Simulation(config, model_path=args.model)
+        sim = Simulation(config, model_path=args.model, **plant)
         log_path = None
         if not args.no_log:
             log_path = default_log_path(args.log_dir)
@@ -413,6 +515,8 @@ def main(argv: list[str] | None = None) -> int:
             sim,
             LokaConfig(
                 enable_llm=llm_enabled,
+                enable_vision=vision,
+                vision=camera,
                 enable_session_log=not args.no_log,
                 log_path=log_path,
                 print_compressor=not args.quiet_compressor,
@@ -420,6 +524,40 @@ def main(argv: list[str] | None = None) -> int:
             faults=build_faults(args),
         )
         runtime.effort_observer.printout = True
+    if args.prop_spawns and sim.props is None:
+        print("[PROPS] --props / --scene ignored: props.slots in loka.yaml is empty")
+        args.prop_spawns = []
+    for kind, x, y, yaw in args.prop_spawns:
+        try:
+            print(sim.props.spawn(kind, x, y, yaw))
+        except ValueError as exc:
+            print(f"[PROPS] {exc}")
+    log = getattr(runtime, "log", None)
+    if log is not None:
+        props = ";".join(f"{k}:{x:g},{y:g},{yaw:g}" for k, x, y, yaw in args.prop_spawns)
+        log.note(
+            f"argv: {' '.join(sys.argv[1:]) or '(none)'}\nstartup props: {props or '(none)'}",
+            sim_time=0.0,
+        )
+    recorder = None
+    if args.record is not None:
+        record_cfg = settings.get("recording") or {}
+        path = Path(args.record) if args.record else (
+            Path(record_cfg.get("directory", "recordings"))
+            / f"run_loka_{datetime.now():%Y%m%d_%H%M%S}.mp4"
+        )
+        recorder = SessionRecorder(sim, path, OverviewCamera.from_config(record_cfg))
+        print(f"[record] capturing at {recorder.camera.fps:g} fps -> {path} (encoded at exit)")
+    try:
+        return _run(args, sim, runtime, llm_enabled, recorder)
+    finally:
+        if hasattr(runtime, "close"):
+            runtime.close()
+        if recorder is not None:
+            recorder.close()
+
+
+def _run(args, sim, runtime, llm_enabled: bool, recorder=None) -> int:
     if args.mode == "walk":
         applied = runtime.controller.set_task_targets(
             {
@@ -461,7 +599,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.headless:
-        history = runtime.run(duration or 15.0)
+        if recorder is None:
+            history = runtime.run(duration or 15.0)
+        else:
+            end = duration or 15.0
+            recorder.maybe_capture()
+            while sim.data.time < end and not sim.fell:
+                runtime.step()
+                recorder.maybe_capture()
+            history = getattr(runtime, "history", sim.history)
         fell = sim.fell
         print(sim.stats().report())
         print(f"tracking samples: {len(history)}  fell={fell}")
@@ -483,6 +629,11 @@ def main(argv: list[str] | None = None) -> int:
             daemon=True,
         ).start()
 
+    ego_view = None
+    if args.ego_view:
+        ego_view = EgoViewStream(sim.recipe, hz=args.ego_hz)
+        print(f"[ego view] streaming {EGO_CAMERA} at up to {args.ego_hz:g} Hz ({ego_view.backend})")
+
     try:
         with mujoco.viewer.launch_passive(
             sim.model,
@@ -498,6 +649,8 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 for _ in range(steps_per_frame):
                     runtime.step()
+                    if recorder is not None:
+                        recorder.maybe_capture()
                     if sim.fell:
                         break
                 begin_frame(viewer)
@@ -505,6 +658,8 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.unitree_rl:
                     render_gait_overlays(viewer, runtime.controller)
                 viewer.sync()
+                if ego_view is not None:
+                    ego_view.offer(sim)
                 next_frame += frame_dt
                 sleep = next_frame - time.perf_counter()
                 if sleep > 0:
@@ -517,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         stop.set()
         stdin_stop.set()
+        if ego_view is not None:
+            ego_view.close()
 
     print(sim.stats().report())
     return 1 if sim.fell else 0

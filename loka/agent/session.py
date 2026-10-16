@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from loka.agent.directives import format_listeners, format_mission_directives
+from loka.agent.plan import format_plan
 from loka.agent.robot_context import format_current_model_belief
 
 
@@ -16,6 +17,8 @@ def _format_context_sections(
     return (
         "## LOCKED MISSION DIRECTIVES\n"
         f"{format_mission_directives(loka_state)}\n\n"
+        "## SELF-ASSIGNED PLAN\n"
+        f"{format_plan(loka_state)}\n\n"
         "## ACTIVE LISTENERS\n"
         f"{format_listeners(loka_state)}\n\n"
         f"{mpc_config}\n\n"
@@ -38,8 +41,6 @@ def _format_intervention_history(interventions, empty_label):
         lines.append(f"  Hypothesis: {fix.get('hypothesis', 'N/A')}")
         lines.append(f"  Analysis: {fix.get('analysis', 'N/A')}")
 
-        if fix.get("controller_targets"):
-            lines.append(f"  Controller_Targets: {fix['controller_targets']}")
         if fix.get("planner_targets"):
             lines.append(f"  Planner_Targets: {fix['planner_targets']}")
         if fix.get("task_targets"):
@@ -89,7 +90,6 @@ class ConversationMixin:
             "hypothesis": sem_state.get("Hypothesis"),
             "hypotheses": sem_state.get("Hypotheses") or [],
             "analysis": sem_state.get("Analysis"),
-            "controller_targets": scratchpad.get("Controller_Targets", {}),
             "planner_targets": scratchpad.get("Planner_Targets", {}),
             "task_targets": scratchpad.get("Task_Targets", {}),
             "model_mutations": scratchpad.get("Model_Mutations", []),
@@ -120,12 +120,54 @@ class ConversationMixin:
         user_content: str,
         *,
         max_memory: int | None = None,
+        image_png: bytes | None = None,
+        image_detail: str = "high",
     ) -> list:
         messages = [{"role": "system", "content": system_prompt}]
         if self.shows_prior_turns(max_memory):
             messages.extend(self._messages)
         messages.append({"role": "user", "content": user_content})
+        if image_png is not None:
+            attach_image(messages, image_png, detail=image_detail)
         return messages
+
+
+def attach_image(messages: list, image_png: bytes, *, detail: str = "high") -> None:
+    """Turn the last user message into text plus one inline PNG.
+
+    History stays text-only (``append_exchange`` stores the string), so a turn
+    only ever carries the frame captured for it.
+    """
+    import base64
+
+    last = messages[-1]
+    text = last["content"] if isinstance(last["content"], str) else _message_text(last)
+    url = "data:image/png;base64," + base64.b64encode(image_png).decode("ascii")
+    last["content"] = [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": url, "detail": detail}},
+    ]
+
+
+def append_text(messages: list, note: str) -> None:
+    """Append a line to the last user message, string or multimodal."""
+    last = messages[-1]
+    if isinstance(last["content"], str):
+        last["content"] = last["content"].rstrip() + "\n\n" + note
+        return
+    for part in last["content"]:
+        if part.get("type") == "text":
+            part["text"] = part["text"].rstrip() + "\n\n" + note
+            return
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return "\n".join(
+        part.get("text", "") for part in content or () if part.get("type") == "text"
+    )
 
 
 _STOOD_FOR_FAULT = (
@@ -234,8 +276,8 @@ class FailureEpisode(ConversationMixin):
         else:
             situation = (
                 "Earlier orchestrator turns are omitted. Reason from the current "
-                "telemetry, tunables, and model belief. Applied controller targets "
-                "and model mutations remain in effect.\n"
+                "telemetry, tunables, and model belief. Applied gait targets, "
+                "search results, and model mutations remain in effect.\n"
             )
         return (
             f"--- FAILURE EPISODE (round {self.round_number}, t={sim_time:.2f}s) ---\n"
@@ -310,8 +352,8 @@ class OperatorSession(ConversationMixin):
         else:
             recall = (
                 "Earlier orchestrator turns are omitted. Reason from the current "
-                "telemetry, tunables, and model belief. Applied controller targets "
-                "and model mutations remain in effect.\n\n"
+                "telemetry, tunables, and model belief. Applied gait targets, "
+                "search results, and model mutations remain in effect.\n\n"
             )
         return (
             f"--- OPERATOR DIRECTIVE (t={sim_time:.2f}s) ---\n"

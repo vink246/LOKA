@@ -1,0 +1,19 @@
+<mujoco model="cube">
+  <!-- The pushable block from HumanoidBench tasks/push.xml (MIT, see
+       LICENSE.humanoidbench): 0.2 m, 0.3 kg. The body origin is on the floor.
+       LOKA adds the free joint. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="cube">
+      <geom type="box" pos="0 0 0.1" size="0.1 0.1 0.1" rgba="0.67 0.73 0.78 1" class="visual"/>
+      <geom name="block" type="box" pos="0 0 0.1" size="0.1 0.1 0.1" mass="0.3" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

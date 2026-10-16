@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import time
@@ -39,10 +40,13 @@ from loka.agent.faults import FaultSpec, capture_nominal_params
 from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
 from loka.agent.llm import load_stand_system_prompt, stand_llm_worker
 from loka.agent.session_log import StandSessionLog, default_log_path
+from loka.scene_props import prop_contacts
+from loka.vision import EgoCameraSpec, EgoRenderer, camera_pose
 import mujoco
 
 _SESSION = loka_config()["session"]
 _BIAS = loka_config().get("effort_bias", {})
+_VISION = loka_config().get("vision", {}) or {}
 
 MU_SLIDE_MPS = 0.05  # planted-site speed that counts as sliding
 MU_MIN_NORMAL_N = 20.0
@@ -54,6 +58,10 @@ MU_PERCENTILE = 75.0  # partly stuck contacts read below the cone
 @dataclass
 class LokaConfig:
     enable_llm: bool = True
+    #: Attach an ego_cam frame to every user turn. The plant must be built
+    #: with the camera (``Simulation(camera=...)``).
+    enable_vision: bool = bool(_VISION.get("enabled", False))
+    vision: EgoCameraSpec = field(default_factory=lambda: EgoCameraSpec.from_config(_VISION))
     cooldown_s: float = float(_SESSION["cooldown_s"])
     heartbeat_s: float = float(_SESSION["heartbeat_s"])
     telemetry_window_s: float = float(_SESSION["telemetry_window_s"])
@@ -121,12 +129,18 @@ class LokaRuntime:
             "primary_objective": self.config.objective,
             "mission_directives": [],
             "listeners": [],
+            "plan": None,
         }
         self.robot_context = build_robot_model_context(
             self.controller.robot.model,
             str(self.controller.config.model_path),
         )
-        self.system_prompt = load_stand_system_prompt(robot_context=self.robot_context)
+        self.ego_renderer: EgoRenderer | None = None
+        self.vision_block: str | None = None
+        self._frame_count = 0
+        self.system_prompt = load_stand_system_prompt(
+            robot_context=self.robot_context, vision=self.vision_block
+        )
 
         self.recent_frames: deque = deque()
         self._last_edit_t = -1e9
@@ -160,8 +174,12 @@ class LokaRuntime:
             print(f"[LOKA] session jsonl → {self.log.jsonl_path.resolve()}")
             self.log.note(
                 f"LLM={'on' if self.config.enable_llm else 'off'}; "
-                f"faults={len(self.faults)}"
+                f"faults={len(self.faults)}; "
+                f"vision={'on' if self.config.enable_vision and self.config.enable_llm else 'off'}"
             )
+        if self.config.enable_vision and self.config.enable_llm:
+            self._start_vision()
+            self._rebuild_prompt()
 
         # Driver command limit in actuator units. After a gear search accepts,
         # the QP's joint-torque limit is this times that belief, refreshed
@@ -201,8 +219,8 @@ class LokaRuntime:
     def _frame(self) -> dict:
         tel = self.controller.telemetry
         robot = self.controller.robot
-        qpos = self.sim.data.qpos.copy()
-        qvel = self.sim.data.qvel.copy()
+        qpos = self.sim.robot_qpos.copy()
+        qvel = self.sim.robot_qvel.copy()
         torque = tel.torque.copy() if tel is not None else np.zeros(robot.nu)
         limit = np.maximum(robot.torque_limit, 1e-3)
         util = np.abs(torque) / limit
@@ -274,6 +292,7 @@ class LokaRuntime:
             "bias_nm": self._bias_nm(),
             "bias_threshold_nm": self._bias_threshold_nm(),
             "belief_search_busy": self.belief_search.busy,
+            "prop_contacts": prop_contacts(self.sim.model, self.sim.data, self.sim.prop_layout),
         }
 
     def _gated_heading_error(self, tel) -> float:
@@ -405,7 +424,66 @@ class LokaRuntime:
     # -- LLM dispatch -------------------------------------------------------
 
     def _rebuild_prompt(self) -> None:
-        self.system_prompt = load_stand_system_prompt(robot_context=self.robot_context)
+        self.system_prompt = load_stand_system_prompt(
+            robot_context=self.robot_context, vision=self.vision_block
+        )
+
+    # -- vision -------------------------------------------------------------
+
+    def _start_vision(self) -> None:
+        from loka.agent.context import format_vision_block
+        from loka.vision import floor_cell_size, nominal_camera_pose
+
+        if not self.sim.has_camera:
+            raise ValueError(
+                "enable_vision needs the plant built with the head camera: "
+                "Simulation(camera=EgoCameraSpec().recipe())"
+            )
+        spec = self.config.vision
+        self.vision_block = format_vision_block(
+            spec,
+            nominal_camera_pose(self.sim.model),
+            floor_cell_size(self.sim.model),
+        )
+        self.ego_renderer = EgoRenderer(self.sim.recipe)
+        if self.log is not None and spec.save_frames:
+            frames = self._frames_dir()
+            frames.mkdir(parents=True, exist_ok=True)
+            for old in frames.glob("turn_*.png"):
+                old.unlink()
+        print(
+            f"[LOKA] vision on: {spec.width}x{spec.height} ego_cam, "
+            f"fovy {spec.fovy_deg:g} deg, pitch down {spec.pitch_down_deg:g} deg "
+            f"({self.ego_renderer.backend} renderer)"
+        )
+
+    def _frames_dir(self) -> Path:
+        return self.log.path.parent / "frames"
+
+    def _vision_request(self, user_content: str) -> tuple[str, dict | None]:
+        """Snapshot the plant for this turn and add the CAMERA FRAME section."""
+        if self.ego_renderer is None:
+            return user_content, None
+        from loka.agent.context import format_camera_frame
+
+        snapshot = self.sim.snapshot()
+        pose = camera_pose(self.sim.model, self.sim.data)
+        self._frame_count += 1
+        frame_path = None
+        if self.log is not None and self.config.vision.save_frames:
+            frame_path = self._frames_dir() / f"turn_{self._frame_count:03d}.png"
+        user_content = user_content.rstrip() + "\n\n" + format_camera_frame(pose, self.config.vision)
+        return user_content, {
+            "render": self.ego_renderer.render,
+            "snapshot": snapshot,
+            "detail": self.config.vision.detail,
+            "frame_path": frame_path,
+        }
+
+    def close(self) -> None:
+        if self.ego_renderer is not None:
+            self.ego_renderer.close()
+            self.ego_renderer = None
 
     def _telemetry_for(self, frame: dict) -> str:
         window = list(self.recent_frames) or [frame]
@@ -440,6 +518,7 @@ class LokaRuntime:
             or self.belief_search.busy
         ):
             return False
+        user_content, vision = self._vision_request(user_content)
         self.llm_busy = True
         self.active_session = session
         self._pending_user_content = user_content
@@ -455,10 +534,12 @@ class LokaRuntime:
             user_content,
             max_memory=self.config.max_memory,
         )
+        # The worker attaches the image to its own copy, so the logged
+        # messages below stay text-only.
         thread = threading.Thread(
             target=stand_llm_worker,
-            args=(messages, self.llm_queue),
-            kwargs={"model": self.config.llm_model},
+            args=(copy.deepcopy(messages), self.llm_queue),
+            kwargs={"model": self.config.llm_model, "vision": vision},
             daemon=True,
         )
         thread.start()
@@ -513,6 +594,12 @@ class LokaRuntime:
         wall_latency = time.perf_counter() - float(self._dispatch_wall_t)
         reason = self._pending_dispatch_reason
         user_content = self._pending_user_content
+        frame_path = (result or {}).get("frame_path")
+        if self.log is not None and result:
+            if frame_path is not None:
+                self.log.frame(sim_time=now, path=frame_path, size=result.get("image_bytes"))
+            if result.get("image_error"):
+                self.log.note(f"camera frame: {result['image_error']}", sim_time=now)
         if timed_out or not result or not result.get("scratchpad"):
             note = (
                 f"orchestrator timed out after {self.config.llm_request_timeout_s:.0f}s"
@@ -578,6 +665,7 @@ class LokaRuntime:
                 "summary": summary,
                 "timed_out": False,
                 "model": self.config.llm_model,
+                "frame_path": None if frame_path is None else str(frame_path),
             }
         )
         self._rebuild_prompt()
@@ -638,7 +726,7 @@ class LokaRuntime:
         robot.torque_limit[:] = achievable
         if self.controller.wbc.torque_limit is not robot.torque_limit:
             self.controller.wbc.torque_limit[:] = achievable
-        torque = self.controller.compute_torque(sim.data.qpos, sim.data.qvel)
+        torque = self.controller.compute_torque(sim.robot_qpos, sim.robot_qvel)
         zero_dead_actuator_commands(torque, self.loka_state)
         command = joint_torque_to_command(torque, scale, self._command_limit)
         sim.torque = command
@@ -660,16 +748,17 @@ class LokaRuntime:
         mujoco.mj_kinematics(sim.model, sim.data)
         mujoco.mj_comPos(sim.model, sim.data)
         robot = self.controller.robot
-        robot.update(sim.data.qpos, sim.data.qvel)
+        nv = sim.robot_nv
+        robot.update(sim.robot_qpos, sim.robot_qvel)
         contact_jac = robot.contact_jacobian()
         belief = robot.data
-        belief.qacc[:] = sim.data.qacc
+        belief.qacc[:] = sim.data.qacc[:nv]
         belief_inverse = np.empty(robot.model.nv)
         mujoco.mj_rne(robot.model, belief, 1, belief_inverse)
         measured = (
-            sim.data.qfrc_actuator
-            + sim.data.qfrc_constraint
-            + sim.data.qfrc_applied
+            sim.data.qfrc_actuator[:nv]
+            + sim.data.qfrc_constraint[:nv]
+            + sim.data.qfrc_applied[:nv]
         )
         deviation = belief_actuator_deviation(
             measured, belief_inverse, contact_jac
@@ -679,12 +768,12 @@ class LokaRuntime:
             robot.model.actuator_gear[:, 0],
             self.loka_state["nominal_gears"],
             sim.data.ctrl,
-            sim.data.qfrc_actuator,
+            sim.data.qfrc_actuator[:nv],
         )
         heights = robot.data.site_xpos[robot.contact_site_ids][:, 2]
         planted = heights < self.controller._ground_height + CONTACT_HEIGHT_TOLERANCE
         tang = np.linalg.norm(
-            (contact_jac @ sim.data.qvel).reshape(-1, 3)[:, :2],
+            (contact_jac @ sim.robot_qvel).reshape(-1, 3)[:, :2],
             axis=1,
         )
         slip = float(tang[planted].max()) if np.any(planted) else 0.0
@@ -716,6 +805,7 @@ class LokaRuntime:
         )
 
     def step(self) -> dict:
+        self.sim.apply_prop_requests()
         self._maybe_inject_faults()
         self._drain_llm()
 

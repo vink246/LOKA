@@ -6,18 +6,8 @@ from pathlib import Path
 
 import mujoco
 
-from loka.control.locomotion import (
-    HEIGHT_BAND,
-    MAX_LEAN_XY,
-    MAX_YAW,
-    TASK_PARAMETER_NAMES,
-    LocomotionController,
-)
+from loka.control.locomotion import LocomotionController
 from loka.agent.robot_context import build_robot_model_context
-from loka.agent.policy import (
-    LLM_STAND_CONTROLLER_ALLOWLIST,
-    stand_llm_catalogue,
-)
 
 
 def default_stand_objective() -> str:
@@ -28,100 +18,6 @@ def default_stand_objective() -> str:
         "On faults, queue Belief_Searches so the model matches the plant, and set "
         "Task_Targets for the directive. Do not generate code."
     )
-
-
-def build_stand_capabilities(controller: LocomotionController) -> dict:
-    from loka.control.stacks import SPECS
-
-    limits = controller.lean_limits()
-    stack = getattr(controller.config, "stack", "legacy_dcm")
-    spec = SPECS.get(stack, SPECS["legacy_dcm"])
-    return {
-        "cost_weights": sorted(spec.llm_allowlist),
-        "plant": spec.description,
-        "stack": stack,
-        "task_parameters": sorted(TASK_PARAMETER_NAMES),
-        "task_limits": limits,
-        "max_lean_xy": MAX_LEAN_XY,
-        "height_band": HEIGHT_BAND,
-        "max_yaw": MAX_YAW,
-        "planner": [],  # no MJPC planner numerics on this plant
-    }
-
-
-def format_stand_capabilities_block(capabilities: dict) -> str:
-    lines = [
-        "## AVAILABLE CONTROLLER PARAMETERS",
-        "Controller_Targets MUST use dotted paths from the allowlist below.",
-        "Any other mpc.*/wbc.*/stand.* path is locked and will be ignored.",
-        "Never use bare names like weight_force — they are ambiguous across layers.",
-        "",
-        "### Adaptive Controller_Targets (allowlist)",
-        stand_llm_catalogue(),
-        "",
-        "### Task_Targets",
-        "height [m], yaw [rad], lean_x [m forward], lean_y [m left]",
-        f"  height in [{capabilities['task_limits']['height_min']:.3f}, "
-        f"{capabilities['task_limits']['height_max']:.3f}]",
-        f"  lean clamped to ~{LEAN_FRACTION_TEXT} of support margin "
-        f"(hard |lean| <= {MAX_LEAN_XY} m)",
-        f"  yaw in [{-MAX_YAW:.2f}, {MAX_YAW:.2f}] rad",
-        "",
-        "### Gait Task_Targets (stand ↔ walk)",
-        "gait.mode: stand|walk|tread|limp  (or 0..3)",
-        *_gait_knob_lines(capabilities.get("stack", "legacy_dcm")),
-        "gait.heading is a goal. The feet turn at gait.turn_rate, and a large",
-        "heading error cuts speed to a crawl. yaw is a standing offset from the",
-        "feet, ignored while walking. lean_x/lean_y are in the stance frame.",
-        "Setting gait.mode=walk with omitted speed and heading defaults to ~0.25 m/s.",
-        "To reach a world point, set gait.goal_x and gait.goal_y (and gait.speed as",
-        "the cruise). The plant re-aims the heading every tick, slows near the goal,",
-        "stops inside gait.goal_tolerance, and walks back if pushed off. Do not",
-        "re-steer with gait.heading: writing it alone cancels the goal. Arm near_xy",
-        "on the same point with radius >= goal_tolerance + 0.1 to wake on arrival.",
-        "Foothold XY and contact schedules are classical (not LLM-settable).",
-        "While walking: contact slip, force mismatch, and CoM residuals during",
-        "swing are expected. Do NOT lower friction_mu or kp_base_position for",
-        "those alone — prefer gait.speed / duty / step_period, or lean.",
-        "Hint: after a friction belief drops below nominal, the plant already",
-        "plans inside the believed friction cone, but a gait tuned for a dry",
-        "floor can ask for more sideways force than a slippery one gives. A",
-        "slower gait.speed, a higher gait.duty_factor (longer double support), a",
-        "longer gait.step_period, or a shorter gait.step_length_max tends to need",
-        "less, at the cost of reaching the goal later.",
-        "",
-        "### Model_Mutations (belief on the controller's private MjModel)",
-        "object_type: actuator|geom|body",
-        "attributes: gear | friction | mass | com",
-        "com is [x, y, z] meters in that body's frame (+x forward, +y left, +z up).",
-        "Shift com when the load is offset; raise mass when the whole body is heavier.",
-        "Zero actuator gear for a dead joint; do not raise gear to 'force' a seized joint.",
-        "",
-        "### Listeners",
-        "Arm a one-shot wake: kind near_xy | heading_error_below | speed_below |",
-        "pelvis_z_below | pelvis_z_above | after_s | bias_under_threshold, plus a message.",
-        "bias_under_threshold fires when |bias| is at or under the mode threshold.",
-        "near_xy uses world pelvis x,y and radius (default 0.4 m).",
-        "Set the point early: the call itself takes time and the robot keeps moving.",
-        "Omit Listeners to leave the current set armed; an empty list clears them.",
-    ]
-    return "\n".join(lines)
-
-
-LEAN_FRACTION_TEXT = "55%"
-
-
-def _gait_knob_lines(stack: str = "legacy_dcm") -> list[str]:
-    from loka.control.gait import gait_knobs
-
-    lines = []
-    for knob in gait_knobs(stack):
-        if knob.field == "mode":
-            continue
-        lines.append(
-            f"  {knob.name} in [{knob.low:.3g}, {knob.high:.3g}]: {knob.summary}"
-        )
-    return lines
 
 
 def format_stand_configuration(controller: LocomotionController) -> str:
@@ -147,6 +43,133 @@ def format_stand_configuration(controller: LocomotionController) -> str:
         else:
             lines.append(f"  {key}: {value:.6g}")
     return "\n".join(lines)
+
+
+#: What the prop files in models/props/ look like, for the vision prompt.
+_PROP_CATALOGUE = (
+    "chair: light wood, seat 0.42 x 0.42 m at 0.45 m high, backrest to 0.85 m; 6 kg, free (pushable, tips over)",
+    "table: dark wood, 1.0 x 1.0 m top at 0.95 m high on four legs; 16 kg, free (pushable)",
+    "box: brown cardboard, 0.4 x 0.2 x 0.3 m tall; 3 kg, free (pushable)",
+    "cube: pale grey-blue block, 0.2 m; 0.3 kg, free (kicked aside by a step)",
+    "shelf: light-wood bookshelf, 0.65 x 0.9 m footprint, 1.85 m tall; static (does not move)",
+)
+
+
+def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
+    """System-prompt block describing the head camera and how to use it."""
+    import math
+
+    h = float(nominal_pose.xyz[2])
+    p = spec.pitch_rad
+    horizon = spec.cy - spec.fy * math.tan(p)
+    ranges = []
+    for v in (int(math.ceil(horizon)) + 15, 100, 150, 200, 256, 300, 350, 400, 450, spec.height - 1):
+        yn = (v - spec.cy) / spec.fy
+        denom = math.sin(p) + yn * math.cos(p)
+        if denom <= 1e-6 or v >= spec.height:
+            continue
+        forward = h * (math.cos(p) - yn * math.sin(p)) / denom
+        half_width = h * ((spec.width - spec.cx) / spec.fx) / denom
+        ranges.append(f"  row {v:3d}: floor {forward:5.2f} m ahead, image spans +/-{half_width:4.2f} m sideways")
+    floor = (
+        f"The floor is a blue checkerboard of {floor_cell:.2f} m squares, alternating "
+        f"light and dark, with thin white lines every {2 * floor_cell:.2f} m. Count "
+        "squares to measure distances and sizes on the floor."
+        if floor_cell
+        else "The floor has no metric pattern."
+    )
+    lines = [
+        "## EGOCENTRIC CAMERA",
+        "Each user message carries one RGB image from ego_cam, a camera on the front of "
+        "the G1 head, rendered at the instant the message was sent. It shows what the "
+        "robot would see. Use it to find obstacles, free space, and objects on the way "
+        "to the goal. Telemetry remains the source of truth for the robot's own state.",
+        "",
+        "### Camera and image",
+        f"- RGB only (no depth), {spec.width} x {spec.height} px, noiseless render, no lens distortion.",
+        f"- Pinhole intrinsics: fx = fy = {spec.fx:.1f} px, cx = {spec.cx:.1f}, cy = {spec.cy:.1f}. "
+        f"Vertical FOV {spec.fovy_deg:.1f} deg, horizontal FOV {spec.fovx_deg:.1f} deg.",
+        f"- Mounted on torso_link at {tuple(round(v, 3) for v in _ego_mount())} m "
+        "(x forward, z up), midway between the head's stereo cameras; the head is "
+        "fixed to the torso, so it turns with the waist and torso.",
+        f"- The optical axis points along the torso's forward direction, pitched "
+        f"{spec.pitch_down_deg:.1f} deg below horizontal.",
+        f"- In the nominal stand the camera is {h:.3f} m above the floor. Its live height, "
+        "heading, pitch, and roll at capture are in each message's CAMERA FRAME section; "
+        "a crouch or lean changes them.",
+        "- Pixel (u, v): u grows to the right, v grows downward, (0, 0) is the top-left corner. "
+        "The image's left half is the robot's left (+y in its heading frame).",
+        f"- With the nominal pitch the horizon is row {horizon:.0f}. Everything below it is "
+        "floor or objects standing on it; the sky gradient fills the top rows.",
+        "- The robot's own arms or hands can appear at the bottom edge; they are not obstacles.",
+        "- Lighting is a directional overhead light plus a headlight, so objects cast short "
+        "shadows straight down.",
+        f"- {floor}",
+        "",
+        "### From a pixel to the floor",
+        "Use the camera height h, pitch p, and yaw from CAMERA FRAME. For the pixel where an "
+        "object meets the floor (its lowest visible point):",
+        "  xn = (u - cx) / fx,  yn = (v - cy) / fy,  d = sin(p) + yn cos(p)  (d <= 0: above the horizon)",
+        "  ahead X = h (cos(p) - yn sin(p)) / d,   left Y = -h xn / d   (camera heading frame, m)",
+        "  world x = cam_x + X cos(yaw) - Y sin(yaw),   world y = cam_y + X sin(yaw) + Y cos(yaw)",
+        "Bearing of a column, ignoring pitch: atan((cx - u) / fx), positive to the left. An object "
+        f"of width W at slant range R spans about fx W / R pixels.",
+        "Reference ranges for the centre column in the nominal stand:",
+        *ranges,
+        "Image ranges are good to about 10% close in and degrade with distance. Re-check from a "
+        "nearer frame before committing to a tight gap.",
+        "",
+        "### Objects you may see",
+        *(f"- {item}" for item in _PROP_CATALOGUE),
+        "",
+        "### Navigating with the image",
+        "- Consult the image when the path matters: before starting a walk, near listeners, and "
+        "whenever the goal is not yet reached. If the image shows nothing in the way, proceed "
+        "as you would without it.",
+        "- The plant walks a straight line to gait.goal_x/goal_y and does not see obstacles. To "
+        "go around one, set an intermediate waypoint as the goal, at least 0.5 m clear of the "
+        "obstacle's edge (the robot is about 0.5 m wide), and arm a near_xy listener there; "
+        "then set the next waypoint or the final goal. Keep the locked directive's goal as the "
+        "end point.",
+        "- Put a detour waypoint beside the obstacle (level with it or past its near edge), not "
+        "straight to the robot's side: e.g. robot at (0,0) facing +x, chair centred at (1.5,0), "
+        "goal (3,0) -> waypoints (1.0,-0.9), (2.0,-0.9), then (3,0), each a turn of about 42 deg, "
+        "rather than (0,-0.9), a 90 deg turn. Keep each turn at or under 45 deg where you can.",
+        "- Estimate the obstacle's world position from the image first (bearing and floor "
+        "range formulas above), then choose waypoints, and record both in the Plan so later "
+        "turns know where the obstacle was and why each waypoint sits where it does.",
+        "- You only see a new frame when you are called. When obstacles are near, arm an "
+        "after_s listener (2 to 4 s) or a near_xy listener short of them to look again.",
+        "- The frame was taken when the message was sent; the robot keeps moving during your "
+        "reply, so allow for the distance covered at the current speed.",
+        "- To push a light free prop (cube, box) out of the way, walk slowly (gait.speed <= 0.15) "
+        "straight through it. Do not try to push the table or the shelf, and do not plan to "
+        "step onto any prop: the footstep planner assumes flat ground.",
+        "- A PROP CONTACT section in the telemetry means the robot is touching a prop. The "
+        "contact force raises |bias|; that is an external load, not a model error. Back off "
+        "or steer around before queueing any belief search.",
+        "- Objects beyond about 6 m are a few pixels wide. Do not infer free space far away "
+        "from an empty-looking image.",
+    ]
+    return "\n".join(lines)
+
+
+def _ego_mount() -> tuple[float, float, float]:
+    from loka.vision import EGO_MOUNT_POS
+
+    return EGO_MOUNT_POS
+
+
+def format_camera_frame(pose, spec) -> str:
+    """The per-turn CAMERA FRAME section that accompanies the attached image."""
+    return (
+        "## CAMERA FRAME\n"
+        f"Attached image: ego_cam, {spec.width} x {spec.height} px RGB, captured at "
+        f"t={pose.time:.2f}s when this message was sent.\n"
+        f"{pose.describe()}\n"
+        f"Camera height above the floor h = {pose.xyz[2]:.3f} m. The robot keeps moving "
+        "while you reply."
+    )
 
 
 def build_stand_robot_context(controller: LocomotionController) -> str:

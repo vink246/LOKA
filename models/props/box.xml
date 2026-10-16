@@ -1,0 +1,24 @@
+<mujoco model="box">
+  <!-- The cardboard package from HumanoidBench tasks/room.xml (MIT, see
+       LICENSE.humanoidbench), 0.4 x 0.2 x 0.3 m. The body origin is on the floor.
+       LOKA adds the free joint. HumanoidBench's default density gives 24 kg; the
+       explicit 3 kg here is an empty shipping box. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <texture name="package" type="2d" file="textures/package_plain.png"/>
+    <material name="package" texture="package" texuniform="true"/>
+  </asset>
+  <worldbody>
+    <body name="box">
+      <geom type="box" pos="0 0 0.15" size="0.2 0.1 0.15" material="package" class="visual"/>
+      <geom name="shell" type="box" pos="0 0 0.15" size="0.2 0.1 0.15" mass="3" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>
