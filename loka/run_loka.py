@@ -11,8 +11,12 @@
     python -m loka.run_loka --no-llm --ego-view --props "table:2,0"
     python -m loka.run_loka --record --goal 3,1        # recordings/run_loka_<stamp>.mp4
     python -m loka.run_loka --scene obstacle_course --vision --ego-view --record
+    python -m loka.run_loka --navila --navila-script "move forward 100 cm; stop" --scene obstacle_course
+    python -m loka.run_loka --navila --navila-model ~/scratch/models/navila-llama3-8b-8f \\
+        --headless -T 60 --scene obstacle_course --record --operator "walk to the chair"
 
-``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``).
+``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``),
+except with ``--navila`` where it is the navigation instruction.
 ``--vision`` attaches a 512x512 head-camera frame to every orchestrator turn
 (settings in ``loka/config/loka.yaml`` under ``vision``). The scene carries a
 pool of HumanoidBench props (chair, table, box, cube, shelf) parked off-scene;
@@ -27,6 +31,12 @@ camera (``recording`` in ``loka.yaml``), headless or with the viewer.
 ``--unitree-rl`` swaps the MPC plant for the unitree_rl_lab velocity policy on
 the same scene. It has no orchestrator, so it implies ``--no-llm``; goals,
 ``--mode walk``, faults and the fault keys work as they do for the plant.
+``--navila`` runs the NaVILA navigation VLA (mid-level actions) on the MPC
+plant by default, or on unitree_rl with ``--unitree-rl``. Weights load only
+from a local directory (``--navila-model`` / ``navila.model_path``); download
+them on PACE with ``scripts/fetch_navila_checkpoint.py``. ``--navila-script``
+replays mid-level actions with no GPU and no checkpoint. Real ``--navila``
+needs the ``loka-navila`` env (``scripts/setup_navila_env.sh``) on a GPU node.
 ``--no-llm`` accepts a world goal (``--goal 3,3`` or ``goal 3 3`` on
 stdin) and structured ``--task`` setpoints. The control loop never blocks on
 the model.
@@ -261,9 +271,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Build the plain scene without the prop pool",
     )
+    parser.add_argument(
+        "--navila",
+        action="store_true",
+        help="Run the NaVILA navigation VLA (implies --no-llm). Needs --navila-model "
+        "or --navila-script. Plant is MPC unless --unitree-rl is also set",
+    )
+    parser.add_argument(
+        "--navila-model",
+        type=Path,
+        default=None,
+        help="Local NaVILA checkpoint directory (never a Hub id). "
+        "Download on PACE: python scripts/fetch_navila_checkpoint.py --out …",
+    )
+    parser.add_argument(
+        "--navila-device",
+        type=str,
+        default=None,
+        help="CUDA device for NaVILA (default: navila.device in loka.yaml, else cuda:0)",
+    )
+    parser.add_argument(
+        "--navila-script",
+        type=str,
+        default=None,
+        metavar="ACTIONS",
+        help='Replay mid-level actions with no GPU, e.g. "move forward 100 cm; turn left 30 degrees; stop"',
+    )
     add_stack_argument(parser)
     args = parser.parse_args(argv)
-    if args.vision and (args.no_llm or args.unitree_rl):
+    if args.vision and (args.no_llm or args.unitree_rl) and not args.navila:
         parser.error("--vision feeds the orchestrator; drop --no-llm / --unitree-rl")
     if args.ego_view and args.headless:
         parser.error("--ego-view opens a window; drop --headless")
@@ -280,16 +316,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.prop_spawns += parse_props_spec(args.props)
         except ValueError as exc:
             parser.error(f"--props: {exc}")
+    if args.navila_script is not None or args.navila_model is not None or args.navila_device is not None:
+        if not args.navila:
+            parser.error("--navila-model / --navila-script / --navila-device need --navila")
+    if args.navila:
+        args.no_llm = True
+        if args.task is not None:
+            parser.error("--navila does not take --task; use --operator or --navila-script")
+        if args.navila_script is None and args.navila_model is None:
+            # model_path may still come from loka.yaml; checked in main.
+            pass
+        if args.vision:
+            parser.error("--navila has its own camera; drop --vision")
     if args.unitree_rl:
-        if args.operator or args.task:
+        if (args.operator or args.task) and not args.navila:
             parser.error("--unitree-rl has no orchestrator; drop --operator / --task")
         args.no_llm = True
     elif args.policy_dir is not None or args.goal_heading is not None:
         parser.error("--policy-dir and --goal-heading need --unitree-rl")
-    if args.operator and args.no_llm:
+    if args.operator and args.no_llm and not args.navila:
         parser.error(
             "--operator is language and requires the LLM; "
-            "drop --no-llm, or use --goal 3,3 / --task for the plant"
+            "drop --no-llm, use --navila, or use --goal 3,3 / --task for the plant"
         )
     if args.operator and args.goal:
         parser.error("pass only one of --operator or --goal")
@@ -359,6 +407,9 @@ class _PlantRuntime:
     def clear_interactive_faults(self) -> None:
         print(restore_faults(self.sim, self.viz) or "[FAULT] nothing to clear")
 
+    def submit_operator(self, text: str) -> None:
+        print(f"[!] plant has no language path; ignored: {text!r}")
+
     def step(self) -> None:
         now = float(self.sim.data.time)
         for index, fault in enumerate(self.faults):
@@ -377,7 +428,7 @@ class _PlantRuntime:
 
 
 def _handle_interactive_line(
-    runtime: LokaRuntime, line: str, *, llm_enabled: bool
+    runtime: LokaRuntime, line: str, *, llm_enabled: bool, navila: bool = False
 ) -> None:
     prop_cmd = parse_prop_command(line)
     if prop_cmd is not None:
@@ -410,13 +461,14 @@ def _handle_interactive_line(
     if not text:
         return
     goal = parse_goal_command(text)
-    if goal is not None and not llm_enabled:
+    if goal is not None and not llm_enabled and not navila:
         x, y, speed = goal
         _apply_goal(runtime, x, y, speed)
         return
-    if llm_enabled:
+    if llm_enabled or navila:
         runtime.submit_operator(text)
-        print(f"[operator] queued: {text}")
+        if not navila:
+            print(f"[operator] queued: {text}")
     else:
         print(
             "[!] Not a fault or goal command, and LLM is off. "
@@ -446,10 +498,20 @@ def _apply_goal(
 
 
 def _stdin_command_thread(
-    runtime: LokaRuntime, stop: threading.Event, *, llm_enabled: bool
+    runtime: LokaRuntime,
+    stop: threading.Event,
+    *,
+    llm_enabled: bool,
+    navila: bool = False,
 ) -> None:
     print(FAULT_HELP)
-    print("[interactive] type a fault command, 'goal x y', or an operator request, then Enter")
+    if navila:
+        print(
+            "[interactive] type a navigation instruction, 'act move forward 50 cm', "
+            "a fault command, or 'help', then Enter"
+        )
+    else:
+        print("[interactive] type a fault command, 'goal x y', or an operator request, then Enter")
     while not stop.is_set():
         try:
             line = sys.stdin.readline()
@@ -457,7 +519,7 @@ def _stdin_command_thread(
             break
         if not line:
             break
-        _handle_interactive_line(runtime, line, llm_enabled=llm_enabled)
+        _handle_interactive_line(runtime, line, llm_enabled=llm_enabled, navila=navila)
 
 
 def _make_key_callback(runtime: LokaRuntime):
@@ -492,16 +554,67 @@ def main(argv: list[str] | None = None) -> int:
     apply_stack_arg(config, args)
     settings = loka_config()
     vision_cfg = settings.get("vision") or {}
+    navila_cfg_raw = dict(settings.get("navila") or {})
     vision = llm_enabled and (args.vision or bool(vision_cfg.get("enabled", False)))
-    camera = EgoCameraSpec.from_config(vision_cfg)
+    if args.navila:
+        camera = EgoCameraSpec.from_config(navila_cfg_raw.get("camera") or {})
+    else:
+        camera = EgoCameraSpec.from_config(vision_cfg)
     args.ego_hz = float(vision_cfg.get("stream_hz", 15.0))
     prop_cfg = settings.get("props") or {}
+    need_camera = vision or args.ego_view or args.navila
     plant = {
         "props": None if args.no_props else dict(prop_cfg.get("slots") or {}),
         "static_props": tuple(prop_cfg.get("static") or ()),
-        "camera": camera.recipe() if vision or args.ego_view else None,
+        "camera": camera.recipe() if need_camera else None,
     }
-    if args.unitree_rl:
+    if args.navila:
+        from loka.vla.navila import (
+            NavilaConfig,
+            NavilaPolicy,
+            NavilaRuntime,
+            parse_script,
+            require_navila_checkpoint,
+            require_navila_gpu,
+        )
+
+        if args.navila_device is not None:
+            navila_cfg_raw["device"] = args.navila_device
+        if args.navila_model is not None:
+            navila_cfg_raw["model_path"] = str(args.navila_model)
+        nav_cfg = NavilaConfig.from_dict(navila_cfg_raw)
+        script_actions = None
+        policy = None
+        if args.navila_script is not None:
+            script_actions = parse_script(args.navila_script)
+        else:
+            path = require_navila_checkpoint(nav_cfg.model_path)
+            require_navila_gpu(
+                nav_cfg.device, nav_cfg.min_free_gb, nav_cfg.min_compute_capability
+            )
+            policy = NavilaPolicy(
+                path,
+                device=nav_cfg.device,
+                num_frames=nav_cfg.num_frames,
+                max_new_tokens=nav_cfg.max_new_tokens,
+            )
+        plant_name = "unitree_rl" if args.unitree_rl else "mpc"
+        if args.unitree_rl:
+            sim = UnitreeRLSimulation(
+                config, model_path=args.model, policy_dir=args.policy_dir, **plant
+            )
+        else:
+            sim = Simulation(config, model_path=args.model, **plant)
+        runtime = NavilaRuntime(
+            sim,
+            nav_cfg,
+            plant=plant_name,
+            policy=policy,
+            script=script_actions,
+            faults=build_faults(args),
+            enable_camera=policy is not None,
+        )
+    elif args.unitree_rl:
         sim = UnitreeRLSimulation(
             config, model_path=args.model, policy_dir=args.policy_dir, **plant
         )
@@ -571,7 +684,7 @@ def _run(args, sim, runtime, llm_enabled: bool, recorder=None) -> int:
     duration = args.duration or (20.0 if args.headless else None)
     stop = threading.Event()
 
-    if args.operator or args.task or args.goal_xy:
+    if args.operator or args.task or args.goal_xy or (args.navila and args.navila_script):
         def _queue_later():
             while not stop.is_set() and sim.data.time < args.operator_at:
                 time.sleep(0.05)
@@ -588,12 +701,19 @@ def _run(args, sim, runtime, llm_enabled: bool, recorder=None) -> int:
                     args.goal_speed,
                     args.goal_heading,
                 )
+            elif args.navila and args.navila_script and not args.operator:
+                runtime.submit_instruction(args.navila_script)
             elif args.operator:
                 runtime.submit_operator(args.operator)
 
         threading.Thread(target=_queue_later, daemon=True).start()
 
-    plant = "unitree_rl policy" if args.unitree_rl else "MPC plant"
+    if args.navila:
+        plant = "navila+" + ("unitree_rl" if args.unitree_rl else "mpc")
+    elif args.unitree_rl:
+        plant = "unitree_rl policy"
+    else:
+        plant = "MPC plant"
     print(
         f"G1 {plant}: orchestrator {'on' if llm_enabled else 'off'}  fault={args.fault}"
     )
@@ -625,7 +745,7 @@ def _run(args, sim, runtime, llm_enabled: bool, recorder=None) -> int:
         threading.Thread(
             target=_stdin_command_thread,
             args=(runtime, stdin_stop),
-            kwargs={"llm_enabled": llm_enabled},
+            kwargs={"llm_enabled": llm_enabled, "navila": bool(args.navila)},
             daemon=True,
         ).start()
 

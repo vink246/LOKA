@@ -3,6 +3,7 @@
 ``low_level`` is the MPC + whole-body controller with no orchestrator.
 ``loka`` is that same controller with the language orchestrator in the loop.
 ``unitree_rl`` is the unitree_rl_lab velocity policy on the same plant.
+``navila`` is the NaVILA mid-level navigation VLA on the MPC or unitree_rl plant.
 
 A new baseline subclasses :class:`Baseline`, registers a name, and is
 selected from the suite YAML as ``{name, type, options}``.
@@ -226,6 +227,95 @@ class LokaBaseline(Baseline):
 
     def mutation_count(self) -> int:
         return len(self.runtime.loka_state.get("mutations") or [])
+
+
+@register_baseline("navila")
+class NavilaBaseline(Baseline):
+    """NaVILA mid-level navigation VLA on the MPC or unitree_rl plant.
+
+    Options: ``plant`` (``mpc`` | ``unitree_rl``), ``model_path`` (local
+    checkpoint directory; required for real inference), ``device``,
+    ``policy_dir`` / ``min_speed`` when ``plant`` is ``unitree_rl``.
+    """
+
+    supports_directive = True
+
+    def __init__(self, spec, suite, log_path: Path | None = None) -> None:
+        from loka.agent.loka_config import loka_config
+        from loka.vla.navila import (
+            NavilaConfig,
+            NavilaPolicy,
+            NavilaRuntime,
+            require_navila_checkpoint,
+            require_navila_gpu,
+        )
+
+        options = dict(spec.options or {})
+        plant = str(options.get("plant", "mpc")).strip().lower()
+        settings = (loka_config().get("navila") or {}).copy()
+        settings.update({k: v for k, v in options.items() if k not in ("plant", "policy_dir", "min_speed")})
+        if options.get("model_path"):
+            settings["model_path"] = options["model_path"]
+        cfg = NavilaConfig.from_dict(settings)
+        model_path = require_navila_checkpoint(cfg.model_path)
+        require_navila_gpu(cfg.device, cfg.min_free_gb, cfg.min_compute_capability)
+        camera = cfg.camera.recipe()
+        plant_kw = {
+            "props": dict((loka_config().get("props") or {}).get("slots") or {}),
+            "static_props": tuple((loka_config().get("props") or {}).get("static") or ()),
+            "camera": camera,
+        }
+        if plant == "unitree_rl":
+            self._sim = UnitreeRLSimulation(
+                locomotion_config(suite),
+                policy_dir=options.get("policy_dir"),
+                min_speed=options.get("min_speed"),
+                **plant_kw,
+            )
+        elif plant == "mpc":
+            self._sim = Simulation(locomotion_config(suite), **plant_kw)
+        else:
+            raise ValueError(f"navila plant must be mpc or unitree_rl, got {plant!r}")
+        policy = NavilaPolicy(
+            model_path, device=cfg.device, num_frames=cfg.num_frames, max_new_tokens=cfg.max_new_tokens
+        )
+        if log_path is not None:
+            cfg.log_dir = Path(log_path)
+        self.runtime = NavilaRuntime(
+            self._sim, cfg, plant=plant, policy=policy, enable_camera=True
+        )
+        self._goal_xy = None
+        self._plant = plant
+
+    def reset(self, seed: int, init_noise: float) -> None:
+        self._sim.reset()
+        apply_seeded_state_noise(self._sim.model, self._sim.data, seed, init_noise)
+        self._goal_xy = None
+
+    def step(self) -> None:
+        self.runtime.step()
+
+    def command_goal(self, xy, speed: float, radius: float) -> None:
+        self._goal_xy = np.asarray(xy, dtype=float)
+        _apply_goal(self._sim.controller, xy, speed, radius)
+
+    def submit_directive(self, text: str, xy) -> None:
+        self._goal_xy = np.asarray(xy, dtype=float)
+        self.runtime.submit_instruction(text)
+
+    def inject(self, fault: FaultSpec) -> None:
+        _inject(self._sim, self.runtime.viz, fault)
+
+    def close(self) -> None:
+        self.runtime.close()
+
+    @property
+    def sim(self) -> Simulation:
+        return self._sim
+
+    @property
+    def viz(self) -> FaultVizState:
+        return self.runtime.viz
 
 
 def build_baseline(spec, suite, log_path: Path | None = None) -> Baseline:
