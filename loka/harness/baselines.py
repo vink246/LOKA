@@ -246,6 +246,7 @@ class NavilaBaseline(Baseline):
             NavilaConfig,
             NavilaPolicy,
             NavilaRuntime,
+            apply_scratch_cache_defaults,
             require_navila_checkpoint,
             require_navila_gpu,
         )
@@ -258,6 +259,7 @@ class NavilaBaseline(Baseline):
             settings["model_path"] = options["model_path"]
         cfg = NavilaConfig.from_dict(settings)
         model_path = require_navila_checkpoint(cfg.model_path)
+        apply_scratch_cache_defaults()
         require_navila_gpu(cfg.device, cfg.min_free_gb, cfg.min_compute_capability)
         camera = cfg.camera.recipe()
         plant_kw = {

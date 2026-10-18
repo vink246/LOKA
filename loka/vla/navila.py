@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import queue
 import re
 import threading
@@ -34,6 +35,11 @@ FETCH_HINT = (
     "Download on PACE only: "
     "python scripts/fetch_navila_checkpoint.py --out ~/scratch/models/navila-llama3-8b-8f"
 )
+#: PACE scratch layout used when HF_HOME / XDG_CACHE_HOME are not exported.
+SCRATCH_CACHE_DEFAULTS = {
+    "HF_HOME": "~/scratch/huggingface",
+    "XDG_CACHE_HOME": "~/scratch/.cache",
+}
 
 _FORWARD_RE = re.compile(
     r"(?:move\s+)?forward\s+(\d+(?:\.\d+)?)\s*cm",
@@ -233,6 +239,20 @@ def require_navila_checkpoint(path: str | Path | None) -> Path:
             raise FileNotFoundError(
                 f"{resolved} has no weight files. {FETCH_HINT}"
             )
+    return resolved
+
+
+def apply_scratch_cache_defaults() -> dict[str, str]:
+    """Fill unset HF_HOME / XDG_CACHE_HOME from ``SCRATCH_CACHE_DEFAULTS``.
+
+    Hugging Face reads these when it is first imported, so call this before
+    importing torch, transformers, huggingface_hub or llava.
+    """
+    resolved = {}
+    for key, value in SCRATCH_CACHE_DEFAULTS.items():
+        if not os.environ.get(key):
+            os.environ[key] = str(Path(value).expanduser())
+        resolved[key] = os.environ[key]
     return resolved
 
 

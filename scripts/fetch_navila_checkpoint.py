@@ -6,6 +6,9 @@
 Do **not** run this on a laptop: the checkpoint is ~16 GB. After it finishes,
 pass the same path to ``run_loka --navila --navila-model <path>``.
 
+HF_HOME defaults to ``~/scratch/huggingface`` and XDG_CACHE_HOME to
+``~/scratch/.cache``. An exported value or ``--hf-home`` / ``--cache-dir`` wins.
+
 Requires ``huggingface_hub`` (installed by ``scripts/setup_navila_env.sh``).
 """
 
@@ -19,6 +22,8 @@ from pathlib import Path
 
 HUB_ID = "a8cheng/navila-llama3-8b-8f"
 MIN_FREE_GB = 20.0
+DEFAULT_HF_HOME = "~/scratch/huggingface"
+DEFAULT_CACHE_HOME = "~/scratch/.cache"
 
 
 def _free_gb(path: Path) -> float:
@@ -48,7 +53,21 @@ def main(argv: list[str] | None = None) -> int:
         default=MIN_FREE_GB,
         help=f"Refuse to download if free disk under --out is below this (default: {MIN_FREE_GB})",
     )
+    parser.add_argument(
+        "--hf-home",
+        default=os.environ.get("HF_HOME") or DEFAULT_HF_HOME,
+        help=f"HF_HOME for the download (default: $HF_HOME, else {DEFAULT_HF_HOME})",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=os.environ.get("XDG_CACHE_HOME") or DEFAULT_CACHE_HOME,
+        help=f"XDG_CACHE_HOME (default: $XDG_CACHE_HOME, else {DEFAULT_CACHE_HOME})",
+    )
     args = parser.parse_args(argv)
+    # huggingface_hub reads these at import time, so set them before importing it.
+    os.environ["HF_HOME"] = str(Path(args.hf_home).expanduser())
+    os.environ["XDG_CACHE_HOME"] = str(Path(args.cache_dir).expanduser())
+    print(f"HF_HOME={os.environ['HF_HOME']} XDG_CACHE_HOME={os.environ['XDG_CACHE_HOME']}")
 
     out = args.out.expanduser().resolve()
     free = _free_gb(out)
@@ -79,9 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # local_dir keeps weights out of the default Hub cache under $HOME.
     print(f"Downloading {args.repo_id} -> {out} ({free:.1f} GB free) …")
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "0")
     snapshot_download(
         repo_id=args.repo_id,
         local_dir=str(out),

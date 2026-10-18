@@ -5,9 +5,13 @@
 #   bash scripts/setup_navila_env.sh
 #   bash scripts/setup_navila_env.sh --prefix ~/scratch/envs/loka-navila
 #
+# Caches default to scratch so home quota is not filled. An exported value or
+# the flag wins:
+#   HF_HOME         ~/scratch/huggingface   (--hf-home)
+#   XDG_CACHE_HOME  ~/scratch/.cache        (--cache-dir; pip and conda packages go under it)
+#
 # Then:
 #   conda activate loka-navila   # or the --prefix path
-#   export HF_HOME=~/scratch/hf_cache
 #   python scripts/fetch_navila_checkpoint.py --out ~/scratch/models/navila-llama3-8b-8f
 #   python -m loka.run_loka --navila --navila-model ~/scratch/models/navila-llama3-8b-8f \
 #       --headless -T 60 --scene obstacle_course --record --operator "walk to the chair"
@@ -16,6 +20,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_NAME="${LOKA_NAVILA_ENV:-loka-navila}"
 PREFIX=""
+HF_HOME_DIR="${HF_HOME:-$HOME/scratch/huggingface}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/scratch/.cache}"
 NAVILA_DIR="${NAVILA_SRC:-$ROOT/third_party/NaVILA}"
 # Pin to a known NaVILA commit so flash-attn / transformers pins stay valid.
 NAVILA_REPO="${NAVILA_REPO:-https://github.com/AnjieCheng/NaVILA.git}"
@@ -27,8 +33,12 @@ while [[ $# -gt 0 ]]; do
     --prefix=*) PREFIX="${1#*=}"; shift ;;
     --navila-dir) NAVILA_DIR="$2"; shift 2 ;;
     --name) ENV_NAME="$2"; shift 2 ;;
+    --hf-home) HF_HOME_DIR="$2"; shift 2 ;;
+    --hf-home=*) HF_HOME_DIR="${1#*=}"; shift ;;
+    --cache-dir) CACHE_DIR="$2"; shift 2 ;;
+    --cache-dir=*) CACHE_DIR="${1#*=}"; shift ;;
     -h|--help)
-      sed -n '2,20p' "$0"
+      sed -n '2,17p' "$0"
       exit 0
       ;;
     *)
@@ -37,6 +47,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+export HF_HOME="$HF_HOME_DIR"
+export XDG_CACHE_HOME="$CACHE_DIR"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$CACHE_DIR/pip}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_DIR/conda/pkgs}"
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS"
+echo "HF_HOME=$HF_HOME"
+echo "XDG_CACHE_HOME=$XDG_CACHE_HOME (pip: $PIP_CACHE_DIR, conda pkgs: $CONDA_PKGS_DIRS)"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "conda is not on PATH" >&2
@@ -95,5 +113,4 @@ fi
 python -c "import torch, llava; print('navila env ok', torch.__version__, torch.cuda.is_available())"
 echo
 echo "Env ready. Next (on PACE):"
-echo "  export HF_HOME=\$HOME/scratch/hf_cache"
 echo "  python $ROOT/scripts/fetch_navila_checkpoint.py --out \$HOME/scratch/models/navila-llama3-8b-8f"

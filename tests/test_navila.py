@@ -19,6 +19,7 @@ from loka.vla.navila import (
     NavActionExecutor,
     NavilaConfig,
     NavilaRuntime,
+    apply_scratch_cache_defaults,
     build_prompt,
     parse_action,
     parse_script,
@@ -86,6 +87,14 @@ def test_require_checkpoint_refuses_hub_and_missing(tmp_path):
         require_navila_checkpoint(incomplete)
     (incomplete / "model.safetensors").write_bytes(b"x")
     assert require_navila_checkpoint(incomplete) == incomplete.resolve()
+
+
+def test_scratch_cache_defaults_fill_only_unset(monkeypatch):
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", "/custom/cache")
+    resolved = apply_scratch_cache_defaults()
+    assert resolved["HF_HOME"] == str(Path("~/scratch/huggingface").expanduser())
+    assert resolved["XDG_CACHE_HOME"] == "/custom/cache"
 
 
 def test_require_navila_gpu_messages():

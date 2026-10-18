@@ -573,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
             NavilaConfig,
             NavilaPolicy,
             NavilaRuntime,
+            apply_scratch_cache_defaults,
             parse_script,
             require_navila_checkpoint,
             require_navila_gpu,
@@ -589,6 +590,8 @@ def main(argv: list[str] | None = None) -> int:
             script_actions = parse_script(args.navila_script)
         else:
             path = require_navila_checkpoint(nav_cfg.model_path)
+            caches = apply_scratch_cache_defaults()
+            print(f"[navila] HF_HOME={caches['HF_HOME']} XDG_CACHE_HOME={caches['XDG_CACHE_HOME']}")
             require_navila_gpu(
                 nav_cfg.device, nav_cfg.min_free_gb, nav_cfg.min_compute_capability
             )
