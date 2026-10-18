@@ -22,6 +22,9 @@ Llama-3.2-11B-Vision-Instruct checkpoint instead of OpenAI. Its language model i
 Llama-3.1-8B, the same family and size as NaVILA's, and its 128K context holds
 LOKA's full prompt. Needs the ``loka-mllama`` env (``scripts/setup_mllama_env.sh``)
 on a GPU node; the repo is gated, see ``scripts/fetch_navila_checkpoint.py``.
+Both default to ``--prompt-style compact``: the same rules and reply schema in
+about 2-3K tokens a turn instead of ~20K. ``--prompt-style full`` sends the
+prompt LOKA is evaluated with.
 ``--orchestrator-vila PATH`` does the same with Llama-3-VILA1.5-8B (NaVILA's
 base model, ``loka-navila`` env), but VILA reads only 4,096 tokens, so it sees
 the start of the system prompt and nothing after it.
@@ -322,6 +325,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "base model) instead of OpenAI. Needs the loka-navila env on a GPU node",
     )
     parser.add_argument(
+        "--prompt-style",
+        choices=("full", "compact"),
+        default=None,
+        help="Orchestrator prompt. full is the evaluated LOKA prompt (~20K tokens a turn); "
+        "compact keeps the rules and reply schema in ~2-3K tokens. Default: compact with "
+        "--orchestrator-mllama / --orchestrator-vila, full otherwise",
+    )
+    parser.add_argument(
         "--orchestrator-device",
         type=str,
         default="cuda:0",
@@ -340,6 +351,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"{local[0]} replaces the LLM; drop --no-llm / --navila / --unitree-rl")
     if args.orchestrator_vila is not None and not args.orchestrator_device.startswith("cuda"):
         parser.error("--orchestrator-vila needs a cuda --orchestrator-device")
+    if args.prompt_style is None:
+        args.prompt_style = "compact" if local else "full"
     if args.vision and (args.no_llm or args.unitree_rl) and not args.navila:
         parser.error("--vision feeds the orchestrator; drop --no-llm / --unitree-rl")
     if args.ego_view and args.headless:
@@ -734,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
             LokaConfig(
                 enable_llm=llm_enabled,
                 llm_model=llm_model,
+                prompt_style=args.prompt_style,
                 enable_vision=vision,
                 vision=camera,
                 enable_session_log=not args.no_log,

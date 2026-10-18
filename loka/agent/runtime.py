@@ -29,7 +29,7 @@ from loka.agent.context import (
     default_stand_objective,
     format_stand_configuration,
 )
-from loka.agent.robot_context import build_robot_model_context
+from loka.agent.robot_context import build_compact_robot_context, build_robot_model_context
 from loka.agent.anomaly import (
     EffortDeviationObserver,
     belief_actuator_deviation,
@@ -38,7 +38,7 @@ from loka.agent.anomaly import (
 from loka.agent.belief_search import BeliefSearchRunner, parse_belief_searches
 from loka.agent.faults import FaultSpec, capture_nominal_params
 from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
-from loka.agent.llm import load_stand_system_prompt, stand_llm_worker
+from loka.agent.llm import PROMPT_STYLES, load_stand_system_prompt, stand_llm_worker
 from loka.agent.session_log import StandSessionLog, default_log_path
 from loka.scene_props import prop_contacts
 from loka.vision import EgoCameraSpec, EgoRenderer, camera_pose
@@ -77,6 +77,10 @@ class LokaConfig:
     llm_latency_mode: str = "wall"
     llm_latency_s: float = 2.0
     llm_request_timeout_s: float = 120.0
+    #: ``full`` is the prompt LOKA is evaluated with. ``compact`` keeps the same
+    #: rules and reply schema but drops the MJCF dump, the per-actuator effort
+    #: list, the state cost and the MPC costs, for small local models.
+    prompt_style: str = "full"
 
     def __post_init__(self) -> None:
         assert 0 <= self.max_memory <= self.max_turns, (
@@ -92,6 +96,8 @@ class LokaConfig:
             raise ValueError("llm_latency_s must be >= 0")
         if float(self.llm_request_timeout_s) < 0.0:
             raise ValueError("llm_request_timeout_s must be >= 0")
+        if self.prompt_style not in PROMPT_STYLES:
+            raise ValueError(f"prompt_style must be one of {PROMPT_STYLES}, got {self.prompt_style!r}")
     objective: str = field(default_factory=default_stand_objective)
     log_path: Path | None = None
     print_compressor: bool = True
@@ -131,16 +137,18 @@ class LokaRuntime:
             "listeners": [],
             "plan": None,
         }
-        self.robot_context = build_robot_model_context(
-            self.controller.robot.model,
-            str(self.controller.config.model_path),
-        )
+        self.compact = self.config.prompt_style == "compact"
+        if self.compact:
+            self.robot_context = build_compact_robot_context(self.controller.robot.model)
+        else:
+            self.robot_context = build_robot_model_context(
+                self.controller.robot.model,
+                str(self.controller.config.model_path),
+            )
         self.ego_renderer: EgoRenderer | None = None
         self.vision_block: str | None = None
         self._frame_count = 0
-        self.system_prompt = load_stand_system_prompt(
-            robot_context=self.robot_context, vision=self.vision_block
-        )
+        self._rebuild_prompt()
 
         self.recent_frames: deque = deque()
         self._last_edit_t = -1e9
@@ -425,13 +433,18 @@ class LokaRuntime:
 
     def _rebuild_prompt(self) -> None:
         self.system_prompt = load_stand_system_prompt(
-            robot_context=self.robot_context, vision=self.vision_block
+            robot_context=self.robot_context,
+            vision=self.vision_block,
+            style=self.config.prompt_style,
         )
+
+    def _config_text(self) -> str:
+        return format_stand_configuration(self.controller, compact=self.compact)
 
     # -- vision -------------------------------------------------------------
 
     def _start_vision(self) -> None:
-        from loka.agent.context import format_vision_block
+        from loka.agent.context import format_compact_vision_block, format_vision_block
         from loka.vision import floor_cell_size, nominal_camera_pose
 
         if not self.sim.has_camera:
@@ -440,7 +453,8 @@ class LokaRuntime:
                 "Simulation(camera=EgoCameraSpec().recipe())"
             )
         spec = self.config.vision
-        self.vision_block = format_vision_block(
+        block = format_compact_vision_block if self.compact else format_vision_block
+        self.vision_block = block(
             spec,
             nominal_camera_pose(self.sim.model),
             floor_cell_size(self.sim.model),
@@ -491,6 +505,7 @@ class LokaRuntime:
             window,
             control_dt=self.sim.config.control_dt,
             observer=self.effort_observer,
+            compact=self.compact,
         )
 
     def _consume_listeners(self, frame: dict) -> list:
@@ -601,11 +616,12 @@ class LokaRuntime:
             if result.get("image_error"):
                 self.log.note(f"camera frame: {result['image_error']}", sim_time=now)
         if timed_out or not result or not result.get("scratchpad"):
-            note = (
-                f"orchestrator timed out after {self.config.llm_request_timeout_s:.0f}s"
-                if timed_out
-                else "empty orchestrator result"
-            )
+            if timed_out:
+                note = f"orchestrator timed out after {self.config.llm_request_timeout_s:.0f}s"
+            elif result and result.get("parse_error"):
+                note = f"unparseable orchestrator reply ({result['parse_error']})"
+            else:
+                note = "empty orchestrator result"
             print(f"[LOKA] {note}; cooldown {self.config.cooldown_s:.1f}s")
             if self.log is not None:
                 self.log.note(note, sim_time=now)
@@ -854,7 +870,7 @@ class LokaRuntime:
                 if self.config.enable_llm:
                     self._rebuild_prompt()
                     telemetry = self._telemetry_for(frame)
-                    cfg_text = format_stand_configuration(self.controller)
+                    cfg_text = self._config_text()
                     user = self.operator_session.build_request_turn(
                         request,
                         telemetry,
@@ -869,7 +885,7 @@ class LokaRuntime:
             fired = self._consume_listeners(frame)
             if fired and self.config.enable_llm:
                 telemetry = self._telemetry_for(frame)
-                cfg_text = format_stand_configuration(self.controller)
+                cfg_text = self._config_text()
                 user = self.operator_session.build_listener_turn(
                     [item.message for item in fired],
                     telemetry,
@@ -921,7 +937,7 @@ class LokaRuntime:
                         self.log.note(note, sim_time=now)
             else:
                 telemetry = self._telemetry_for(frame)
-                cfg_text = format_stand_configuration(self.controller)
+                cfg_text = self._config_text()
                 if self.failure_episode.prior_turn_count == 0:
                     user = self.failure_episode.build_initial_user_turn(
                         telemetry,
@@ -1024,7 +1040,7 @@ class LokaRuntime:
         if not heartbeat_due(now, self._last_invoke_t, self.config.heartbeat_s):
             return
         telemetry = self._telemetry_for(frame)
-        cfg_text = format_stand_configuration(self.controller)
+        cfg_text = self._config_text()
         user = self.operator_session.build_heartbeat_turn(
             telemetry,
             self.loka_state,

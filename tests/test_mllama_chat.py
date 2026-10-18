@@ -123,11 +123,12 @@ def test_run_loka_orchestrator_mllama_end_to_end_with_a_stub_model(tmp_path, mon
 
         def chat(self, messages):
             calls.append(messages)
+            # The bold-markdown shape Llama 3.2 Vision produced on PACE.
             return (
-                "Semantic_State:\n"
-                '  Hypothesis: "walk to the chair"\n'
-                '  Analysis: "stub reply"\n'
-                "Task_Targets:\n"
+                "**Semantic_State**\n"
+                "  Hypothesis: walk to the chair\n"
+                "  Analysis: The chair: straight ahead, nothing in the way.\n"
+                "**Task_Targets:**\n"
                 "  gait.mode: walk\n"
                 "  gait.speed: 0.25\n"
                 "  gait.goal_x: 3.0\n"
@@ -156,6 +157,9 @@ def test_run_loka_orchestrator_mllama_end_to_end_with_a_stub_model(tmp_path, mon
     assert code == 0
     assert calls, "the orchestrator never reached the local backend"
     assert "walk to the chair" in str(calls[0])
+    # Local orchestrators default to the compact prompt.
+    system = calls[0][0]["content"] if calls[0][0]["role"] == "system" else ""
+    assert "MJCF kinematics" not in system and "no markdown" in system
 
 
 TINY = os.environ.get("LOKA_TINY_MLLAMA", "")

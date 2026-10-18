@@ -20,11 +20,38 @@ def default_stand_objective() -> str:
     )
 
 
-def format_stand_configuration(controller: LocomotionController) -> str:
-    """Live MPC costs and DCM gait knobs, current values only."""
+#: Gait targets the compact prompt shows; the rest stay at their schedule values.
+_COMPACT_GAIT_KEYS = (
+    "gait.mode",
+    "gait.speed",
+    "gait.heading",
+    "gait.goal_active",
+    "gait.goal_x",
+    "gait.goal_y",
+    "gait.goal_tolerance",
+    "gait.swing_height",
+)
+
+
+def format_stand_configuration(controller: LocomotionController, *, compact: bool = False) -> str:
+    """Live MPC costs and DCM gait knobs, current values only.
+
+    ``compact`` drops the MPC costs (the orchestrator does not retune them) and
+    keeps the navigation-relevant gait targets on one line.
+    """
     tasks = controller.task_snapshot()
-    weights = controller.tunables()
     from loka.control.gait import gait_mode_name
+
+    if compact:
+        bits = []
+        for key in _COMPACT_GAIT_KEYS:
+            if key not in tasks:
+                continue
+            value = float(tasks[key])
+            shown = gait_mode_name(value) if key == "gait.mode" else f"{value:.3g}"
+            bits.append(f"{key}={shown}")
+        return "## GAIT TARGETS\n  " + " ".join(bits)
+    weights = controller.tunables()
 
     lines = ["## CURRENT MPC TUNABLES"]
     mpc_paths = [path for path in sorted(weights) if path.startswith("mpc.")]
@@ -53,6 +80,34 @@ _PROP_CATALOGUE = (
     "cube: pale grey-blue block, 0.2 m; 0.3 kg, free (kicked aside by a step)",
     "shelf: light-wood bookshelf, 0.65 x 0.9 m footprint, 1.85 m tall; static (does not move)",
 )
+
+
+def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
+    """The camera facts a planner needs, without the derivations and prop catalogue."""
+    import math
+
+    h = float(nominal_pose.xyz[2])
+    p = spec.pitch_rad
+    horizon = spec.cy - spec.fy * math.tan(p)
+    ranges = []
+    for v in (int(math.ceil(horizon)) + 15, 256, spec.height - 1):
+        yn = (v - spec.cy) / spec.fy
+        denom = math.sin(p) + yn * math.cos(p)
+        if denom > 1e-6 and v < spec.height:
+            ranges.append(f"row {v}: {h * (math.cos(p) - yn * math.sin(p)) / denom:.1f} m")
+    floor = f" The floor is a checkerboard of {floor_cell:.2f} m squares." if floor_cell else ""
+    return "\n".join(
+        [
+            "## CAMERA",
+            f"One {spec.width}x{spec.height} RGB head-camera image per message, pitched "
+            f"{spec.pitch_down_deg:.0f} deg down, horizontal FOV {spec.fovx_deg:.0f} deg, "
+            f"about {h:.2f} m above the floor. The image's left is the robot's left. Horizon "
+            f"near row {horizon:.0f}; floor distance ahead by image row: {', '.join(ranges)}.{floor}",
+            "Props: chair 0.42 m seat; table 1.0 m square, 0.95 m tall; box 0.4 x 0.2 m; "
+            "cube 0.2 m; shelf 0.65 x 0.9 m, 1.85 m tall, static. Push only the cube or box. "
+            "The plant does not see obstacles: route around them with waypoints.",
+        ]
+    )
 
 
 def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:

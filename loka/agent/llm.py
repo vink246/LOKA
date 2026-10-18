@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from loka.agent.reply_parse import parse_orchestrator_reply
 from loka.agent.robot_context import format_primary_objective_block
 
 load_dotenv()
@@ -17,6 +17,9 @@ _client: OpenAI | None = None
 _chat_backend = None
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "system_prompt.txt"
+#: The same rules and reply schema in about a fifth of the tokens, for small local models.
+_COMPACT_PROMPT_PATH = _PROMPT_PATH.with_name("system_prompt_compact.txt")
+PROMPT_STYLES = ("full", "compact")
 
 
 def set_chat_backend(backend) -> None:
@@ -37,6 +40,9 @@ _VISION_LINE = (
     "message was sent, and a CAMERA FRAME section with the camera's world pose at "
     "that instant (see EGOCENTRIC CAMERA below)"
 )
+_COMPACT_VISION_LINE = (
+    "Each message also carries one head-camera image and its CAMERA FRAME pose (see CAMERA below)."
+)
 
 
 def load_stand_system_prompt(
@@ -44,15 +50,23 @@ def load_stand_system_prompt(
     robot_context: str | None = None,
     objective: str | None = None,
     vision: str | None = None,
+    style: str = "full",
 ) -> str:
-    """``vision`` is the EGOCENTRIC CAMERA block; None leaves the prompt text-only."""
-    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8").rstrip()
+    """``vision`` is the EGOCENTRIC CAMERA block; None leaves the prompt text-only.
+
+    ``style`` ``compact`` uses ``system_prompt_compact.txt``.
+    """
+    if style not in PROMPT_STYLES:
+        raise ValueError(f"prompt style must be one of {PROMPT_STYLES}, got {style!r}")
+    path = _COMPACT_PROMPT_PATH if style == "compact" else _PROMPT_PATH
+    system_prompt = path.read_text(encoding="utf-8").rstrip()
     plant = (
         "The robot is a Unitree G1 controlled by a centroidal convex MPC and a whole-body QP."
     )
     system_prompt = system_prompt.replace("{{PLANT}}", plant)
     if vision:
-        system_prompt = system_prompt.replace("{{VISION}}", _VISION_LINE)
+        line = _COMPACT_VISION_LINE if style == "compact" else _VISION_LINE
+        system_prompt = system_prompt.replace("{{VISION}}", line)
     else:
         system_prompt = system_prompt.replace("{{VISION}}\n", "").replace("{{VISION}}", "")
     blocks = [system_prompt]
@@ -114,9 +128,17 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> Non
                 # temperature=0.1,
             )
             yaml_text = response.choices[0].message.content or ""
-        yaml_text = yaml_text.replace("```yaml", "").replace("```", "").strip()
-        scratchpad = yaml.safe_load(yaml_text)
-        result_queue.put({"scratchpad": scratchpad, "raw_yaml": yaml_text, **image})
     except Exception as exc:
         print(f"\n[LLM Worker Error] {exc}")
         result_queue.put(None)
+        return
+    try:
+        scratchpad, cleaned, notes = parse_orchestrator_reply(yaml_text)
+    except ValueError as exc:
+        print(f"\n[LLM Worker Error] unparseable reply: {exc}\n--- reply ---\n{yaml_text[:1500]}\n---")
+        # Keep the raw text so the turn record and session log show what came back.
+        result_queue.put({"scratchpad": None, "raw_yaml": yaml_text, "parse_error": str(exc), **image})
+        return
+    if notes:
+        print(f"\n[LLM] reply repaired: {'; '.join(notes)}")
+    result_queue.put({"scratchpad": scratchpad, "raw_yaml": cleaned, "parse_notes": notes, **image})

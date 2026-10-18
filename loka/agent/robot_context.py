@@ -118,6 +118,24 @@ def format_current_model_belief(loka_state):
     return "\n".join(lines)
 
 
+def build_compact_robot_context(model) -> str:
+    """The names a search or mutation may target, without the kinematic tree or MJCF."""
+    bodies = [
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(1, model.nbody)
+    ]
+    actuators = [
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in range(model.nu)
+    ]
+    return "\n".join(
+        [
+            "ROBOT MODEL REFERENCE",
+            "Bodies (mass, com searches; default torso_link): " + ", ".join(b for b in bodies if b),
+            "Actuators (gear searches): " + ", ".join(a for a in actuators if a),
+            "Geom for friction searches: floor",
+        ]
+    )
+
+
 def build_robot_model_context(model, xml_path):
     """Build a static kinematic reference for the LLM orchestrator."""
     lines = [
