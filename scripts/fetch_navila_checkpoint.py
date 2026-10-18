@@ -6,6 +6,11 @@
 Do **not** run this on a laptop: the checkpoint is ~16 GB. After it finishes,
 pass the same path to ``run_loka --navila --navila-model <path>``.
 
+The same script fetches NaVILA's base model for ``run_loka --orchestrator-vila``:
+
+    python scripts/fetch_navila_checkpoint.py \\
+        --repo-id Efficient-Large-Model/Llama-3-VILA1.5-8B --out ~/scratch/models/llama-3-vila1.5-8b
+
 HF_HOME defaults to ``~/scratch/huggingface`` and XDG_CACHE_HOME to
 ``~/scratch/.cache``. An exported value or ``--hf-home`` / ``--cache-dir`` wins.
 
@@ -104,7 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         local_dir=str(out),
         local_dir_use_symlinks=False,
     )
-    print(f"Done. Use:\n  python -m loka.run_loka --navila --navila-model {out} …")
+    print(
+        f"Done: {out}\n  NaVILA:            run_loka --navila --navila-model {out} …\n"
+        f"  VILA orchestrator: run_loka --orchestrator-vila {out} …"
+    )
     return 0
 
 

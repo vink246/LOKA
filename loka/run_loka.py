@@ -17,6 +17,11 @@
 
 ``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``),
 except with ``--navila`` where it is the navigation instruction.
+``--orchestrator-vila PATH`` runs the orchestrator on a local
+Llama-3-VILA1.5-8B checkpoint (the model NaVILA was fine-tuned from) instead of
+OpenAI, so LOKA and the NaVILA baseline share a model family. Same env and GPU
+needs as ``--navila``; fetch it on PACE with ``scripts/fetch_navila_checkpoint.py
+--repo-id Efficient-Large-Model/Llama-3-VILA1.5-8B --out <dir>``.
 ``--vision`` attaches a 512x512 head-camera frame to every orchestrator turn
 (settings in ``loka/config/loka.yaml`` under ``vision``). The scene carries a
 pool of HumanoidBench props (chair, table, box, cube, shelf) parked off-scene;
@@ -297,8 +302,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="ACTIONS",
         help='Replay mid-level actions with no GPU, e.g. "move forward 100 cm; turn left 30 degrees; stop"',
     )
+    parser.add_argument(
+        "--orchestrator-vila",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Run LOKA's orchestrator on a local Llama-3-VILA1.5-8B checkpoint (NaVILA's "
+        "base model) instead of OpenAI. Needs the loka-navila env on a GPU node",
+    )
+    parser.add_argument(
+        "--orchestrator-device",
+        type=str,
+        default="cuda:0",
+        help="CUDA device for --orchestrator-vila (default: cuda:0)",
+    )
     add_stack_argument(parser)
     args = parser.parse_args(argv)
+    if args.orchestrator_vila is not None and (args.no_llm or args.navila or args.unitree_rl):
+        parser.error("--orchestrator-vila replaces the LLM; drop --no-llm / --navila / --unitree-rl")
     if args.vision and (args.no_llm or args.unitree_rl) and not args.navila:
         parser.error("--vision feeds the orchestrator; drop --no-llm / --unitree-rl")
     if args.ego_view and args.headless:
@@ -625,6 +646,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         runtime = _PlantRuntime(sim, build_faults(args))
     else:
+        llm_model = None
+        if args.orchestrator_vila is not None:
+            from loka.agent.llm import set_chat_backend
+            from loka.vla.navila import (
+                apply_scratch_cache_defaults,
+                prefer_egl_rendering,
+                require_navila_checkpoint,
+                require_navila_gpu,
+            )
+
+            from loka.vla.vila_chat import VILA_FETCH_HINT, VilaChatBackend
+
+            vila_path = require_navila_checkpoint(
+                args.orchestrator_vila, name="VILA", hint=VILA_FETCH_HINT
+            )
+            caches = apply_scratch_cache_defaults()
+            print(f"[vila] HF_HOME={caches['HF_HOME']} XDG_CACHE_HOME={caches['XDG_CACHE_HOME']}")
+            require_navila_gpu(args.orchestrator_device)
+            print(f"[vila] MUJOCO_GL={prefer_egl_rendering()} for the ego camera and recording")
+
+            backend = VilaChatBackend(vila_path, device=args.orchestrator_device)
+            set_chat_backend(backend)
+            llm_model = backend.label
+            print(f"[vila] orchestrator: {llm_model} on {args.orchestrator_device}")
         sim = Simulation(config, model_path=args.model, **plant)
         log_path = None
         if not args.no_log:
@@ -633,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
             sim,
             LokaConfig(
                 enable_llm=llm_enabled,
+                llm_model=llm_model,
                 enable_vision=vision,
                 vision=camera,
                 enable_session_log=not args.no_log,

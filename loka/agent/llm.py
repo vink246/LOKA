@@ -12,9 +12,24 @@ from openai import OpenAI
 from loka.agent.robot_context import format_primary_objective_block
 
 load_dotenv()
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+_client: OpenAI | None = None
+#: A local backend with ``chat(messages) -> str`` replaces the OpenAI call.
+_chat_backend = None
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "system_prompt.txt"
+
+
+def set_chat_backend(backend) -> None:
+    """Route orchestrator turns to ``backend.chat`` (None restores OpenAI)."""
+    global _chat_backend
+    _chat_backend = backend
+
+
+def _openai_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _client
 
 
 _VISION_LINE = (
@@ -77,23 +92,28 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> Non
     """Background thread: never call from the control loop.
 
     ``model`` overrides the ``LOKA_STAND_MODEL`` environment variable. When
-    both are unset the worker uses ``gpt-5.4-mini``. ``vision`` holds
-    ``render`` (snapshot -> PNG), the dispatch ``snapshot``, ``detail``, and an
-    optional ``frame_path``; the frame is rendered here, off the control loop.
+    both are unset the worker uses ``gpt-6-luna``. A backend set with
+    :func:`set_chat_backend` takes the turn instead and ignores ``model``.
+    ``vision`` holds ``render`` (snapshot -> PNG), the dispatch ``snapshot``,
+    ``detail``, and an optional ``frame_path``; the frame is rendered here, off
+    the control loop.
     """
     image = {}
     try:
         if vision is not None:
             image = _attach_camera_frame(api_messages, vision)
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY is not set")
-        chosen = model or os.environ.get("LOKA_STAND_MODEL", "gpt-6-luna")
-        response = client.chat.completions.create(
-            model=chosen,
-            messages=api_messages,
-            # temperature=0.1,
-        )
-        yaml_text = response.choices[0].message.content or ""
+        if _chat_backend is not None:
+            yaml_text = _chat_backend.chat(api_messages)
+        else:
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError("OPENAI_API_KEY is not set")
+            chosen = model or os.environ.get("LOKA_STAND_MODEL", "gpt-6-luna")
+            response = _openai_client().chat.completions.create(
+                model=chosen,
+                messages=api_messages,
+                # temperature=0.1,
+            )
+            yaml_text = response.choices[0].message.content or ""
         yaml_text = yaml_text.replace("```yaml", "").replace("```", "").strip()
         scratchpad = yaml.safe_load(yaml_text)
         result_queue.put({"scratchpad": scratchpad, "raw_yaml": yaml_text, **image})

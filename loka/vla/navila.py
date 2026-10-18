@@ -206,12 +206,12 @@ def build_prompt(instruction: str, num_frames: int = 8) -> str:
     )
 
 
-def require_navila_checkpoint(path: str | Path | None) -> Path:
-    """Refuse Hub ids and missing dirs. Never triggers a download."""
+def require_navila_checkpoint(
+    path: str | Path | None, *, name: str = "NaVILA", hint: str = FETCH_HINT
+) -> Path:
+    """Refuse Hub ids and missing dirs for a VILA-family checkpoint. Never downloads."""
     if path is None or str(path).strip() == "":
-        raise FileNotFoundError(
-            f"navila.model_path / --navila-model is empty. {FETCH_HINT}"
-        )
+        raise FileNotFoundError(f"{name} checkpoint path is empty. {hint}")
     text = str(path).strip()
     if "/" in text and not Path(text).expanduser().exists() and not text.startswith(
         (".", "/", "~")
@@ -219,26 +219,22 @@ def require_navila_checkpoint(path: str | Path | None) -> Path:
         # Looks like an org/name Hub id rather than a filesystem path.
         if re.fullmatch(r"[\w.-]+/[\w.-]+", text):
             raise FileNotFoundError(
-                f"Refusing Hugging Face id {text!r}; pass a local directory. {FETCH_HINT}"
+                f"Refusing Hugging Face id {text!r}; pass a local directory. {hint}"
             )
     resolved = Path(text).expanduser().resolve()
     if not resolved.is_dir():
-        raise FileNotFoundError(
-            f"NaVILA checkpoint not found at {resolved}. {FETCH_HINT}"
-        )
+        raise FileNotFoundError(f"{name} checkpoint not found at {resolved}. {hint}")
     # Lightweight completeness check: config + at least one weight shard.
     config = resolved / "config.json"
     if not config.is_file():
         raise FileNotFoundError(
-            f"{resolved} has no config.json (incomplete download?). {FETCH_HINT}"
+            f"{resolved} has no config.json (incomplete download?). {hint}"
         )
     weights = list(resolved.glob("*.safetensors")) + list(resolved.glob("*.bin"))
     if not weights:
-        # Some layouts nest weights; accept a non-empty tree with index files.
+        # VILA checkpoints keep the weights in llm/, vision_tower/ and mm_projector/.
         if not any(resolved.rglob("*.safetensors")) and not any(resolved.rglob("*.bin")):
-            raise FileNotFoundError(
-                f"{resolved} has no weight files. {FETCH_HINT}"
-            )
+            raise FileNotFoundError(f"{resolved} has no weight files. {hint}")
     return resolved
 
 
@@ -320,6 +316,26 @@ def require_navila_gpu(
     return props.name
 
 
+def load_vila_checkpoint(model_path: Path, device: str):
+    """Load a VILA-family checkpoint (NaVILA, VILA1.5) onto one GPU.
+
+    Returns ``(tokenizer, model, image_processor, context_len)``.
+    """
+    from llava.mm_utils import get_model_name_from_path
+    from llava.model.builder import load_pretrained_model
+
+    # The builder branches on the name (lora / mpt / mistral / gemma), so it
+    # must be the checkpoint directory name, as in NaVILA-Bench vlm_server.py.
+    model_name = get_model_name_from_path(str(model_path))
+    # A device other than "cuda" maps every module onto that one GPU.
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        str(model_path), model_name, None, device=device
+    )
+    model = model.to(device)
+    model.eval()
+    return tokenizer, model, image_processor, context_len
+
+
 class NavilaPolicy:
     """Local-checkpoint NaVILA wrapper. Imports torch/llava only on construction."""
 
@@ -339,18 +355,10 @@ class NavilaPolicy:
 
     def _load(self) -> None:
         import torch
-        from llava.mm_utils import get_model_name_from_path
-        from llava.model.builder import load_pretrained_model
 
-        # The builder branches on the name (lora / mpt / mistral / gemma), so it
-        # must be the checkpoint directory name, as in NaVILA-Bench vlm_server.py.
-        model_name = get_model_name_from_path(str(self.model_path))
-        # A device other than "cuda" maps every module onto that one GPU.
-        self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
-            str(self.model_path), model_name, None, device=self.device
+        self.tokenizer, self.model, self.image_processor, self.context_len = load_vila_checkpoint(
+            self.model_path, self.device
         )
-        self.model = self.model.to(self.device)
-        self.model.eval()
         self._torch = torch
 
     def generate(self, frames: list[np.ndarray], instruction: str) -> str:
