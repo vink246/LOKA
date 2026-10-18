@@ -119,6 +119,36 @@ def test_require_navila_gpu_messages():
             require_navila_gpu()
 
 
+def test_policy_load_passes_model_name_not_base(tmp_path):
+    from loka.vla.navila import NavilaPolicy
+
+    ckpt = tmp_path / "navila-llama3-8b-8f"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text("{}", encoding="utf-8")
+    (ckpt / "model.safetensors").write_bytes(b"x")
+
+    model = mock.MagicMock()
+    model.to.return_value = model
+    builder = mock.MagicMock()
+    builder.load_pretrained_model.return_value = ("tok", model, "proc", 4096)
+    mm_utils = mock.MagicMock()
+    mm_utils.get_model_name_from_path.side_effect = lambda p: Path(p).name
+    modules = {
+        "torch": mock.MagicMock(),
+        "llava": mock.MagicMock(),
+        "llava.mm_utils": mm_utils,
+        "llava.model": mock.MagicMock(),
+        "llava.model.builder": builder,
+    }
+    with mock.patch.dict(sys.modules, modules):
+        policy = NavilaPolicy(ckpt, device="cuda:0")
+    builder.load_pretrained_model.assert_called_once_with(
+        str(ckpt.resolve()), "navila-llama3-8b-8f", None, device="cuda:0"
+    )
+    model.to.assert_called_once_with("cuda:0")
+    assert policy.tokenizer == "tok" and policy.image_processor == "proc"
+
+
 def test_script_mode_never_imports_torch():
     """Building a script runtime must not pull torch into sys.modules."""
     before = "torch" in sys.modules

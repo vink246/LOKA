@@ -329,25 +329,17 @@ class NavilaPolicy:
 
     def _load(self) -> None:
         import torch
+        from llava.mm_utils import get_model_name_from_path
         from llava.model.builder import load_pretrained_model
 
-        # local_files_only prevents a silent Hub pull if files are missing.
-        kwargs: dict[str, Any] = {"device_map": self.device}
-        try:
-            result = load_pretrained_model(
-                str(self.model_path),
-                None,
-                "llava_llama",
-                **kwargs,
-            )
-        except TypeError:
-            # Older builder signatures omit model_name / device_map variants.
-            result = load_pretrained_model(str(self.model_path), None, "llava_llama")
-        if len(result) == 4:
-            self.tokenizer, self.model, self.image_processor, self.context_len = result
-        else:
-            self.tokenizer, self.model, self.image_processor = result[:3]
-            self.context_len = getattr(self.model.config, "max_sequence_length", 2048)
+        # The builder branches on the name (lora / mpt / mistral / gemma), so it
+        # must be the checkpoint directory name, as in NaVILA-Bench vlm_server.py.
+        model_name = get_model_name_from_path(str(self.model_path))
+        # A device other than "cuda" maps every module onto that one GPU.
+        self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+            str(self.model_path), model_name, None, device=self.device
+        )
+        self.model = self.model.to(self.device)
         self.model.eval()
         self._torch = torch
 
