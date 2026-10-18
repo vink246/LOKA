@@ -81,7 +81,8 @@ class NavilaConfig:
     max_new_tokens: int = 32
     forward_speed: float = 0.25
     turn_tolerance_deg: float = 5.0
-    goal_tolerance: float = 0.12
+    stop_lead: float = 0.10
+    turn_decel: float = 0.10
     timeout_factor: float = 3.0
     max_actions: int = 40
     unparseable_fallback: str = "stop"
@@ -407,15 +408,29 @@ class _ActiveAction:
     action: NavAction
     start_xy: np.ndarray
     start_yaw: float
-    target_xy: np.ndarray | None
     target_yaw: float | None
     deadline: float
     start_sim: float
     kind: str
+    #: Forward only: unit travel axis and the progress along it that ends the action.
+    axis: np.ndarray | None = None
+    stop_at: float = 0.0
+    #: Turns only: commanded speed ramping from ``start_speed`` down to ``speed_floor``.
+    start_speed: float = 0.0
+    speed: float = 0.0
+    speed_floor: float = 0.0
 
 
 class NavActionExecutor:
-    """Closed-loop mid-level actions on any controller with ``set_task_targets``."""
+    """Closed-loop mid-level actions on any controller with ``set_task_targets``.
+
+    ``move forward`` walks with the heading locked to the yaw at the start and
+    stands once progress along that axis reaches the distance minus
+    ``stop_lead`` (the stopping step covers the rest). Turns set the new
+    heading and ramp ``gait.speed`` down at ``turn_decel`` from whatever speed
+    the plant had, to zero on the MPC plant and to ``MIN_WALK_SPEED`` on
+    unitree_rl, whose policy only yaws while walking.
+    """
 
     def __init__(
         self,
@@ -424,14 +439,16 @@ class NavActionExecutor:
         plant: str = "mpc",
         forward_speed: float = 0.25,
         turn_tolerance_deg: float = 5.0,
-        goal_tolerance: float = 0.12,
+        stop_lead: float = 0.10,
+        turn_decel: float = 0.10,
         timeout_factor: float = 3.0,
     ) -> None:
         self.controller = controller
         self.plant = plant
         self.forward_speed = float(forward_speed)
         self.turn_tol = math.radians(float(turn_tolerance_deg))
-        self.goal_tol = float(goal_tolerance)
+        self.stop_lead = max(0.0, float(stop_lead))
+        self.turn_decel = max(1e-3, float(turn_decel))
         self.timeout_factor = float(timeout_factor)
         self.active: _ActiveAction | None = None
         self.last_outcome: dict | None = None
@@ -443,6 +460,13 @@ class NavActionExecutor:
 
     def _cruise(self) -> float:
         return float(np.clip(self.forward_speed, 0.05, self._speed_cap()))
+
+    def _current_speed(self) -> float:
+        """Linear speed the plant is commanding right now [m/s]."""
+        if isinstance(self.controller, UnitreeRLController):
+            return float(np.linalg.norm(self.controller.commander.command[:2]))
+        gait = getattr(self.controller, "gait", None)
+        return float(getattr(gait, "cmd_speed", 0.0))
 
     def clear(self) -> None:
         self.active = None
@@ -467,28 +491,26 @@ class NavActionExecutor:
 
         if action.kind == "forward":
             dist = float(action.value) / 100.0
-            target = xy + dist * np.array([math.cos(yaw), math.sin(yaw)])
             cruise = self._cruise()
             nominal = max(dist / max(cruise, 1e-3), 1.0)
             self.controller.set_task_targets(
                 {
                     "gait.mode": "walk",
                     "gait.speed": cruise,
-                    "gait.goal_x": float(target[0]),
-                    "gait.goal_y": float(target[1]),
-                    "gait.goal_tolerance": self.goal_tol,
-                    "gait.goal_active": 1.0,
+                    "gait.heading": float(yaw),
+                    "gait.goal_active": 0.0,
                 }
             )
             self.active = _ActiveAction(
                 action=action,
                 start_xy=xy.copy(),
                 start_yaw=yaw,
-                target_xy=target,
                 target_yaw=None,
                 deadline=float(sim_time) + self.timeout_factor * nominal,
                 start_sim=float(sim_time),
                 kind="forward",
+                axis=np.array([math.cos(yaw), math.sin(yaw)]),
+                stop_at=max(0.0, dist - self.stop_lead),
             )
             return {"action": action.describe(), "kind": "forward", "status": "started"}
 
@@ -498,44 +520,46 @@ class NavActionExecutor:
         target_yaw = wrap_angle(yaw + delta)
         abs_delta = abs(delta)
         if self.plant == "unitree_rl":
-            # Arc: walk at min speed while yaw tracks the target heading.
-            cruise = max(MIN_WALK_SPEED, self._cruise() * 0.5)
+            floor = MIN_WALK_SPEED
             yaw_rate = 0.2  # unitree_rl v0 ang_vel_z cap
-            nominal = max(abs_delta / yaw_rate, 1.0)
-            self.controller.set_task_targets(
-                {
-                    "gait.mode": "walk",
-                    "gait.speed": cruise,
-                    "gait.heading": float(target_yaw),
-                    "gait.goal_active": 0.0,
-                    "gait.goal_heading": float(target_yaw),
-                }
-            )
             kind = "turn_arc"
         else:
-            # In-place crawl toward the new heading.
-            turn_rate = 0.4
-            nominal = max(abs_delta / turn_rate, 1.0)
-            self.controller.set_task_targets(
-                {
-                    "gait.mode": "walk",
-                    "gait.speed": 0.0,
-                    "gait.heading": float(target_yaw),
-                    "gait.goal_active": 0.0,
-                }
-            )
+            floor = 0.0
+            yaw_rate = 0.4
             kind = "turn_inplace"
+        speed = max(self._current_speed(), floor)
+        nominal = max(abs_delta / yaw_rate, 1.0) + (speed - floor) / self.turn_decel
+        self.controller.set_task_targets(
+            {
+                "gait.mode": "walk",
+                "gait.speed": speed,
+                "gait.heading": float(target_yaw),
+                "gait.goal_active": 0.0,
+            }
+        )
         self.active = _ActiveAction(
             action=action,
             start_xy=xy.copy(),
             start_yaw=yaw,
-            target_xy=None,
             target_yaw=target_yaw,
             deadline=float(sim_time) + self.timeout_factor * nominal,
             start_sim=float(sim_time),
             kind=kind,
+            start_speed=speed,
+            speed=speed,
+            speed_floor=floor,
         )
         return {"action": action.describe(), "kind": kind, "status": "started"}
+
+    def _ramp_turn_speed(self, act: _ActiveAction, sim_time: float) -> None:
+        if act.speed <= act.speed_floor:
+            return
+        elapsed = max(0.0, float(sim_time) - act.start_sim)
+        speed = max(act.speed_floor, act.start_speed - self.turn_decel * elapsed)
+        # Re-send every ~5 mm/s, and always on reaching the floor.
+        if act.speed - speed >= 0.005 or speed <= act.speed_floor:
+            self.controller.set_task_targets({"gait.speed": speed})
+            act.speed = speed
 
     def poll(self, qpos: np.ndarray, sim_time: float) -> dict | None:
         """Return an outcome dict once when the active action finishes; else None."""
@@ -546,15 +570,14 @@ class NavActionExecutor:
         yaw = yaw_of(qpos[3:7])
         done = False
         status = "done"
-        if act.kind == "forward" and act.target_xy is not None:
-            gait = getattr(self.controller, "gait", None)
-            arrived = bool(getattr(gait, "goal_arrived", False))
-            rem = float(np.linalg.norm(act.target_xy - xy))
-            if arrived or rem <= self.goal_tol:
+        if act.kind == "forward" and act.axis is not None:
+            if float(np.dot(xy - act.start_xy, act.axis)) >= act.stop_at:
                 done = True
         elif act.target_yaw is not None:
             if abs(wrap_angle(act.target_yaw - yaw)) <= self.turn_tol:
                 done = True
+            else:
+                self._ramp_turn_speed(act, sim_time)
         if not done and float(sim_time) >= act.deadline:
             done = True
             status = "timeout"
@@ -613,7 +636,8 @@ class NavilaRuntime:
             plant=plant,
             forward_speed=self.config.forward_speed,
             turn_tolerance_deg=self.config.turn_tolerance_deg,
-            goal_tolerance=self.config.goal_tolerance,
+            stop_lead=self.config.stop_lead,
+            turn_decel=self.config.turn_decel,
             timeout_factor=self.config.timeout_factor,
         )
         self.instruction: str | None = None

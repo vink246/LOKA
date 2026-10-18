@@ -107,7 +107,12 @@ navila:
   max_new_tokens: 32
   forward_speed: 0.25
   turn_tolerance_deg: 5.0
-  goal_tolerance: 0.12
+  # move forward: heading locked to the start yaw; stand this far [m] short of
+  # the distance so the stopping step lands near it.
+  stop_lead: 0.10
+  # Turns ramp gait.speed down at this rate [m/s^2] (to 0 on MPC, to the
+  # policy's min walk speed on unitree_rl).
+  turn_decel: 0.10
   timeout_factor: 3.0
   max_actions: 40
   unparseable_fallback: stop

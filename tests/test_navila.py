@@ -184,23 +184,62 @@ def _pelvis_yaw(sim) -> float:
     return yaw_of(sim.robot_qpos[3:7])
 
 
-@pytest.mark.slow
-def test_executor_forward_mpc():
-    sim = Simulation(LocomotionConfig(), props=None, camera=None)
-    sim.reset()
-    ex = NavActionExecutor(sim.controller, plant="mpc", forward_speed=0.25, goal_tolerance=0.15)
-    start = sim.robot_qpos[:2].copy()
-    ex.start(NavAction("forward", 50.0), sim.robot_qpos, float(sim.data.time))
-    done = None
-    for _ in range(int(20.0 / sim.config.control_dt)):
+def _run_until_done(sim, ex, seconds: float):
+    for _ in range(int(seconds / sim.config.control_dt)):
         sim.step()
         done = ex.poll(sim.robot_qpos, float(sim.data.time))
         if done is not None:
+            return done
+    return None
+
+
+@pytest.mark.slow
+def test_executor_forward_mpc_holds_heading():
+    sim = Simulation(LocomotionConfig(), props=None, camera=None)
+    sim.reset()
+    ex = NavActionExecutor(sim.controller, plant="mpc", forward_speed=0.25)
+    yaw0 = _pelvis_yaw(sim)
+    start = sim.robot_qpos[:2].copy()
+    axis = np.array([math.cos(yaw0), math.sin(yaw0)])
+    for _ in range(2):
+        locked = _pelvis_yaw(sim)
+        ex.start(NavAction("forward", 75.0), sim.robot_qpos, float(sim.data.time))
+        done = _run_until_done(sim, ex, 20.0)
+        assert done is not None and done["status"] == "done"
+        assert sim.controller.gait.config.heading == pytest.approx(locked, abs=1e-6)
+        for _ in range(int(1.0 / sim.config.control_dt)):
+            sim.step()
+    progress = float(np.dot(sim.robot_qpos[:2] - start, axis))
+    assert 1.3 < progress < 1.75
+    assert abs(math.degrees(_pelvis_yaw(sim) - yaw0)) < 8.0
+    assert not sim.fell
+
+
+@pytest.mark.slow
+def test_executor_turn_mpc_ramps_speed_from_walk():
+    sim = Simulation(LocomotionConfig(), props=None, camera=None)
+    sim.reset()
+    ex = NavActionExecutor(sim.controller, plant="mpc", forward_speed=0.25, turn_decel=0.1)
+    ex.start(NavAction("forward", 200.0), sim.robot_qpos, float(sim.data.time))
+    for _ in range(int(3.0 / sim.config.control_dt)):
+        sim.step()
+        assert ex.poll(sim.robot_qpos, float(sim.data.time)) is None
+    walking = sim.controller.gait.cmd_speed
+    assert walking > 0.15
+    ex.start(NavAction("turn_left", 30.0), sim.robot_qpos, float(sim.data.time))
+    assert ex.active.start_speed == pytest.approx(walking)
+    t0 = float(sim.data.time)
+    sim.step()
+    ex.poll(sim.robot_qpos, float(sim.data.time))
+    for _ in range(int(1.0 / sim.config.control_dt)):
+        sim.step()
+        if ex.poll(sim.robot_qpos, float(sim.data.time)) is not None:
             break
-    assert done is not None
-    assert done["status"] in ("done", "timeout")
-    dist = float(np.linalg.norm(sim.robot_qpos[:2] - start))
-    assert dist > 0.25
+    if ex.active is not None:
+        expected = max(0.0, walking - 0.1 * (float(sim.data.time) - t0))
+        assert sim.controller.gait.config.speed == pytest.approx(expected, abs=0.01)
+    done = ex.active is None or _run_until_done(sim, ex, 25.0) is not None
+    assert done
     assert not sim.fell
 
 
@@ -279,7 +318,6 @@ def test_runtime_async_stub_policy_advances_sim():
         max_actions=10,
         log_dir=log_dir,
         save_frames=False,
-        goal_tolerance=0.18,
         timeout_factor=4.0,
     )
     runtime = NavilaRuntime(
