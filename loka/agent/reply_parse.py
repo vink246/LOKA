@@ -116,6 +116,130 @@ def _keep_yaml_lines(lines: list[str]) -> tuple[list[str], bool]:
     return kept, dropped
 
 
+#: Fields of a list item (a listener or a search) that may lose their indent.
+_LIST_ITEM_FIELDS = frozenset(
+    {"kind", "name", "axis", "x", "y", "z", "radius", "tol", "speed", "delay", "message", "when"}
+)
+
+
+def _renest_flat_sections(lines: list[str]) -> tuple[list[str], bool]:
+    """Indent a section whose body lost its indentation.
+
+    ``Semantic_State:`` followed by ``Hypothesis: ...`` at column 0 loads as
+    ``Semantic_State: null`` plus a stray top-level ``Hypothesis``. A section is
+    flattened when its header has no value and its first body line starts at
+    column 0; its body is then shifted right until the next section. In a list
+    section, a column-0 key that is not a list-item field ends the section.
+    """
+    out: list[str] = []
+    changed = False
+    header: str | None = None  # waiting for the first body line of this section
+    mode: str | None = None  # "map" or "list" while shifting a flattened body
+    for line in lines:
+        stripped = line.strip()
+        col0 = bool(line) and not line[:1].isspace()
+        key = line.split(":", 1)[0] if ":" in line else ""
+        if col0 and ":" in line and _canonical_top_key(key):
+            header = key if not line.split(":", 1)[1].strip() else None
+            mode = None
+            out.append(line)
+            continue
+        if not stripped:
+            out.append(line)
+            continue
+        if header is not None:
+            header = None
+            if col0:
+                mode = "list" if stripped.startswith("- ") else "map"
+        if mode is None:
+            out.append(line)
+            continue
+        if mode == "list" and col0 and not stripped.startswith("- "):
+            field = key.strip().lower()
+            if field in _LIST_ITEM_FIELDS:
+                out.append("    " + line)
+                changed = True
+                continue
+            mode = None
+            out.append(line)
+            continue
+        out.append("  " + line)
+        changed = True
+    return out, changed
+
+
+#: Where a stray top-level field belongs when its section came back empty.
+_STRAY_FIELDS = {
+    "Semantic_State": ("hypothesis", "analysis", "hypotheses"),
+    "Plan": ("goal", "rationale", "steps", "current_step", "notes"),
+}
+_TARGET_PREFIXES = ("gait.", "mpc.")
+_TARGET_FIELDS = frozenset({"height", "lean_x", "lean_y", "yaw", "com_offset_x", "com_offset_y"})
+
+
+def _home_section(field: str) -> str | None:
+    """The section a field belongs in, for the fields that only live in one."""
+    name = str(field)
+    if name.startswith(_TARGET_PREFIXES) or name in _TARGET_FIELDS:
+        return "Task_Targets"
+    for section, fields in _STRAY_FIELDS.items():
+        if name.lower() in fields:
+            return section
+    return None
+
+
+def _sanitize(pad: dict) -> tuple[dict, list[str]]:
+    """Make each known section the type the runtime expects; salvage stray fields.
+
+    A field found at the top level, or inside the wrong one of Semantic_State,
+    Task_Targets and Plan, is moved into its own section.
+    """
+    notes: list[str] = []
+    moved: dict[str, dict] = {}
+    for key in list(pad):
+        home = _home_section(key)
+        if home is not None:
+            moved.setdefault(home, {})[key] = pad.pop(key)
+    for section in _STRAY_FIELDS.keys() | {"Task_Targets"}:
+        body = pad.get(section)
+        if not isinstance(body, dict):
+            continue
+        for key in list(body):
+            home = _home_section(key)
+            if home is not None and home != section:
+                moved.setdefault(home, {})[key] = body.pop(key)
+    for section, fields in moved.items():
+        if not isinstance(pad.get(section), dict):
+            pad[section] = {}
+        for key, value in fields.items():
+            name = key if section == "Task_Targets" else key[:1].upper() + key[1:]
+            pad[section].setdefault(name, value)
+    if moved:
+        notes.append("stray fields moved back into their sections")
+    for section in list(_STRAY_FIELDS) + ["Task_Targets"]:
+        if pad.get(section) == {} and section != "Semantic_State":
+            pad[section] = None
+    empty = [k for k in TOP_LEVEL_KEYS if k in pad and pad[k] is None]
+    for k in empty:
+        del pad[k]
+    if empty:
+        notes.append(f"empty sections dropped: {', '.join(empty)}")
+    sem = pad.get("Semantic_State")
+    if sem is not None and not isinstance(sem, dict):
+        pad["Semantic_State"] = {"Hypothesis": str(sem)}
+        notes.append("Semantic_State coerced to a mapping")
+    elif sem is None and any(k in pad for k in TOP_LEVEL_KEYS):
+        # The runtime refuses a reply without it; keep the targets the model did send.
+        pad["Semantic_State"] = {}
+        notes.append("missing Semantic_State added")
+    for section in ("Task_Targets", "Plan"):
+        value = pad.get(section)
+        if value is not None and not isinstance(value, dict) and not (section == "Plan" and isinstance(value, str)):
+            del pad[section]
+            notes.append(f"{section} dropped: not a mapping")
+    return pad, notes
+
+
 def _quote_unsafe_values(lines: list[str]) -> tuple[list[str], bool]:
     """Quote ``key: value`` scalars YAML would misread (colons, #, leading * & ! % @ `)."""
     out, changed = [], False
@@ -177,6 +301,9 @@ def parse_orchestrator_reply(text: str) -> tuple[dict, str, list[str]]:
     lines, changed = _keep_yaml_lines(lines)
     if changed:
         notes.append("prose outside the YAML dropped")
+    lines, changed = _renest_flat_sections(lines)
+    if changed:
+        notes.append("flattened sections re-indented")
     cleaned = "\n".join(lines).strip()
 
     attempts = [cleaned]
@@ -193,11 +320,17 @@ def parse_orchestrator_reply(text: str) -> tuple[dict, str, list[str]]:
         if isinstance(loaded, dict):
             if index:
                 notes.append("unsafe values quoted")
-            return loaded, candidate, notes
+            pad, fixes = _sanitize(loaded)
+            if fixes:
+                notes.extend(fixes)
+                candidate = yaml.safe_dump(pad, sort_keys=False)
+            return pad, candidate, notes
         last_error = ValueError(f"reply is YAML but not a mapping ({type(loaded).__name__})")
 
     merged, failed = _load_by_section(attempts[-1])
     if merged:
         notes.append(f"loaded section by section; dropped {', '.join(failed) or 'none'}")
-        return merged, yaml.safe_dump(merged, sort_keys=False), notes
+        pad, fixes = _sanitize(merged)
+        notes.extend(fixes)
+        return pad, yaml.safe_dump(pad, sort_keys=False), notes
     raise ValueError(f"no YAML scratchpad in the reply: {last_error}")

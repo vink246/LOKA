@@ -24,8 +24,20 @@ def _example_yaml(prompt: str) -> str:
 def test_the_prompt_example_is_a_valid_scratchpad(style):
     prompt = load_stand_system_prompt(style=style)
     pad, _, notes = parse_orchestrator_reply(_example_yaml(prompt))
-    assert {"Semantic_State", "Task_Targets", "Listeners", "Plan", "Belief_Searches"} <= set(pad)
+    assert {"Semantic_State", "Task_Targets", "Listeners", "Plan"} <= set(pad)
     assert notes == []
+
+
+def test_compact_example_does_not_leak_the_scene_or_a_search():
+    """Llama 3.2 Vision copied an example built on the obstacle course verbatim."""
+    from loka.scene_props import load_scene
+
+    example = _example_yaml(load_stand_system_prompt(style="compact"))
+    pad, _, _ = parse_orchestrator_reply(example)
+    assert "Belief_Searches" not in pad
+    for kind, x, y, _yaw in load_scene("obstacle_course"):
+        assert kind not in example.lower()
+        assert f"{x:g}, {y:g}" not in example and f"({x:g}," not in example
 
 
 def test_compact_prompt_keeps_the_rules_and_is_short():

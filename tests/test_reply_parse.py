@@ -115,6 +115,91 @@ def test_lists_and_listeners_survive():
     assert pad["Listeners"][0]["message"] == "Close to the chair. Stand."
 
 
+#: Turn 4 of logs/loka/local_llm (Llama 3.2 Vision on PACE): every field lost its indent.
+FLATTENED = """Semantic_State:
+
+Hypothesis: "Walk to the chair, passing the box on its right."
+Analysis: "The box at (1.2, -0.4) is on the straight line, so I go around it first."
+
+Task_Targets:
+
+gait.mode: walk
+gait.speed: 0.15
+gait.goal_x: 1.2
+gait.goal_y: 0.4
+
+Listeners:
+
+- kind: near_xy
+  x: 1.0
+  y: 0.4
+  radius: 0.3
+  message: "Past the box. Head to the chair."
+
+Plan:
+
+Goal: "Stand next to the chair."
+Rationale: "The box blocks the direct line."
+Steps:
+  - "Walk to (1.2, 0.4), beside the box"
+  - "Walk to (3.0, -0.6), in front of the chair, and stand"
+Current_Step: 1
+
+Belief_Searches:
+
+- kind: mass
+  name: torso_link
+
+CAMERA:
+"""
+
+
+def test_flattened_sections_from_the_pace_run_are_re_nested():
+    pad, _, notes = parse_orchestrator_reply(FLATTENED)
+    assert pad["Semantic_State"]["Hypothesis"].startswith("Walk to the chair")
+    assert pad["Task_Targets"] == {
+        "gait.mode": "walk",
+        "gait.speed": 0.15,
+        "gait.goal_x": 1.2,
+        "gait.goal_y": 0.4,
+    }
+    assert pad["Listeners"][0]["message"] == "Past the box. Head to the chair."
+    assert pad["Plan"]["Current_Step"] == 1 and len(pad["Plan"]["Steps"]) == 2
+    assert pad["Belief_Searches"] == [{"kind": "mass", "name": "torso_link"}]
+    assert "Hypothesis" not in pad and "gait.mode" not in pad and "Goal" not in pad
+    assert "flattened sections re-indented" in notes
+
+
+def test_flattened_list_item_fields_stay_in_their_item():
+    reply = "Semantic_State:\nHypothesis: \"x\"\nListeners:\n- kind: after_s\ndelay: 2.0\nmessage: \"look again\"\n"
+    pad, _, _ = parse_orchestrator_reply(reply)
+    assert pad["Listeners"] == [{"kind": "after_s", "delay": 2.0, "message": "look again"}]
+
+
+def test_stray_and_empty_sections_are_salvaged():
+    reply = "Semantic_State:\nTask_Targets:\nHypothesis: \"walk\"\ngait.mode: walk\ngait.goal_x: 2.0\nPlan:\n"
+    pad, _, notes = parse_orchestrator_reply(reply)
+    assert pad["Semantic_State"] == {"Hypothesis": "walk"}
+    assert pad["Task_Targets"] == {"gait.mode": "walk", "gait.goal_x": 2.0}
+    assert "Plan" not in pad
+    pad, _, notes = parse_orchestrator_reply("Task_Targets:\n  gait.mode: stand\n")
+    assert pad["Semantic_State"] == {} and "missing Semantic_State added" in notes
+    pad, _, _ = parse_orchestrator_reply('Semantic_State: "just a sentence"\n')
+    assert pad["Semantic_State"] == {"Hypothesis": "just a sentence"}
+
+
+def test_apply_survives_a_null_semantic_state():
+    from loka.agent.apply import apply_stand_scratchpad
+    from loka.control.locomotion import LocomotionConfig
+    from loka.control.stacks import make
+
+    controller = make(LocomotionConfig())
+    summary = apply_stand_scratchpad(
+        controller, {"Semantic_State": None, "Task_Targets": {"gait.mode": "stand"}}, {"mutations": []}
+    )
+    assert summary["ok"]
+
+
 @pytest.mark.parametrize("reply", ["", "   ", "I cannot help with that.", "- just\n- a list"])
 def test_replies_with_no_scratchpad_raise(reply):
     with pytest.raises(ValueError):
