@@ -263,32 +263,41 @@ def prefer_egl_rendering() -> str:
     return os.environ.setdefault("MUJOCO_GL", "egl")
 
 
-def require_navila_gpu(
+def require_cuda_gpu(
     device: str = "cuda:0",
     min_free_gb: float = 20.0,
     min_compute_capability: tuple[int, int] = (8, 0),
+    *,
+    model: str,
+    setup_script: str,
+    packages: tuple[str, ...] = (),
 ) -> str:
-    """Fail fast when the NaVILA env or GPU is unsuitable."""
+    """Fail fast when the model's env or the GPU is unsuitable.
+
+    ``packages`` are imported to confirm the right env is active; ``setup_script``
+    is named in the error so the fix is one command.
+    """
     try:
         import torch
     except ImportError as exc:
         raise RuntimeError(
-            "torch is not installed. Activate the loka-navila env on a PACE GPU node "
-            "(see scripts/setup_navila_env.sh)."
+            f"torch is not installed. Activate the {model} env on a PACE GPU node "
+            f"(see {setup_script})."
         ) from exc
-    try:
-        import llava  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "NaVILA's llava package is not installed. Run scripts/setup_navila_env.sh on PACE."
-        ) from exc
+    for package in packages:
+        try:
+            __import__(package)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"{package} is not installed in this env; {model} needs it. Run {setup_script} on PACE."
+            ) from exc
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA is not available. NaVILA needs an NVIDIA GPU (Ampere or newer). "
-            "Use --navila-script on this machine, or run --navila on PACE."
+            f"CUDA is not available. {model} needs an NVIDIA GPU (Ampere or newer); "
+            "run it on a PACE GPU node."
         )
     if not device.startswith("cuda"):
-        raise RuntimeError(f"NaVILA device must be a cuda device, got {device!r}")
+        raise RuntimeError(f"{model} device must be a cuda device, got {device!r}")
     index = int(device.split(":")[1]) if ":" in device else 0
     if index < 0 or index >= torch.cuda.device_count():
         raise RuntimeError(
@@ -299,8 +308,8 @@ def require_navila_gpu(
     need_major, need_minor = min_compute_capability
     if (major, minor) < (need_major, need_minor):
         raise RuntimeError(
-            f"GPU {props.name} is compute {major}.{minor}; NaVILA needs "
-            f">= {need_major}.{need_minor} (Ampere+) for flash-attn 2 / bf16."
+            f"GPU {props.name} is compute {major}.{minor}; {model} needs "
+            f">= {need_major}.{need_minor} (Ampere+) for bf16 / flash attention."
         )
     free_b, total_b = torch.cuda.mem_get_info(index)
     free_gb = free_b / (1024**3)
@@ -308,13 +317,29 @@ def require_navila_gpu(
     if free_gb < float(min_free_gb):
         raise RuntimeError(
             f"GPU {props.name} has {free_gb:.1f} GB free / {total_gb:.1f} GB total; "
-            f"need >= {min_free_gb:g} GB free for NaVILA fp16."
+            f"need >= {min_free_gb:g} GB free for {model}."
         )
     print(
-        f"[navila] GPU {props.name} compute {major}.{minor} "
+        f"[gpu] {props.name} compute {major}.{minor} "
         f"{free_gb:.1f}/{total_gb:.1f} GB free on {device}"
     )
     return props.name
+
+
+def require_navila_gpu(
+    device: str = "cuda:0",
+    min_free_gb: float = 20.0,
+    min_compute_capability: tuple[int, int] = (8, 0),
+) -> str:
+    """Fail fast when the NaVILA env (torch + llava) or GPU is unsuitable."""
+    return require_cuda_gpu(
+        device,
+        min_free_gb,
+        min_compute_capability,
+        model="NaVILA",
+        setup_script="scripts/setup_navila_env.sh",
+        packages=("llava",),
+    )
 
 
 def load_vila_checkpoint(model_path: Path, device: str):

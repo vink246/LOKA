@@ -17,11 +17,14 @@
 
 ``--operator`` is free-text language and requires the LLM (``OPENAI_API_KEY``),
 except with ``--navila`` where it is the navigation instruction.
-``--orchestrator-vila PATH`` runs the orchestrator on a local
-Llama-3-VILA1.5-8B checkpoint (the model NaVILA was fine-tuned from) instead of
-OpenAI, so LOKA and the NaVILA baseline share a model family. Same env and GPU
-needs as ``--navila``; fetch it on PACE with ``scripts/fetch_navila_checkpoint.py
---repo-id Efficient-Large-Model/Llama-3-VILA1.5-8B --out <dir>``.
+``--orchestrator-mllama PATH`` runs the orchestrator on a local
+Llama-3.2-11B-Vision-Instruct checkpoint instead of OpenAI. Its language model is
+Llama-3.1-8B, the same family and size as NaVILA's, and its 128K context holds
+LOKA's full prompt. Needs the ``loka-mllama`` env (``scripts/setup_mllama_env.sh``)
+on a GPU node; the repo is gated, see ``scripts/fetch_navila_checkpoint.py``.
+``--orchestrator-vila PATH`` does the same with Llama-3-VILA1.5-8B (NaVILA's
+base model, ``loka-navila`` env), but VILA reads only 4,096 tokens, so it sees
+the start of the system prompt and nothing after it.
 ``--vision`` attaches a 512x512 head-camera frame to every orchestrator turn
 (settings in ``loka/config/loka.yaml`` under ``vision``). The scene carries a
 pool of HumanoidBench props (chair, table, box, cube, shelf) parked off-scene;
@@ -303,6 +306,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help='Replay mid-level actions with no GPU, e.g. "move forward 100 cm; turn left 30 degrees; stop"',
     )
     parser.add_argument(
+        "--orchestrator-mllama",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Run LOKA's orchestrator on a local Llama-3.2-11B-Vision-Instruct checkpoint "
+        "instead of OpenAI. Needs the loka-mllama env on a GPU node",
+    )
+    parser.add_argument(
         "--orchestrator-vila",
         type=Path,
         default=None,
@@ -314,12 +325,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--orchestrator-device",
         type=str,
         default="cuda:0",
-        help="CUDA device for --orchestrator-vila (default: cuda:0)",
+        help="Device for --orchestrator-mllama / --orchestrator-vila (default: cuda:0). "
+        "cpu skips the GPU check; --orchestrator-mllama only, for tiny test checkpoints",
     )
     add_stack_argument(parser)
     args = parser.parse_args(argv)
-    if args.orchestrator_vila is not None and (args.no_llm or args.navila or args.unitree_rl):
-        parser.error("--orchestrator-vila replaces the LLM; drop --no-llm / --navila / --unitree-rl")
+    local = [flag for flag, value in (
+        ("--orchestrator-mllama", args.orchestrator_mllama),
+        ("--orchestrator-vila", args.orchestrator_vila),
+    ) if value is not None]
+    if len(local) > 1:
+        parser.error("pass only one of --orchestrator-mllama / --orchestrator-vila")
+    if local and (args.no_llm or args.navila or args.unitree_rl):
+        parser.error(f"{local[0]} replaces the LLM; drop --no-llm / --navila / --unitree-rl")
+    if args.orchestrator_vila is not None and not args.orchestrator_device.startswith("cuda"):
+        parser.error("--orchestrator-vila needs a cuda --orchestrator-device")
     if args.vision and (args.no_llm or args.unitree_rl) and not args.navila:
         parser.error("--vision feeds the orchestrator; drop --no-llm / --unitree-rl")
     if args.ego_view and args.headless:
@@ -568,6 +588,64 @@ def _make_key_callback(runtime: LokaRuntime):
     return key_callback
 
 
+def _install_local_orchestrator(args: argparse.Namespace) -> str | None:
+    """Route orchestrator turns to a local VLM. Returns its label, or None for OpenAI.
+
+    Runs before the plant is built, so a bad checkpoint, env or GPU fails before
+    the render processes start.
+    """
+    if args.orchestrator_mllama is None and args.orchestrator_vila is None:
+        return None
+    from loka.agent.llm import set_chat_backend
+    from loka.vla.navila import (
+        apply_scratch_cache_defaults,
+        prefer_egl_rendering,
+        require_cuda_gpu,
+        require_navila_checkpoint,
+    )
+
+    device = args.orchestrator_device
+    if args.orchestrator_mllama is not None:
+        from loka.vla.mllama_chat import MLLAMA_FETCH_HINT, MLLAMA_MIN_FREE_GB
+
+        tag, name, hint, path = "mllama", "Llama-3.2-Vision", MLLAMA_FETCH_HINT, args.orchestrator_mllama
+        gpu = {
+            "min_free_gb": MLLAMA_MIN_FREE_GB,
+            "model": "Llama 3.2 Vision",
+            "setup_script": "scripts/setup_mllama_env.sh",
+            "packages": ("transformers", "accelerate"),
+        }
+    else:
+        from loka.vla.vila_chat import VILA_FETCH_HINT
+
+        tag, name, hint, path = "vila", "VILA", VILA_FETCH_HINT, args.orchestrator_vila
+        gpu = {
+            "min_free_gb": 20.0,
+            "model": "VILA",
+            "setup_script": "scripts/setup_navila_env.sh",
+            "packages": ("llava",),
+        }
+    checkpoint = require_navila_checkpoint(path, name=name, hint=hint)
+    caches = apply_scratch_cache_defaults()
+    print(f"[{tag}] HF_HOME={caches['HF_HOME']} XDG_CACHE_HOME={caches['XDG_CACHE_HOME']}")
+    if device.startswith("cuda"):
+        require_cuda_gpu(device, **gpu)
+        print(f"[{tag}] MUJOCO_GL={prefer_egl_rendering()} for the ego camera and recording")
+    else:
+        print(f"[{tag}] device={device}: GPU check skipped; only tiny test checkpoints are practical")
+    if tag == "mllama":
+        from loka.vla.mllama_chat import MllamaChatBackend
+
+        backend = MllamaChatBackend(checkpoint, device=device)
+    else:
+        from loka.vla.vila_chat import VilaChatBackend
+
+        backend = VilaChatBackend(checkpoint, device=device)
+    set_chat_backend(backend)
+    print(f"[{tag}] orchestrator: {backend.label} on {device}")
+    return backend.label
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     llm_enabled = not args.no_llm
@@ -646,30 +724,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         runtime = _PlantRuntime(sim, build_faults(args))
     else:
-        llm_model = None
-        if args.orchestrator_vila is not None:
-            from loka.agent.llm import set_chat_backend
-            from loka.vla.navila import (
-                apply_scratch_cache_defaults,
-                prefer_egl_rendering,
-                require_navila_checkpoint,
-                require_navila_gpu,
-            )
-
-            from loka.vla.vila_chat import VILA_FETCH_HINT, VilaChatBackend
-
-            vila_path = require_navila_checkpoint(
-                args.orchestrator_vila, name="VILA", hint=VILA_FETCH_HINT
-            )
-            caches = apply_scratch_cache_defaults()
-            print(f"[vila] HF_HOME={caches['HF_HOME']} XDG_CACHE_HOME={caches['XDG_CACHE_HOME']}")
-            require_navila_gpu(args.orchestrator_device)
-            print(f"[vila] MUJOCO_GL={prefer_egl_rendering()} for the ego camera and recording")
-
-            backend = VilaChatBackend(vila_path, device=args.orchestrator_device)
-            set_chat_backend(backend)
-            llm_model = backend.label
-            print(f"[vila] orchestrator: {llm_model} on {args.orchestrator_device}")
+        llm_model = _install_local_orchestrator(args)
         sim = Simulation(config, model_path=args.model, **plant)
         log_path = None
         if not args.no_log:
