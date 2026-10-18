@@ -259,7 +259,14 @@ class EgoRenderer:
             return
         if not self._conn.poll(RENDER_TIMEOUT_S * 3):
             raise RuntimeError("ego renderer did not start")
-        ok, message = self._conn.recv()
+        try:
+            ok, message = self._conn.recv()
+        except EOFError:
+            self.error = (
+                f"ego renderer process exited during start (gl={self.backend}); "
+                "see its traceback above"
+            )
+            raise RuntimeError(self.error) from None
         if not ok:
             self.error = str(message)
             raise RuntimeError(self.error)

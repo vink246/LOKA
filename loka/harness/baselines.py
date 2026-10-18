@@ -247,6 +247,7 @@ class NavilaBaseline(Baseline):
             NavilaPolicy,
             NavilaRuntime,
             apply_scratch_cache_defaults,
+            prefer_egl_rendering,
             require_navila_checkpoint,
             require_navila_gpu,
         )
@@ -261,6 +262,7 @@ class NavilaBaseline(Baseline):
         model_path = require_navila_checkpoint(cfg.model_path)
         apply_scratch_cache_defaults()
         require_navila_gpu(cfg.device, cfg.min_free_gb, cfg.min_compute_capability)
+        prefer_egl_rendering()
         camera = cfg.camera.recipe()
         plant_kw = {
             "props": dict((loka_config().get("props") or {}).get("slots") or {}),

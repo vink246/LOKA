@@ -97,6 +97,15 @@ def test_scratch_cache_defaults_fill_only_unset(monkeypatch):
     assert resolved["XDG_CACHE_HOME"] == "/custom/cache"
 
 
+def test_prefer_egl_rendering_respects_export(monkeypatch):
+    from loka.vla.navila import prefer_egl_rendering
+
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    assert prefer_egl_rendering() == "egl"
+    monkeypatch.setenv("MUJOCO_GL", "osmesa")
+    assert prefer_egl_rendering() == "osmesa"
+
+
 def test_require_navila_gpu_messages():
     with mock.patch.dict(sys.modules, {"torch": None}):
         # Force ImportError path by patching the import inside the function.

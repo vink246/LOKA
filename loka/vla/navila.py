@@ -256,6 +256,16 @@ def apply_scratch_cache_defaults() -> dict[str, str]:
     return resolved
 
 
+def prefer_egl_rendering() -> str:
+    """Default ``MUJOCO_GL`` to ``egl`` for the render subprocesses.
+
+    Call after :func:`require_navila_gpu` passes. A headless node otherwise
+    falls back to OSMesa, which needs ``libOSMesa`` in the env; EGL renders on
+    the GPU NaVILA already has. An exported ``MUJOCO_GL`` wins.
+    """
+    return os.environ.setdefault("MUJOCO_GL", "egl")
+
+
 def require_navila_gpu(
     device: str = "cuda:0",
     min_free_gb: float = 20.0,

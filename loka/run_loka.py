@@ -575,6 +575,7 @@ def main(argv: list[str] | None = None) -> int:
             NavilaRuntime,
             apply_scratch_cache_defaults,
             parse_script,
+            prefer_egl_rendering,
             require_navila_checkpoint,
             require_navila_gpu,
         )
@@ -595,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
             require_navila_gpu(
                 nav_cfg.device, nav_cfg.min_free_gb, nav_cfg.min_compute_capability
             )
+            print(f"[navila] MUJOCO_GL={prefer_egl_rendering()} for the ego camera and recording")
             policy = NavilaPolicy(
                 path,
                 device=nav_cfg.device,

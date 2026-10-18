@@ -71,12 +71,17 @@ else
   conda activate "$ENV_NAME"
 fi
 
+# OSMesa (MUJOCO_GL=osmesa fallback; --navila defaults to EGL on the GPU) and
+# the ffmpeg binary mediapy writes --record mp4s with.
+conda install -y -c conda-forge mesalib ffmpeg
+
 python -m pip install -U pip
-# LOKA plant deps (same as environment.yml).
+# LOKA plant deps (environment.yml). MuJoCo is pinned: the MjSpec scene
+# builder uses the 3.2.x API (3.16 has no MjSpec.find_body).
 python -m pip install \
-  "mujoco>=3.2" "numpy>=1.24" "scipy>=1.10" "pyyaml>=6.0" "osqp>=1.1" \
+  "mujoco==3.2.3" "numpy>=1.24" "scipy>=1.10" "pyyaml>=6.0" "osqp>=1.1" \
   "pytest>=7.4" "dearpygui>=1.11" "openai>=1.30" "python-dotenv>=1.0" \
-  "Pillow" "huggingface_hub"
+  "Pillow" "mediapy" "huggingface_hub"
 
 # Torch 2.3 + CUDA 12.1 wheels (Ampere+). Adjust the index if the cluster CUDA differs.
 python -m pip install torch==2.3.0 torchvision==0.18.0 \
