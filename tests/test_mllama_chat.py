@@ -81,8 +81,8 @@ def test_openai_messages_to_mllama_rejects_bad_roles_and_assistant_images():
 @pytest.mark.parametrize(
     "generated, expected",
     [
-        (' "Walk to the chair."\n  Analysis: "clear"', 'Semantic_State:\n  Hypothesis: "Walk to the chair."\n  Analysis: "clear"'),
-        ('"Walk."', 'Semantic_State:\n  Hypothesis: "Walk."'),
+        ('\n  Hypothesis: "Walk to the chair."\n  Analysis: "clear"', 'Semantic_State:\n  Hypothesis: "Walk to the chair."\n  Analysis: "clear"'),
+        ('{Hypothesis: "Walk."}', 'Semantic_State: {Hypothesis: "Walk."}'),
         ('Semantic_State:\n  Hypothesis: "again"', 'Semantic_State:\n  Hypothesis: "again"'),
     ],
 )

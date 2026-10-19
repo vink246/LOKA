@@ -20,24 +20,29 @@ def _example_yaml(prompt: str) -> str:
     return "\n".join(lines)
 
 
-@pytest.mark.parametrize("style", ["full", "compact"])
-def test_the_prompt_example_is_a_valid_scratchpad(style):
-    prompt = load_stand_system_prompt(style=style)
+def test_the_full_prompt_example_is_a_valid_scratchpad():
+    prompt = load_stand_system_prompt(style="full")
     pad, _, notes = parse_orchestrator_reply(_example_yaml(prompt))
     assert {"Semantic_State", "Task_Targets", "Listeners", "Plan"} <= set(pad)
     assert notes == []
 
 
-def test_compact_example_does_not_leak_the_scene_or_a_search():
-    """Llama 3.2 Vision copied an example built on the obstacle course verbatim."""
+def test_compact_reply_format_has_placeholders_not_a_worked_example():
+    """Llama 3.2 Vision copied a worked example verbatim, so the compact prompt has none."""
+    from loka.agent.reply_guard import check_reply
     from loka.scene_props import load_scene
 
-    example = _example_yaml(load_stand_system_prompt(style="compact"))
-    pad, _, _ = parse_orchestrator_reply(example)
-    assert "Belief_Searches" not in pad
+    fmt = _example_yaml(load_stand_system_prompt(style="compact"))
+    for section in ("Semantic_State:", "Task_Targets:", "Listeners:", "Plan:", "Belief_Searches:"):
+        assert section in fmt
+    values = [line.split(":", 1)[1].strip() for line in fmt.splitlines() if ":" in line]
+    concrete = [v for v in values if v and "<" not in v]
+    assert concrete == [], f"concrete example values left in the format: {concrete}"
     for kind, x, y, _yaw in load_scene("obstacle_course"):
-        assert kind not in example.lower()
-        assert f"{x:g}, {y:g}" not in example and f"({x:g}," not in example
+        assert kind not in fmt.lower() and f"{x:g}" not in fmt
+    # A reply that is the format copied back is caught.
+    pad, _, _ = parse_orchestrator_reply(fmt)
+    assert any("placeholder" in p for p in check_reply(fmt, pad))
 
 
 def test_compact_prompt_keeps_the_rules_and_is_short():

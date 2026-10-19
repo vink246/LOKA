@@ -27,9 +27,12 @@ about 2-3K tokens a turn instead of ~20K. ``--prompt-style full`` sends the
 prompt LOKA is evaluated with. They also default to ``--describe-first`` (with
 ``--vision``: the model first describes the frame, each object with its
 direction and a rough distance, and that description is added to the turn as
-written) and ``--max-memory 0`` (no earlier turns in view). All three
-flags also work with OpenAI, e.g. ``--prompt-style compact --describe-first
---max-memory 0`` to test GPT under the local-model setup.
+written), ``--reply-check`` (a reply that copies the format's placeholders,
+echoes the prompt, is empty, or sends a walk goal at the robot's own position
+is asked again once) and ``--max-memory 0`` (no earlier turns in view). All
+four flags also work with OpenAI, e.g. ``--prompt-style compact
+--describe-first --reply-check --max-memory 0`` to test GPT under the
+local-model setup.
 ``--orchestrator-vila PATH`` does the same with Llama-3-VILA1.5-8B (NaVILA's
 base model, ``loka-navila`` env), but VILA reads only 4,096 tokens, so it sees
 the start of the system prompt and nothing after it.
@@ -340,6 +343,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--orchestrator-vila, off otherwise (works with OpenAI too)",
     )
     parser.add_argument(
+        "--reply-check",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Ask the model again once when its reply copies the format's <...> placeholders, "
+        "echoes the prompt, is empty, or sends a walk goal where the robot already stands. "
+        "Default: on with --orchestrator-mllama / --orchestrator-vila, off otherwise",
+    )
+    parser.add_argument(
         "--max-memory",
         type=int,
         default=None,
@@ -379,6 +390,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.prompt_style = "compact" if local else "full"
     if args.describe_first is None:
         args.describe_first = bool(local)
+    if args.reply_check is None:
+        args.reply_check = bool(local)
     if args.max_memory is None:
         args.max_memory = 0 if local else None
     elif args.max_memory < 0:
@@ -778,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
         memory = {} if args.max_memory is None else {"max_memory": int(args.max_memory)}
         print(
             f"[LOKA] prompt={args.prompt_style} describe_first={describe_first} "
-            f"max_memory={memory.get('max_memory', 'loka.yaml')}"
+            f"reply_check={args.reply_check} max_memory={memory.get('max_memory', 'loka.yaml')}"
         )
         runtime = LokaRuntime(
             sim,
@@ -787,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
                 llm_model=llm_model,
                 prompt_style=args.prompt_style,
                 describe_first=describe_first,
+                reply_check=bool(args.reply_check),
                 **memory,
                 enable_vision=vision,
                 vision=camera,

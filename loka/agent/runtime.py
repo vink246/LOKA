@@ -85,6 +85,9 @@ class LokaConfig:
     #: (one line per object with its direction and a rough distance), then
     #: append that description, as written, to the turn. Needs vision.
     describe_first: bool = False
+    #: Re-ask once when a reply copies the template's placeholders, echoes the
+    #: prompt, is empty, or sends a walk goal at the robot's own position.
+    reply_check: bool = False
 
     def __post_init__(self) -> None:
         assert 0 <= self.max_memory <= self.max_turns, (
@@ -505,6 +508,20 @@ class LokaRuntime:
             }
         return user_content, request
 
+    def _reply_guard(self) -> dict | None:
+        """Reminder and copy check for the worker; None leaves the turn as built."""
+        if not self.config.reply_check and not self.compact:
+            return None
+        from loka.agent.reply_guard import REPLY_REMINDER
+
+        qpos = self.sim.data.qpos
+        return {
+            "reminder": REPLY_REMINDER if self.compact else None,
+            "check": self.config.reply_check,
+            "pelvis_xy": (float(qpos[0]), float(qpos[1])),
+            "goal_tolerance": float(self.controller.gait.config.goal_tolerance),
+        }
+
     def _directive_text(self) -> str:
         directives = self.loka_state.get("mission_directives") or []
         if directives:
@@ -571,7 +588,7 @@ class LokaRuntime:
         thread = threading.Thread(
             target=stand_llm_worker,
             args=(copy.deepcopy(messages), self.llm_queue),
-            kwargs={"model": self.config.llm_model, "vision": vision},
+            kwargs={"model": self.config.llm_model, "vision": vision, "guard": self._reply_guard()},
             daemon=True,
         )
         thread.start()
@@ -663,6 +680,14 @@ class LokaRuntime:
         if self.log is not None:
             if result.get("scene_description"):
                 self.log.note(f"scene description:\n{result['scene_description']}", sim_time=now)
+            if result.get("reply_check"):
+                check = result["reply_check"]
+                self.log.note(
+                    f"reply rejected ({'; '.join(check['problems'])}) and asked again; "
+                    f"retry {'still flagged: ' + '; '.join(check['retry_problems']) if check['retry_problems'] else 'accepted'}."
+                    f"\nrejected reply:\n{check['rejected_reply']}",
+                    sim_time=now,
+                )
             if result.get("raw_reply"):
                 self.log.note(
                     f"reply repaired ({'; '.join(result.get('parse_notes') or [])}); "

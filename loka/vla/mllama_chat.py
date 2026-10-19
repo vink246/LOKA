@@ -30,8 +30,10 @@ MLLAMA_MIN_FREE_GB = 28.0
 #: Llama 3.2 Vision's context is 128K tokens; warn well before it.
 PROMPT_TOKEN_WARN = 100_000
 #: The reply is started for the model so it continues in LOKA's YAML layout
-#: instead of opening with markdown or prose. It is prepended to the returned text.
-REPLY_PREFILL = "Semantic_State:\n  Hypothesis:"
+#: instead of opening with markdown or prose. It is prepended to the returned
+#: text. Only the section name: a longer start matched the prompt's reply
+#: format line for line, and the model continued it with the format's text.
+REPLY_PREFILL = "Semantic_State:"
 
 
 def openai_messages_to_mllama(messages: list[dict]) -> tuple[list[dict], list]:

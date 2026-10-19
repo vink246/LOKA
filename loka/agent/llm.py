@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from loka.agent.reply_guard import check_reply, feedback_message
 from loka.agent.reply_parse import parse_orchestrator_reply
 from loka.agent.scene_describe import DESCRIBE_MAX_TOKENS, DESCRIBE_PREFILL, format_scene_section
 from loka.agent.robot_context import format_primary_objective_block
@@ -145,7 +146,7 @@ def _describe_scene(png: bytes, describe: dict, model=None, detail: str = "high"
     return text.strip()
 
 
-def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> None:
+def stand_llm_worker(api_messages, result_queue, model=None, vision=None, guard=None) -> None:
     """Background thread: never call from the control loop.
 
     ``model`` overrides the ``LOKA_STAND_MODEL`` environment variable. When
@@ -156,7 +157,15 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> Non
     the control loop. With ``vision["describe"]`` (a ``prompt``), the model
     first describes the frame and that description is appended to the turn
     as written.
+
+    ``guard`` (optional): ``reminder`` is appended last to the turn; with
+    ``check`` a reply that copies the template or does not move the robot
+    (:func:`loka.agent.reply_guard.check_reply`, given ``pelvis_xy`` and
+    ``goal_tolerance``) is asked again once with the reasons.
     """
+    from loka.agent.session import append_text
+
+    guard = guard or {}
     image = {}
     try:
         if vision is not None:
@@ -164,26 +173,69 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> Non
             png = image.pop("_png", None)
             describe = vision.get("describe")
             if describe and png is not None:
-                from loka.agent.session import append_text
-
                 description = _describe_scene(png, describe, model, vision.get("detail", "high"))
                 print(f"\n[LLM] scene description:\n{description}")
                 append_text(api_messages, format_scene_section(description))
                 image["scene_description"] = description
+        if guard.get("reminder"):
+            append_text(api_messages, guard["reminder"])
         yaml_text = _complete(api_messages, model)
+        parsed = _try_parse(yaml_text)
+        if guard.get("check"):
+            problems = check_reply(
+                yaml_text,
+                parsed[0] if parsed else None,
+                pelvis_xy=guard.get("pelvis_xy"),
+                goal_tolerance=float(guard.get("goal_tolerance", 0.15)),
+            )
+            if problems:
+                print(f"\n[LLM] reply rejected ({'; '.join(problems)}); asking again\n--- rejected ---\n{yaml_text[:1200]}\n---")
+                retry_messages = list(api_messages) + [
+                    {"role": "assistant", "content": yaml_text},
+                    {"role": "user", "content": feedback_message(problems)},
+                ]
+                retry_text = _complete(retry_messages, model)
+                retry_parsed = _try_parse(retry_text)
+                retry_problems = check_reply(
+                    retry_text,
+                    retry_parsed[0] if retry_parsed else None,
+                    pelvis_xy=guard.get("pelvis_xy"),
+                    goal_tolerance=float(guard.get("goal_tolerance", 0.15)),
+                )
+                image["reply_check"] = {
+                    "problems": problems,
+                    "rejected_reply": yaml_text,
+                    "retry_problems": retry_problems,
+                }
+                if retry_problems:
+                    print(f"\n[LLM] retry still flagged: {'; '.join(retry_problems)}")
+                if retry_parsed is not None or parsed is None:
+                    yaml_text, parsed = retry_text, retry_parsed
     except Exception as exc:
         print(f"\n[LLM Worker Error] {exc}")
         result_queue.put(None)
         return
-    try:
-        scratchpad, cleaned, notes = parse_orchestrator_reply(yaml_text)
-    except ValueError as exc:
-        print(f"\n[LLM Worker Error] unparseable reply: {exc}\n--- reply ---\n{yaml_text[:1500]}\n---")
+    if parsed is None:
+        try:
+            parse_orchestrator_reply(yaml_text)
+        except ValueError as exc:
+            error = str(exc)
+        else:
+            error = "unparseable reply"
+        print(f"\n[LLM Worker Error] unparseable reply: {error}\n--- reply ---\n{yaml_text[:1500]}\n---")
         # Keep the raw text so the turn record and session log show what came back.
-        result_queue.put({"scratchpad": None, "raw_yaml": yaml_text, "parse_error": str(exc), **image})
+        result_queue.put({"scratchpad": None, "raw_yaml": yaml_text, "parse_error": error, **image})
         return
+    scratchpad, cleaned, notes = parsed
     result = {"scratchpad": scratchpad, "raw_yaml": cleaned, "parse_notes": notes, **image}
     if notes:
         print(f"\n[LLM] reply repaired: {'; '.join(notes)}\n--- reply before repair ---\n{yaml_text[:1500]}\n---")
         result["raw_reply"] = yaml_text
     result_queue.put(result)
+
+
+def _try_parse(text: str):
+    try:
+        return parse_orchestrator_reply(text)
+    except ValueError:
+        return None

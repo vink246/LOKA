@@ -9,6 +9,7 @@ loading one top-level section at a time when the whole reply still fails.
 
 from __future__ import annotations
 
+import math
 import re
 
 import yaml
@@ -281,7 +282,35 @@ def _sanitize(pad: dict) -> tuple[dict, list[str]]:
         if value is not None and not isinstance(value, dict) and not (section == "Plan" and isinstance(value, str)):
             del pad[section]
             notes.append(f"{section} dropped: not a mapping")
+    targets = pad.get("Task_Targets")
+    if isinstance(targets, dict):
+        bad = [k for k, v in targets.items() if not _valid_target_value(str(k), v)]
+        for k in bad:
+            del targets[k]
+        if bad:
+            notes.append(f"non-numeric Task_Targets dropped: {', '.join(map(str, bad))}")
+        if not targets:
+            del pad["Task_Targets"]
     return pad, notes
+
+
+_GAIT_MODES = frozenset({"stand", "walk", "tread", "limp"})
+
+
+def _valid_target_value(key: str, value) -> bool:
+    """A number, or a mode name for ``gait.mode``; a copied ``<metres>`` is neither."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value))
+    if key == "gait.mode" and isinstance(value, str):
+        return value.strip().lower() in _GAIT_MODES
+    if key == "gait.goal_heading" and value is None:
+        return True
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _quote_unsafe_values(lines: list[str]) -> tuple[list[str], bool]:
