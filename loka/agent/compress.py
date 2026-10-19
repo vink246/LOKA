@@ -211,7 +211,11 @@ def format_cost_section(observer) -> str:
 
 
 def format_prop_contact_section(frames: Sequence[dict]) -> str:
-    """Robot-to-prop contact over the window. Empty when nothing was touched."""
+    """Robot-to-prop contact over the window. Empty when nothing was touched.
+
+    Objects are numbered, not named: what the robot bumped into is for the
+    orchestrator to find in the image, as a robot only feels the force.
+    """
     peak: dict[str, dict] = {}
     touching_steps: dict[str, int] = {}
     for frame in frames:
@@ -225,17 +229,18 @@ def format_prop_contact_section(frames: Sequence[dict]) -> str:
         return ""
     latest = {e["prop"] for e in (frames[-1].get("prop_contacts") or ())}
     lines = [
-        "PROP CONTACT",
-        "  The robot touched a prop in this window. Contact force enters the effort "
+        "OBJECT CONTACT",
+        "  The robot touched an object in this window. Contact force enters the effort "
         "residual as an external load. It is not a model error; do not queue a belief "
         "search for it.",
     ]
-    for name, entry in sorted(peak.items(), key=lambda kv: -kv[1]["force_n"]):
+    ranked = sorted(peak.items(), key=lambda kv: -kv[1]["force_n"])
+    for index, (name, entry) in enumerate(ranked, start=1):
         share = touching_steps[name] / max(len(frames), 1)
         now = "touching now" if name in latest else "released"
         lines.append(
-            f"  {name} ({entry['kind']}): peak normal {entry['force_n']:.1f} N, "
-            f"{share:.0%} of the window, {now}; links {', '.join(entry['links'])}"
+            f"  object {index}: peak normal {entry['force_n']:.1f} N, "
+            f"{share:.0%} of the window, {now}; robot links {', '.join(entry['links'])}"
         )
     return "\n".join(lines) + "\n"
 

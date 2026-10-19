@@ -72,18 +72,11 @@ def format_stand_configuration(controller: LocomotionController, *, compact: boo
     return "\n".join(lines)
 
 
-#: What the prop files in models/props/ look like, for the vision prompt.
-_PROP_CATALOGUE = (
-    "chair: light wood, seat 0.42 x 0.42 m at 0.45 m high, backrest to 0.85 m; 6 kg, free (pushable, tips over)",
-    "table: dark wood, 1.0 x 1.0 m top at 0.95 m high on four legs; 16 kg, free (pushable)",
-    "box: brown cardboard, 0.4 x 0.2 x 0.3 m tall; 3 kg, free (pushable)",
-    "cube: pale grey-blue block, 0.2 m; 0.3 kg, free (kicked aside by a step)",
-    "shelf: light-wood bookshelf, 0.65 x 0.9 m footprint, 1.85 m tall; static (does not move)",
-)
-
-
 def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
-    """The camera facts a planner needs, without the derivations and prop catalogue."""
+    """The camera facts a planner needs, without the derivations.
+
+    Camera facts only: what is in the scene is for the model to find in the image.
+    """
     import math
 
     h = float(nominal_pose.xyz[2])
@@ -103,8 +96,6 @@ def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) ->
             f"{spec.pitch_down_deg:.0f} deg down, horizontal FOV {spec.fovx_deg:.0f} deg, "
             f"about {h:.2f} m above the floor. The image's left is the robot's left. Horizon "
             f"near row {horizon:.0f}; floor distance ahead by image row: {', '.join(ranges)}.{floor}",
-            "Props: chair 0.42 m seat; table 1.0 m square, 0.95 m tall; box 0.4 x 0.2 m; "
-            "cube 0.2 m; shelf 0.65 x 0.9 m, 1.85 m tall, static. Push only the cube or box. "
             "The plant does not see obstacles: route around them with waypoints.",
         ]
     )
@@ -174,9 +165,6 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "Image ranges are good to about 10% close in and degrade with distance. Re-check from a "
         "nearer frame before committing to a tight gap.",
         "",
-        "### Objects you may see",
-        *(f"- {item}" for item in _PROP_CATALOGUE),
-        "",
         "### Navigating with the image",
         "- Consult the image when the path matters: before starting a walk, near listeners, and "
         "whenever the goal is not yet reached. If the image shows nothing in the way, proceed "
@@ -187,7 +175,7 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "then set the next waypoint or the final goal. Keep the locked directive's goal as the "
         "end point.",
         "- Put a detour waypoint beside the obstacle (level with it or past its near edge), not "
-        "straight to the robot's side: e.g. robot at (0,0) facing +x, chair centred at (1.5,0), "
+        "straight to the robot's side: e.g. robot at (0,0) facing +x, an obstacle centred at (1.5,0), "
         "goal (3,0) -> waypoints (1.0,-0.9), (2.0,-0.9), then (3,0), each a turn of about 42 deg, "
         "rather than (0,-0.9), a 90 deg turn. Keep each turn at or under 45 deg where you can.",
         "- Estimate the obstacle's world position from the image first (bearing and floor "
@@ -197,10 +185,8 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "after_s listener (2 to 4 s) or a near_xy listener short of them to look again.",
         "- The frame was taken when the message was sent; the robot keeps moving during your "
         "reply, so allow for the distance covered at the current speed.",
-        "- To push a light free prop (cube, box) out of the way, walk slowly (gait.speed <= 0.15) "
-        "straight through it. Do not try to push the table or the shelf, and do not plan to "
-        "step onto any prop: the footstep planner assumes flat ground.",
-        "- A PROP CONTACT section in the telemetry means the robot is touching a prop. The "
+        "- Do not plan to step onto any object: the footstep planner assumes flat ground.",
+        "- An OBJECT CONTACT section in the telemetry means the robot is touching an object. The "
         "contact force raises |bias|; that is an external load, not a model error. Back off "
         "or steer around before queueing any belief search.",
         "- Objects beyond about 6 m are a few pixels wide. Do not infer free space far away "
