@@ -61,6 +61,23 @@ def _pick_fenced(text: str) -> tuple[str, bool]:
     return text, False
 
 
+#: Markdown list markers: ``* x``, ``+ x``, ``• x``, ``1. x``, ``2) x``.
+_BULLET = re.compile(r"^(?P<indent>\s*)(?:[*+\u2022\u00b7]|\d+[.)])\s+(?P<rest>\S.*)$")
+
+
+def _normalize_bullets(lines: list[str]) -> tuple[list[str], bool]:
+    """Turn markdown bullets into YAML ``- `` items; ``_sanitize`` merges mapping sections."""
+    out, changed = [], False
+    for line in lines:
+        m = _BULLET.match(line)
+        if m:
+            out.append(f"{m.group('indent')}- {m.group('rest')}")
+            changed = True
+        else:
+            out.append(line)
+    return out, changed
+
+
 def _strip_markdown(lines: list[str]) -> tuple[list[str], bool]:
     out, changed = [], False
     for line in lines:
@@ -195,6 +212,33 @@ def _sanitize(pad: dict) -> tuple[dict, list[str]]:
     Task_Targets and Plan, is moved into its own section.
     """
     notes: list[str] = []
+    # A mapping section written as bullets loads as a list of one-key mappings.
+    for section in ("Semantic_State", "Task_Targets", "Plan"):
+        body = pad.get(section)
+        if isinstance(body, list) and body and all(isinstance(item, dict) for item in body):
+            merged: dict = {}
+            for item in body:
+                merged.update(item)
+            pad[section] = merged
+            notes.append(f"{section} list merged into a mapping")
+        elif section == "Semantic_State" and isinstance(body, list) and body:
+            pad[section] = {"Hypothesis": " ".join(str(item) for item in body)}
+            notes.append("Semantic_State list joined into Hypothesis")
+    # Entries without a kind are unusable; a section of only those must not
+    # replace the armed listeners or the search queue.
+    for section in ("Listeners", "Belief_Searches", "Belief_Search"):
+        body = pad.get(section)
+        if isinstance(body, dict):
+            body = [body]
+        if not isinstance(body, list) or not body:
+            continue
+        usable = [item for item in body if isinstance(item, dict) and (item.get("kind") or item.get("when"))]
+        if not usable:
+            del pad[section]
+            notes.append(f"{section} dropped: no entry has a kind")
+        elif len(usable) != len(body):
+            pad[section] = usable
+            notes.append(f"{section}: {len(body) - len(usable)} entry(ies) without a kind dropped")
     moved: dict[str, dict] = {}
     for key in list(pad):
         home = _home_section(key)
@@ -292,6 +336,9 @@ def parse_orchestrator_reply(text: str) -> tuple[dict, str, list[str]]:
     if fenced:
         notes.append("code fence removed")
     lines = body.replace("\t", "    ").splitlines()
+    lines, changed = _normalize_bullets(lines)
+    if changed:
+        notes.append("markdown bullets turned into YAML items")
     lines, changed = _strip_markdown(lines)
     if changed:
         notes.append("markdown removed from keys")

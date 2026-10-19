@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from loka.agent.reply_parse import parse_orchestrator_reply
+from loka.agent.scene_describe import DESCRIBE_MAX_TOKENS, DESCRIBE_PREFILL, format_scene_section
 from loka.agent.robot_context import format_primary_objective_block
 
 load_dotenv()
@@ -98,8 +99,50 @@ def _attach_camera_frame(api_messages, vision: dict) -> dict:
             Path(frame_path).parent.mkdir(parents=True, exist_ok=True)
             Path(frame_path).write_bytes(png)
         except OSError as exc:
-            return {"image_bytes": len(png), "image_error": f"frame not saved: {exc}"}
-    return {"image_bytes": len(png), "frame_path": frame_path}
+            return {"image_bytes": len(png), "image_error": f"frame not saved: {exc}", "_png": png}
+    return {"image_bytes": len(png), "frame_path": frame_path, "_png": png}
+
+
+def _complete(messages, model=None, *, prefill: str | None = None, max_tokens: int | None = None) -> str:
+    """One chat completion from the local backend, or OpenAI when none is set.
+
+    ``prefill`` starts the local model's reply (OpenAI has no prefill and ignores
+    it); None keeps the backend's default.
+    """
+    if _chat_backend is not None:
+        kwargs = {}
+        if prefill is not None:
+            kwargs["prefill"] = prefill
+        if max_tokens is not None:
+            kwargs["max_new_tokens"] = max_tokens
+        return _chat_backend.chat(messages, **kwargs)
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    chosen = model or os.environ.get("LOKA_STAND_MODEL", "gpt-6-luna")
+    response = _openai_client().chat.completions.create(
+        model=chosen,
+        messages=messages,
+        # temperature=0.1,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _describe_scene(png: bytes, describe: dict, model=None, detail: str = "high") -> str:
+    """The description call: the frame alone, then the description prompt."""
+    import base64
+
+    url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": url, "detail": detail}},
+                {"type": "text", "text": describe["prompt"]},
+            ],
+        }
+    ]
+    text = _complete(messages, model, prefill=DESCRIBE_PREFILL, max_tokens=DESCRIBE_MAX_TOKENS)
+    return text.strip()
 
 
 def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> None:
@@ -110,24 +153,24 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> Non
     :func:`set_chat_backend` takes the turn instead and ignores ``model``.
     ``vision`` holds ``render`` (snapshot -> PNG), the dispatch ``snapshot``,
     ``detail``, and an optional ``frame_path``; the frame is rendered here, off
-    the control loop.
+    the control loop. With ``vision["describe"]`` (a ``prompt``), the model
+    first describes the frame and that description is appended to the turn
+    as written.
     """
     image = {}
     try:
         if vision is not None:
             image = _attach_camera_frame(api_messages, vision)
-        if _chat_backend is not None:
-            yaml_text = _chat_backend.chat(api_messages)
-        else:
-            if not os.environ.get("OPENAI_API_KEY"):
-                raise RuntimeError("OPENAI_API_KEY is not set")
-            chosen = model or os.environ.get("LOKA_STAND_MODEL", "gpt-6-luna")
-            response = _openai_client().chat.completions.create(
-                model=chosen,
-                messages=api_messages,
-                # temperature=0.1,
-            )
-            yaml_text = response.choices[0].message.content or ""
+            png = image.pop("_png", None)
+            describe = vision.get("describe")
+            if describe and png is not None:
+                from loka.agent.session import append_text
+
+                description = _describe_scene(png, describe, model, vision.get("detail", "high"))
+                print(f"\n[LLM] scene description:\n{description}")
+                append_text(api_messages, format_scene_section(description))
+                image["scene_description"] = description
+        yaml_text = _complete(api_messages, model)
     except Exception as exc:
         print(f"\n[LLM Worker Error] {exc}")
         result_queue.put(None)
@@ -139,6 +182,8 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None) -> Non
         # Keep the raw text so the turn record and session log show what came back.
         result_queue.put({"scratchpad": None, "raw_yaml": yaml_text, "parse_error": str(exc), **image})
         return
+    result = {"scratchpad": scratchpad, "raw_yaml": cleaned, "parse_notes": notes, **image}
     if notes:
-        print(f"\n[LLM] reply repaired: {'; '.join(notes)}")
-    result_queue.put({"scratchpad": scratchpad, "raw_yaml": cleaned, "parse_notes": notes, **image})
+        print(f"\n[LLM] reply repaired: {'; '.join(notes)}\n--- reply before repair ---\n{yaml_text[:1500]}\n---")
+        result["raw_reply"] = yaml_text
+    result_queue.put(result)

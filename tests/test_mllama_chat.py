@@ -78,6 +78,57 @@ def test_openai_messages_to_mllama_rejects_bad_roles_and_assistant_images():
         )
 
 
+@pytest.mark.parametrize(
+    "generated, expected",
+    [
+        (' "Walk to the chair."\n  Analysis: "clear"', 'Semantic_State:\n  Hypothesis: "Walk to the chair."\n  Analysis: "clear"'),
+        ('"Walk."', 'Semantic_State:\n  Hypothesis: "Walk."'),
+        ('Semantic_State:\n  Hypothesis: "again"', 'Semantic_State:\n  Hypothesis: "again"'),
+    ],
+)
+def test_reply_is_started_in_yaml_and_joined_once(generated, expected):
+    import sys
+    import types
+    from unittest import mock
+
+    from loka.vla.mllama_chat import REPLY_PREFILL, MllamaChatBackend
+
+    seen = {}
+
+    class Inputs(dict):
+        def to(self, device):
+            return self
+
+    class Processor:
+        def apply_chat_template(self, chat, add_generation_prompt=True):
+            return "<prompt>"
+
+        def __call__(self, images=None, text=None, add_special_tokens=False, return_tensors="pt"):
+            seen["text"] = text
+            ids = mock.MagicMock()
+            ids.shape = (1, 5)
+            return Inputs(input_ids=ids)
+
+        def decode(self, ids, skip_special_tokens=True):
+            return generated
+
+    backend = MllamaChatBackend.__new__(MllamaChatBackend)
+    backend.processor = Processor()
+    backend.model = mock.MagicMock(device="cpu")
+    backend.max_new_tokens = 8
+    backend._lock = mock.MagicMock()
+    backend._torch = types.SimpleNamespace(inference_mode=mock.MagicMock())
+    with mock.patch.dict(sys.modules, {"torch": mock.MagicMock()}):
+        reply = backend.chat([{"role": "user", "content": "go"}])
+        assert seen["text"] == "<prompt>" + REPLY_PREFILL
+        assert reply == expected
+        # The description call starts with SCENE: instead, and "" turns the prefill off.
+        backend.chat([{"role": "user", "content": "go"}], prefill="SCENE:")
+        assert seen["text"] == "<prompt>SCENE:"
+        assert backend.chat([{"role": "user", "content": "go"}], prefill="") == generated.strip()
+        assert seen["text"] == "<prompt>"
+
+
 def test_parse_args_local_orchestrators():
     from loka.run_loka import parse_args
 

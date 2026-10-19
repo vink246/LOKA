@@ -188,6 +188,61 @@ def test_stray_and_empty_sections_are_salvaged():
     assert pad["Semantic_State"] == {"Hypothesis": "just a sentence"}
 
 
+#: The shape behind "empty sections dropped: Semantic_State, Task_Targets" on PACE.
+BULLETED = """Here is my response:
+
+**Semantic_State:**
+* Hypothesis: "Walk toward the chair, keeping the box on the right."
+* Analysis: "The path ahead is clear apart from the box."
+
+**Task_Targets:**
+* gait.mode: walk
+* gait.speed: 0.15
+* gait.goal_x: 1.0
+* gait.goal_y: 0.35
+
+**Listeners:**
+* kind: near_xy
+  x: 0.9
+  y: 0.35
+  radius: 0.3
+  message: "Beside the box."
+
+**Plan:**
+* Goal: "Stand by the chair."
+* Steps:
+  1. "Walk to (1.0, 0.35)"
+  2. "Walk to the chair"
+* Current_Step: 1
+"""
+
+
+def test_markdown_bullets_are_read_as_fields():
+    pad, _, notes = parse_orchestrator_reply(BULLETED)
+    assert pad["Semantic_State"]["Hypothesis"].startswith("Walk toward the chair")
+    assert pad["Task_Targets"] == {
+        "gait.mode": "walk",
+        "gait.speed": 0.15,
+        "gait.goal_x": 1.0,
+        "gait.goal_y": 0.35,
+    }
+    assert pad["Listeners"] == [
+        {"kind": "near_xy", "x": 0.9, "y": 0.35, "radius": 0.3, "message": "Beside the box."}
+    ]
+    assert pad["Plan"]["Steps"] == ["Walk to (1.0, 0.35)", "Walk to the chair"]
+    assert pad["Plan"]["Current_Step"] == 1
+    assert "markdown bullets turned into YAML items" in notes
+
+
+def test_listeners_with_no_kind_do_not_clear_the_armed_ones():
+    reply = 'Semantic_State:\n  Hypothesis: "x"\nListeners:\n  - message: "no kind here"\n'
+    pad, _, notes = parse_orchestrator_reply(reply)
+    assert "Listeners" not in pad
+    assert "Listeners dropped: no entry has a kind" in notes
+    pad, _, _ = parse_orchestrator_reply('Semantic_State:\n  Hypothesis: "x"\nListeners: []\n')
+    assert pad["Listeners"] == []
+
+
 def test_apply_survives_a_null_semantic_state():
     from loka.agent.apply import apply_stand_scratchpad
     from loka.control.locomotion import LocomotionConfig

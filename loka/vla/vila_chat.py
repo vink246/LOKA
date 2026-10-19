@@ -108,7 +108,11 @@ class VilaChatBackend:
         conv.append_message(conv.roles[1], None)
         return conv.get_prompt(), conv
 
-    def chat(self, messages: list[dict]) -> str:
+    def chat(
+        self, messages: list[dict], *, prefill: str = "", max_new_tokens: int | None = None
+    ) -> str:
+        """Greedy reply. VILA's llava generate takes no prefill, so ``prefill`` is ignored."""
+        del prefill
         from llava.constants import IMAGE_TOKEN_INDEX
         from llava.conversation import SeparatorStyle
         from llava.mm_utils import KeywordsStoppingCriteria, process_images, tokenizer_image_token
@@ -138,7 +142,7 @@ class VilaChatBackend:
                 images=image_arg,
                 do_sample=False,
                 temperature=0.0,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=int(max_new_tokens or self.max_new_tokens),
                 use_cache=True,
                 stopping_criteria=[stopping],
             )

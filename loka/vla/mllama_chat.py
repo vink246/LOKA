@@ -29,6 +29,9 @@ MLLAMA_FETCH_HINT = (
 MLLAMA_MIN_FREE_GB = 28.0
 #: Llama 3.2 Vision's context is 128K tokens; warn well before it.
 PROMPT_TOKEN_WARN = 100_000
+#: The reply is started for the model so it continues in LOKA's YAML layout
+#: instead of opening with markdown or prose. It is prepended to the returned text.
+REPLY_PREFILL = "Semantic_State:\n  Hypothesis:"
 
 
 def openai_messages_to_mllama(messages: list[dict]) -> tuple[list[dict], list]:
@@ -116,9 +119,16 @@ class MllamaChatBackend:
         )
         self.model.eval()
 
-    def chat(self, messages: list[dict]) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        prefill: str = REPLY_PREFILL,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        """Greedy reply. ``prefill`` starts the reply ("" for none) and is kept in the text."""
         chat, images = openai_messages_to_mllama(messages)
-        prompt = self.processor.apply_chat_template(chat, add_generation_prompt=True)
+        prompt = self.processor.apply_chat_template(chat, add_generation_prompt=True) + prefill
         inputs = self.processor(
             images=[images] if images else None,
             text=prompt,
@@ -131,11 +141,17 @@ class MllamaChatBackend:
         with self._lock, self._torch.inference_mode():
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=int(max_new_tokens or self.max_new_tokens),
                 do_sample=False,
                 # The checkpoint's generation_config samples; unset its knobs for greedy.
                 temperature=None,
                 top_p=None,
             )
         reply_ids = output[0, n_tokens:]
-        return self.processor.decode(reply_ids, skip_special_tokens=True).strip()
+        text = self.processor.decode(reply_ids, skip_special_tokens=True).rstrip()
+        if not prefill:
+            return text.strip()
+        # The model may restate the start it was given; do not double it.
+        if text.lstrip().startswith(prefill.split(":", 1)[0]):
+            return text.strip()
+        return prefill + (text if text[:1].isspace() else " " + text)

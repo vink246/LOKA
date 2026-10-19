@@ -81,6 +81,10 @@ class LokaConfig:
     #: rules and reply schema but drops the MJCF dump, the per-actuator effort
     #: list, the state cost and the MPC costs, for small local models.
     prompt_style: str = "full"
+    #: Before each turn with a camera frame, ask the model to describe the frame
+    #: (one line per object with its direction and a rough distance), then
+    #: append that description, as written, to the turn. Needs vision.
+    describe_first: bool = False
 
     def __post_init__(self) -> None:
         assert 0 <= self.max_memory <= self.max_turns, (
@@ -487,12 +491,25 @@ class LokaRuntime:
         if self.log is not None and self.config.vision.save_frames:
             frame_path = self._frames_dir() / f"turn_{self._frame_count:03d}.png"
         user_content = user_content.rstrip() + "\n\n" + format_camera_frame(pose, self.config.vision)
-        return user_content, {
+        request = {
             "render": self.ego_renderer.render,
             "snapshot": snapshot,
             "detail": self.config.vision.detail,
             "frame_path": frame_path,
         }
+        if self.config.describe_first:
+            from loka.agent.scene_describe import build_describe_prompt
+
+            request["describe"] = {
+                "prompt": build_describe_prompt(self._directive_text(), self.config.vision, pose),
+            }
+        return user_content, request
+
+    def _directive_text(self) -> str:
+        directives = self.loka_state.get("mission_directives") or []
+        if directives:
+            return "; ".join(d.text.strip() for d in directives)
+        return "no directive yet: hold balance and wait for a goal"
 
     def close(self) -> None:
         if self.ego_renderer is not None:
@@ -644,6 +661,14 @@ class LokaRuntime:
         scratchpad = result["scratchpad"]
         raw = result.get("raw_yaml", "")
         if self.log is not None:
+            if result.get("scene_description"):
+                self.log.note(f"scene description:\n{result['scene_description']}", sim_time=now)
+            if result.get("raw_reply"):
+                self.log.note(
+                    f"reply repaired ({'; '.join(result.get('parse_notes') or [])}); "
+                    f"before repair:\n{result['raw_reply']}",
+                    sim_time=now,
+                )
             self.log.response(
                 sim_time=float(self.sim.data.time),
                 raw_yaml=raw,

@@ -24,7 +24,12 @@ LOKA's full prompt. Needs the ``loka-mllama`` env (``scripts/setup_mllama_env.sh
 on a GPU node; the repo is gated, see ``scripts/fetch_navila_checkpoint.py``.
 Both default to ``--prompt-style compact``: the same rules and reply schema in
 about 2-3K tokens a turn instead of ~20K. ``--prompt-style full`` sends the
-prompt LOKA is evaluated with.
+prompt LOKA is evaluated with. They also default to ``--describe-first`` (with
+``--vision``: the model first describes the frame, each object with its
+direction and a rough distance, and that description is added to the turn as
+written) and ``--max-memory 0`` (no earlier turns in view). All three
+flags also work with OpenAI, e.g. ``--prompt-style compact --describe-first
+--max-memory 0`` to test GPT under the local-model setup.
 ``--orchestrator-vila PATH`` does the same with Llama-3-VILA1.5-8B (NaVILA's
 base model, ``loka-navila`` env), but VILA reads only 4,096 tokens, so it sees
 the start of the system prompt and nothing after it.
@@ -64,7 +69,8 @@ on one updating line. The orchestrator runs unless you pass ``--no-llm``.
 
 Session logs rewrite ``logs/loka/session.log`` (+ ``.jsonl``) each run.
 
-Interactive viewer commands (stdin) and keys:
+Interactive commands (stdin, with the viewer or ``--headless`` when stdin is a
+terminal) and viewer keys:
   mass / friction|ice / push / dead / scale|weak / clear / help
   spawn <kind> x y [yaw] | move <prop> x y [yaw] | remove <prop> | props | clear props
   search mass [body] | search com <x|y|z> [body] | search friction | search gear <actuator> | search stop
@@ -325,6 +331,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "base model) instead of OpenAI. Needs the loka-navila env on a GPU node",
     )
     parser.add_argument(
+        "--describe-first",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Before each turn with a camera frame, have the model describe the frame "
+        "(objects with direction and rough distance) and add that description to the "
+        "turn as written. Needs --vision. Default: on with --orchestrator-mllama / "
+        "--orchestrator-vila, off otherwise (works with OpenAI too)",
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Completed orchestrator turns kept in view (session.max_memory). Default: 0 "
+        "with --orchestrator-mllama / --orchestrator-vila (small models copy their own "
+        "earlier replies), loka.yaml otherwise",
+    )
+    parser.add_argument(
         "--prompt-style",
         choices=("full", "compact"),
         default=None,
@@ -353,6 +377,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--orchestrator-vila needs a cuda --orchestrator-device")
     if args.prompt_style is None:
         args.prompt_style = "compact" if local else "full"
+    if args.describe_first is None:
+        args.describe_first = bool(local)
+    if args.max_memory is None:
+        args.max_memory = 0 if local else None
+    elif args.max_memory < 0:
+        parser.error("--max-memory must be >= 0")
     if args.vision and (args.no_llm or args.unitree_rl) and not args.navila:
         parser.error("--vision feeds the orchestrator; drop --no-llm / --unitree-rl")
     if args.ego_view and args.headless:
@@ -742,12 +772,22 @@ def main(argv: list[str] | None = None) -> int:
         log_path = None
         if not args.no_log:
             log_path = default_log_path(args.log_dir)
+        describe_first = bool(args.describe_first) and vision
+        if args.describe_first and not vision and "--describe-first" in (argv or sys.argv[1:]):
+            print("[LOKA] --describe-first needs the camera; add --vision. Describing is off.")
+        memory = {} if args.max_memory is None else {"max_memory": int(args.max_memory)}
+        print(
+            f"[LOKA] prompt={args.prompt_style} describe_first={describe_first} "
+            f"max_memory={memory.get('max_memory', 'loka.yaml')}"
+        )
         runtime = LokaRuntime(
             sim,
             LokaConfig(
                 enable_llm=llm_enabled,
                 llm_model=llm_model,
                 prompt_style=args.prompt_style,
+                describe_first=describe_first,
+                **memory,
                 enable_vision=vision,
                 vision=camera,
                 enable_session_log=not args.no_log,
@@ -838,16 +878,29 @@ def _run(args, sim, runtime, llm_enabled: bool, recorder=None) -> int:
         f"G1 {plant}: orchestrator {'on' if llm_enabled else 'off'}  fault={args.fault}"
     )
 
+    stdin_stop = threading.Event()
+    if sys.stdin.isatty():
+        threading.Thread(
+            target=_stdin_command_thread,
+            args=(runtime, stdin_stop),
+            kwargs={"llm_enabled": llm_enabled, "navila": bool(args.navila)},
+            daemon=True,
+        ).start()
+
     if args.headless:
-        if recorder is None:
-            history = runtime.run(duration or 15.0)
-        else:
-            end = duration or 15.0
-            recorder.maybe_capture()
-            while sim.data.time < end and not sim.fell:
-                runtime.step()
+        try:
+            if recorder is None:
+                history = runtime.run(duration or 15.0)
+            else:
+                end = duration or 15.0
                 recorder.maybe_capture()
-            history = getattr(runtime, "history", sim.history)
+                while sim.data.time < end and not sim.fell:
+                    runtime.step()
+                    recorder.maybe_capture()
+                history = getattr(runtime, "history", sim.history)
+        finally:
+            stop.set()
+            stdin_stop.set()
         fell = sim.fell
         print(sim.stats().report())
         print(f"tracking samples: {len(history)}  fell={fell}")
@@ -860,14 +913,6 @@ def _run(args, sim, runtime, llm_enabled: bool, recorder=None) -> int:
 
     steps_per_frame = max(1, round(1.0 / (RENDER_HZ * sim.config.control_dt)))
     frame_dt = steps_per_frame * sim.config.control_dt
-    stdin_stop = threading.Event()
-    if sys.stdin.isatty():
-        threading.Thread(
-            target=_stdin_command_thread,
-            args=(runtime, stdin_stop),
-            kwargs={"llm_enabled": llm_enabled, "navila": bool(args.navila)},
-            daemon=True,
-        ).start()
 
     ego_view = None
     if args.ego_view:
