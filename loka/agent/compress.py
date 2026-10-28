@@ -211,7 +211,11 @@ def format_cost_section(observer) -> str:
 
 
 def format_prop_contact_section(frames: Sequence[dict]) -> str:
-    """Robot-to-prop contact over the window. Empty when nothing was touched."""
+    """Robot-to-prop contact over the window. Empty when nothing was touched.
+
+    Objects are numbered, not named: what the robot bumped into is for the
+    orchestrator to find in the image, as a robot only feels the force.
+    """
     peak: dict[str, dict] = {}
     touching_steps: dict[str, int] = {}
     for frame in frames:
@@ -225,19 +229,67 @@ def format_prop_contact_section(frames: Sequence[dict]) -> str:
         return ""
     latest = {e["prop"] for e in (frames[-1].get("prop_contacts") or ())}
     lines = [
-        "PROP CONTACT",
-        "  The robot touched a prop in this window. Contact force enters the effort "
+        "OBJECT CONTACT",
+        "  The robot touched an object in this window. Contact force enters the effort "
         "residual as an external load. It is not a model error; do not queue a belief "
         "search for it.",
     ]
-    for name, entry in sorted(peak.items(), key=lambda kv: -kv[1]["force_n"]):
+    ranked = sorted(peak.items(), key=lambda kv: -kv[1]["force_n"])
+    for index, (name, entry) in enumerate(ranked, start=1):
         share = touching_steps[name] / max(len(frames), 1)
         now = "touching now" if name in latest else "released"
         lines.append(
-            f"  {name} ({entry['kind']}): peak normal {entry['force_n']:.1f} N, "
-            f"{share:.0%} of the window, {now}; links {', '.join(entry['links'])}"
+            f"  object {index}: peak normal {entry['force_n']:.1f} N, "
+            f"{share:.0%} of the window, {now}; robot links {', '.join(entry['links'])}"
         )
     return "\n".join(lines) + "\n"
+
+
+def format_compact_state_section(frames: Sequence[dict]) -> str:
+    """Pose, motion, goal progress and gait command in four lines."""
+    latest = frames[-1]
+    qpos = np.asarray(latest.get("qpos", np.zeros(7)), dtype=float)
+    qvel = np.asarray(latest.get("qvel", np.zeros(6)), dtype=float)
+    rpy = np.asarray(latest.get("rpy", np.zeros(3)), dtype=float)
+    lines = [
+        "STATE",
+        f"  t={float(latest.get('time', 0.0)):.2f}s pelvis x={qpos[0]:+.2f} y={qpos[1]:+.2f} "
+        f"z={qpos[2]:.2f} m, yaw={np.degrees(rpy[2]):+.0f} deg, roll={np.degrees(rpy[0]):+.1f} "
+        f"pitch={np.degrees(rpy[1]):+.1f} deg",
+        f"  speed {float(latest.get('planar_speed', np.linalg.norm(qvel[:2]))):.2f} m/s, "
+        f"walking={bool(latest.get('walking'))}",
+    ]
+    if bool(latest.get("goal_active", False)):
+        goal = np.array([float(latest.get("goal_x", 0.0)), float(latest.get("goal_y", 0.0))])
+        delta = goal - qpos[:2]
+        dist = float(np.linalg.norm(delta))
+        closing = float(qvel[:2] @ delta / dist) if dist > 1e-4 else 0.0
+        bearing = float(np.degrees(np.arctan2(delta[1], delta[0])))
+        lines.append(
+            f"  goal ({goal[0]:+.2f}, {goal[1]:+.2f}) {dist:.2f} m away at bearing {bearing:+.0f} deg, "
+            f"closing speed {closing:+.2f} m/s"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_compact_effort_section(observer) -> str:
+    """|bias| against its threshold, the three largest actuators, motor and slip."""
+    if observer is None or observer.joint_bias is None:
+        return "EFFORT\n  (no samples)\n"
+    bias = np.asarray(observer.joint_bias, dtype=float)
+    names = list(observer.names or tuple(str(i) for i in range(bias.size)))
+    threshold = observer.walk_threshold_nm if observer.is_walking else observer.stand_threshold_nm
+    order = np.argsort(-np.abs(bias))[:3]
+    top = ", ".join(f"{names[i]} {bias[i]:+.1f}" for i in order if i < len(names))
+    motor = f"{observer.motor_nm:.2f}" if observer.motor_bias is not None else "n/a"
+    return (
+        "EFFORT\n"
+        f"  |bias|={float(np.sum(np.abs(bias))):.1f} Nm (threshold {threshold:.1f}, "
+        f"out of bounds {observer.consecutive_out_of_bounds}/{observer.consecutive_steps}); "
+        f"largest: {top}\n"
+        f"  |motor|={motor} (threshold {observer.motor_threshold_nm:.1f}), "
+        f"slip={observer.slip_mps:.2f} m/s (threshold {observer.slip_threshold_mps:.2f})\n"
+    )
 
 
 def synthesize_stand_telemetry(
@@ -245,15 +297,27 @@ def synthesize_stand_telemetry(
     *,
     control_dt: float,
     observer=None,
+    compact: bool = False,
 ) -> str:
-    """Current state, per-actuator effort deviation, and per-component state cost."""
+    """Current state, per-actuator effort deviation, and per-component state cost.
+
+    ``compact`` keeps the state, the effort summary and any prop contact, and
+    drops the per-actuator list and the state cost.
+    """
     window = _window_frames(frames, control_dt)
     if not window:
         return "No telemetry available.\n"
-    sections = [
-        format_full_state_section(window),
-        format_effort_section(observer),
-        format_prop_contact_section(window),
-        format_cost_section(observer),
-    ]
+    if compact:
+        sections = [
+            format_compact_state_section(window),
+            format_compact_effort_section(observer),
+            format_prop_contact_section(window),
+        ]
+    else:
+        sections = [
+            format_full_state_section(window),
+            format_effort_section(observer),
+            format_prop_contact_section(window),
+            format_cost_section(observer),
+        ]
     return "\n".join(section for section in sections if section)

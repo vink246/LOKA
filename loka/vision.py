@@ -213,13 +213,22 @@ def _ego_render_worker(conn, recipe: dict) -> None:
     conn.send((True, "ready"))
     try:
         while True:
-            snapshot = conn.recv()
-            if snapshot is None:
+            message = conn.recv()
+            if message is None:
                 break
+            # ``("rgb"|"png", snapshot)`` or a bare snapshot (PNG, legacy).
+            if isinstance(message, tuple) and len(message) == 2:
+                mode, snapshot = message
+            else:
+                mode, snapshot = "png", message
             try:
                 apply_snapshot(model, data, snapshot)
                 renderer.update_scene(data, camera=EGO_CAMERA)
-                conn.send((True, encode_png(renderer.render())))
+                rgb = renderer.render()
+                if mode == "rgb":
+                    conn.send((True, np.asarray(rgb, dtype=np.uint8)))
+                else:
+                    conn.send((True, encode_png(rgb)))
             except Exception as exc:
                 conn.send((False, f"render failed: {exc}"))
     except (EOFError, KeyboardInterrupt):
@@ -250,7 +259,14 @@ class EgoRenderer:
             return
         if not self._conn.poll(RENDER_TIMEOUT_S * 3):
             raise RuntimeError("ego renderer did not start")
-        ok, message = self._conn.recv()
+        try:
+            ok, message = self._conn.recv()
+        except EOFError:
+            self.error = (
+                f"ego renderer process exited during start (gl={self.backend}); "
+                "see its traceback above"
+            )
+            raise RuntimeError(self.error) from None
         if not ok:
             self.error = str(message)
             raise RuntimeError(self.error)
@@ -258,13 +274,20 @@ class EgoRenderer:
 
     def render(self, snapshot: dict) -> bytes:
         """PNG bytes of ``snapshot`` from ``ego_cam``."""
+        return self._request("png", snapshot)
+
+    def render_rgb(self, snapshot: dict) -> np.ndarray:
+        """Raw HxWx3 uint8 RGB of ``snapshot`` from ``ego_cam``."""
+        return self._request("rgb", snapshot)
+
+    def _request(self, mode: str, snapshot: dict):
         with self._lock:
             if self.error is not None:
                 raise RuntimeError(self.error)
             if not self._proc.is_alive() and self._ready:
                 raise RuntimeError("ego renderer process exited")
             self._wait_ready()
-            self._conn.send(snapshot)
+            self._conn.send((mode, snapshot))
             if not self._conn.poll(RENDER_TIMEOUT_S):
                 raise RuntimeError(f"ego render timed out after {RENDER_TIMEOUT_S:.0f}s")
             ok, payload = self._conn.recv()

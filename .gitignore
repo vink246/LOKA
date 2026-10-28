@@ -225,6 +225,9 @@ results/
 loka_recording.mp4
 *.mp4
 
+# Vendored upstream clones for optional baselines (NaVILA, …)
+third_party/
+
 # LaTeX build byproducts (keep paper/*.tex and paper/main.pdf)
 *.aux
 *.fdb_latexmk

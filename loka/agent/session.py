@@ -84,15 +84,17 @@ class ConversationMixin:
         return len(self._messages) // 2
 
     def record_intervention(self, sim_time: float, scratchpad: dict) -> None:
-        sem_state = scratchpad.get("Semantic_State", {})
+        sem_state = scratchpad.get("Semantic_State")
+        if not isinstance(sem_state, dict):
+            sem_state = {}
         self.interventions.append({
             "time": sim_time,
             "hypothesis": sem_state.get("Hypothesis"),
             "hypotheses": sem_state.get("Hypotheses") or [],
             "analysis": sem_state.get("Analysis"),
-            "planner_targets": scratchpad.get("Planner_Targets", {}),
-            "task_targets": scratchpad.get("Task_Targets", {}),
-            "model_mutations": scratchpad.get("Model_Mutations", []),
+            "planner_targets": scratchpad.get("Planner_Targets") or {},
+            "task_targets": scratchpad.get("Task_Targets") or {},
+            "model_mutations": scratchpad.get("Model_Mutations") or [],
             "belief_searches": scratchpad.get("Belief_Searches")
             or scratchpad.get("Belief_Search")
             or [],

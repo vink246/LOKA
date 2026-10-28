@@ -81,7 +81,10 @@ def apply_stand_scratchpad(
     print("\n" + "=" * 55)
     print("[ORCHESTRATOR] LOKA STAND UPDATE")
     print("=" * 55)
-    sem = scratchpad.get("Semantic_State", {})
+    sem = scratchpad.get("Semantic_State")
+    if not isinstance(sem, dict):
+        sem = {"Hypothesis": sem} if sem else {}
+        scratchpad["Semantic_State"] = sem
     print(f"Hypothesis: {sem.get('Hypothesis', 'None')}")
     print(f"Analysis:   {sem.get('Analysis', 'None')}\n")
 

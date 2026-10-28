@@ -94,3 +94,34 @@ recording:
 props:
   slots: {chair: 3, table: 2, box: 4, cube: 4, shelf: 1}
   static: [shelf]
+
+# NaVILA navigation VLA (run_loka --navila). Weights load only from a local
+# directory; never pass a Hub id here. On PACE:
+#   python scripts/fetch_navila_checkpoint.py --out ~/scratch/models/navila-llama3-8b-8f
+# Hub id for that script only: a8cheng/navila-llama3-8b-8f (~16 GB on disk).
+# Camera defaults approximate NaVILA's R2R training views (wider FOV, flatter).
+navila:
+  model_path: ""
+  device: cuda:0
+  num_frames: 8
+  max_new_tokens: 32
+  forward_speed: 0.25
+  turn_tolerance_deg: 5.0
+  # move forward: heading locked to the start yaw; stand this far [m] short of
+  # the distance so the stopping step lands near it.
+  stop_lead: 0.10
+  # Turns ramp gait.speed down at this rate [m/s^2] (to 0 on MPC, to the
+  # policy's min walk speed on unitree_rl).
+  turn_decel: 0.10
+  timeout_factor: 3.0
+  max_actions: 40
+  unparseable_fallback: stop
+  min_free_gb: 20.0
+  save_frames: true
+  camera:
+    width: 512
+    height: 512
+    fovy_deg: 90.0
+    pitch_down_deg: 10.0
+    detail: high
+    save_frames: true
