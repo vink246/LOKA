@@ -81,7 +81,7 @@ def test_anthropic_provider_caches_the_system_prompt_and_keeps_the_prefill():
     request = fake.calls[0]
     assert request["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     # The history ends in a cache breakpoint too; the new user turn does not.
-    assert request["messages"][1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert request["messages"][1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
     assert all("cache_control" not in block for block in request["messages"][2]["content"])
     assert request["max_tokens"] == 4096
     assert request["messages"][-1] == {"role": "assistant", "content": [{"type": "text", "text": "Semantic_State:"}]}

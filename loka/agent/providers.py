@@ -321,9 +321,11 @@ class AnthropicProvider(ChatProvider):
         prefill = (self.default_prefill if prefill is None else prefill).rstrip()
         system, converted = openai_messages_to_anthropic(list(messages))
         # A second breakpoint after the earlier exchanges caches the history, so
-        # only the new user turn is billed as fresh input on the next call.
+        # only the new user turn is billed as fresh input on the next call. Turns
+        # are seconds apart, so the cheaper 5 m write suffices (a 1 h breakpoint
+        # may precede a 5 m one, not follow it).
         if len(converted) >= 2 and converted[-2]["role"] == "assistant" and converted[-2]["content"]:
-            converted[-2]["content"][-1] = {**converted[-2]["content"][-1], "cache_control": dict(self.cache_control)}
+            converted[-2]["content"][-1] = {**converted[-2]["content"][-1], "cache_control": {"type": "ephemeral", "ttl": "5m"}}
         if prefill:
             converted.append({"role": "assistant", "content": [{"type": "text", "text": prefill}]})
         request = {
