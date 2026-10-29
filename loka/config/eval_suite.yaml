@@ -49,7 +49,7 @@ ablation_config: loka/config/loka_ablations.yaml
 # options.variant, a name under variants in the ablation config. Examples:
 #   - {name: loka_raw_telemetry, type: loka_ablated, options: {variant: raw_telemetry}}
 #   - {name: loka_cost_detector, type: loka_ablated, options: {variant: cost_detector}}
-#   - {name: loka_claude, type: loka, options: {orchestrator: {model: claude-sonnet-4-5}}}
+#   - {name: loka_claude, type: loka, options: {orchestrator: {model: claude-sonnet-5-5}}}
 #   - {name: loka_gemma3_27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it, latency: {mode: pause}}}}
 # Local models (orchestrator_models.yaml, provider: local) run as PACE GPU jobs.
 baselines: [low_level, loka, unitree_rl]

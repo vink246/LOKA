@@ -25,11 +25,9 @@ controller:
   stack: legacy_dcm
 
 # Shared by every LOKA baseline unless its options.orchestrator overrides it.
-# temperature 0 makes every model decode (near-)greedily, so differences come
-# from the model, not from sampling. A model that accepts only its default
-# temperature (some OpenAI reasoning models) falls back to it; each turn's
-# decoding record in loka_turns.jsonl says what was actually sent. Runs made
-# before this setting used each vendor's default temperature.
+# temperature 0 makes the local models decode greedily, so differences come
+# from the model, not from sampling. The API models refuse it and fall back to
+# their default.
 orchestrator:
   model: gpt-6-luna
   latency:
@@ -64,15 +62,15 @@ baselines:
   # so a slow model is judged on its decisions, not its speed; compare these
   # with loka_pause, the reference model under the same latency mode.
   - {name: loka_pause, type: loka, options: {orchestrator: {latency: {mode: pause}}}}
-  - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-4-5, latency: {mode: pause}}}}
+  - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-5-5, latency: {mode: pause}}}}
   - {name: loka_gemma3_4b, type: loka, options: {orchestrator: {model: gemma-3-4b-it, latency: {mode: pause}}}}
   - {name: loka_gemma3_12b, type: loka, options: {orchestrator: {model: gemma-3-12b-it, latency: {mode: pause}}}}
   - {name: loka_gemma3_27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it, latency: {mode: pause}}}}
   - {name: loka_llama32_11b, type: loka, options: {orchestrator: {model: llama-3.2-11b-vision, latency: {mode: pause}}}}
   - {name: loka_gpt_oss_20b, type: loka, options: {orchestrator: {model: gpt-oss-20b, latency: {mode: pause}}}}
   # Larger or optional models: uncomment once their weights are fetched.
-  # - {name: loka_claude_haiku, type: loka, options: {orchestrator: {model: claude-haiku-4-5, latency: {mode: pause}}}}
-  # - {name: loka_claude_opus, type: loka, options: {orchestrator: {model: claude-opus-4-1, latency: {mode: pause}}}}
+  # - {name: loka_claude_haiku, type: loka, options: {orchestrator: {model: claude-haiku-5-5, latency: {mode: pause}}}}
+  # - {name: loka_claude_opus, type: loka, options: {orchestrator: {model: claude-opus-5-5, latency: {mode: pause}}}}
   # - {name: loka_llama31_8b, type: loka, options: {orchestrator: {model: llama-3.1-8b, latency: {mode: pause}}}}
   # - {name: loka_ministral_8b, type: loka, options: {orchestrator: {model: ministral-8b, latency: {mode: pause}}}}
   # - {name: loka_mistral_small_24b, type: loka, options: {orchestrator: {model: mistral-small-3.2-24b, latency: {mode: pause}}}}

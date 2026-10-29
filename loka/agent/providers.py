@@ -47,6 +47,16 @@ def join_prefill(prefill: str, text: str) -> str:
     return prefill + (text if text[:1].isspace() else " " + text)
 
 
+def _accepts_keyword(fn, name: str) -> bool:
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
 def _rejects_temperature(exc: Exception) -> bool:
     """A 400 from a model that only accepts its default temperature."""
     return type(exc).__name__ == "BadRequestError" and "temperature" in str(exc).lower()
@@ -281,12 +291,21 @@ class AnthropicProvider(ChatProvider):
         max_tokens: int | None = 4096,
         prefill: str | None = None,
         temperature: float | None = None,
+        cache_ttl: str | None = "1h",
         client=None,
         timeout: float | None = None,
     ) -> None:
         if temperature is not None and not 0.0 <= float(temperature) <= 1.0:
             raise ValueError(f"Anthropic temperature must be in [0, 1], got {temperature}")
+        if cache_ttl not in (None, "5m", "1h"):
+            raise ValueError(f"Anthropic cache_ttl must be 5m or 1h, got {cache_ttl!r}")
         super().__init__(model, max_tokens=max_tokens or 4096, prefill=prefill, temperature=temperature)
+        #: The system prompt is identical across every turn, episode and worker of
+        #: a run, so a 1 h cache is written about once an hour instead of once per
+        #: episode (a write costs more than a 5 m one, a read costs the same).
+        self.cache_control = {"type": "ephemeral"}
+        if cache_ttl:
+            self.cache_control["ttl"] = cache_ttl
         if client is None:
             import anthropic
 
@@ -301,6 +320,10 @@ class AnthropicProvider(ChatProvider):
     def complete(self, messages, *, prefill=None, max_tokens=None):
         prefill = (self.default_prefill if prefill is None else prefill).rstrip()
         system, converted = openai_messages_to_anthropic(list(messages))
+        # A second breakpoint after the earlier exchanges caches the history, so
+        # only the new user turn is billed as fresh input on the next call.
+        if len(converted) >= 2 and converted[-2]["role"] == "assistant" and converted[-2]["content"]:
+            converted[-2]["content"][-1] = {**converted[-2]["content"][-1], "cache_control": dict(self.cache_control)}
         if prefill:
             converted.append({"role": "assistant", "content": [{"type": "text", "text": prefill}]})
         request = {
@@ -310,23 +333,49 @@ class AnthropicProvider(ChatProvider):
         }
         if system:
             request["system"] = [
-                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+                {"type": "text", "text": system, "cache_control": dict(self.cache_control)}
             ]
+        create = self.client.messages.create
         if self.temperature is not None:
-            request["temperature"] = self.temperature
-        response = self.client.messages.create(**request)
+            if _accepts_keyword(create, "temperature"):
+                request["temperature"] = self.temperature
+            else:
+                # Newer SDKs dropped sampling keywords; the body still carries it.
+                request["extra_body"] = {"temperature": self.temperature}
+        try:
+            response = create(**request)
+        except Exception as exc:
+            if self.temperature is None or not _rejects_temperature(exc):
+                raise
+            print(f"[LLM] {self.model} rejected temperature={self.temperature}; using its default ({exc})")
+            self.temperature = None
+            self.temperature_rejected = True
+            request.pop("temperature", None)
+            request.pop("extra_body", None)
+            response = create(**request)
         text = "".join(
             getattr(block, "text", "") for block in response.content or () if getattr(block, "type", "") == "text"
         )
         usage = _empty_usage()
         raw = getattr(response, "usage", None)
         if raw is not None:
-            usage["input_tokens"] = int(getattr(raw, "input_tokens", 0) or 0)
+            # Anthropic's input_tokens excludes cached tokens; count the whole prompt,
+            # as OpenAI's prompt_tokens does.
+            uncached = int(getattr(raw, "input_tokens", 0) or 0)
+            usage["input_tokens"] = uncached
+            usage["uncached_input_tokens"] = uncached
             usage["output_tokens"] = int(getattr(raw, "output_tokens", 0) or 0)
             for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
                 value = getattr(raw, key, None)
                 if value:
                     usage[key] = int(value)
+                    usage["input_tokens"] += int(value)
+        if getattr(response, "stop_reason", None) == "refusal":
+            details = getattr(response, "stop_details", None)
+            category = getattr(details, "category", None) or "unspecified"
+            print(f"[LLM] {self.model} refused the turn (category {category}); no reply this turn")
+            usage["refusals"] = 1
+            return "", usage
         if prefill:
             text = prefill + (text if text[:1].isspace() else " " + text)
         return text, usage
@@ -345,7 +394,12 @@ def build_provider(provider: str, options: dict | None = None, *, timeout: float
         return OpenAIProvider(model, max_tokens=max_tokens, temperature=temperature, timeout=timeout)
     if provider == "anthropic":
         return AnthropicProvider(
-            model, max_tokens=max_tokens or 4096, prefill=prefill, temperature=temperature, timeout=timeout
+            model,
+            max_tokens=max_tokens or 4096,
+            prefill=prefill,
+            temperature=temperature,
+            cache_ttl=options.get("cache_ttl", "1h"),
+            timeout=timeout,
         )
     if provider == "local":
         return LocalProvider(

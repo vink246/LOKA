@@ -79,11 +79,37 @@ def test_anthropic_provider_caches_the_system_prompt_and_keeps_the_prefill():
     provider = AnthropicProvider("claude-x", client=fake)
     text, usage = provider.complete(_messages(), prefill="Semantic_State:")
     request = fake.calls[0]
-    assert request["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert request["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    # The history ends in a cache breakpoint too; the new user turn does not.
+    assert request["messages"][1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert all("cache_control" not in block for block in request["messages"][2]["content"])
     assert request["max_tokens"] == 4096
     assert request["messages"][-1] == {"role": "assistant", "content": [{"type": "text", "text": "Semantic_State:"}]}
     assert text.startswith("Semantic_State:")
-    assert usage["input_tokens"] == 900 and usage["cache_read_input_tokens"] == 800
+    # The whole prompt counts, cached or not.
+    assert usage["input_tokens"] == 1700 and usage["uncached_input_tokens"] == 900
+    assert usage["cache_read_input_tokens"] == 800
+
+
+def test_anthropic_cache_ttl_option():
+    fake = FakeAnthropic("x")
+    AnthropicProvider("claude-x", cache_ttl="5m", client=fake).complete([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}])
+    assert fake.calls[0]["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    with pytest.raises(ValueError, match="cache_ttl"):
+        AnthropicProvider("claude-x", cache_ttl="2h", client=fake)
+
+
+def test_anthropic_refusal_is_reported():
+    def create(**_request):
+        return NS(
+            content=[],
+            stop_reason="refusal",
+            stop_details=NS(category="reasoning_extraction"),
+            usage=NS(input_tokens=5, output_tokens=0, cache_read_input_tokens=None, cache_creation_input_tokens=None),
+        )
+
+    text, usage = AnthropicProvider("claude-x", client=NS(messages=NS(create=create))).complete(_messages())
+    assert text == "" and usage["refusals"] == 1
 
 
 def test_local_provider_continues_the_prefill():
@@ -133,6 +159,28 @@ def test_temperature_is_sent_and_recorded():
     assert "temperature" not in plain.calls[0]
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         AnthropicProvider("claude-x", temperature=1.5, client=FakeAnthropic("x"))
+
+
+def test_anthropic_sdk_without_sampling_keywords_uses_the_body():
+    calls: list[dict] = []
+
+    def create(*, max_tokens, messages, model, system=None, extra_body=None):
+        calls.append({"extra_body": extra_body})
+        usage = NS(input_tokens=1, output_tokens=1, cache_read_input_tokens=None, cache_creation_input_tokens=None)
+        return NS(content=[NS(type="text", text="ok")], usage=usage)
+
+    provider = AnthropicProvider("claude-x", temperature=0.0, client=NS(messages=NS(create=create)))
+    provider.complete(_messages())
+    assert calls[0]["extra_body"] == {"temperature": 0.0}
+
+    def refusing(*, max_tokens, messages, model, system=None, extra_body=None):
+        if extra_body:
+            raise BadRequestError("temperature: Extra inputs are not permitted")
+        return create(max_tokens=max_tokens, messages=messages, model=model, system=system)
+
+    provider = AnthropicProvider("claude-x", temperature=0.0, client=NS(messages=NS(create=refusing)))
+    assert provider.complete(_messages())[0] == "ok"
+    assert provider.decoding()["temperature_rejected"]
 
 
 def test_rejected_temperature_falls_back_and_is_recorded():

@@ -45,6 +45,9 @@ defaults:
     vllm_args: ["--max-num-seqs", "2", "--gpu-memory-utilization", "0.88"]
   anthropic:
     max_tokens: 4096
+    # Prompt-cache lifetime for the system prompt and conversation history:
+    # 1h (write once an hour across the whole run) or 5m.
+    cache_ttl: 1h
   openai: {}
 
 models:
