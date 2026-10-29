@@ -2,6 +2,7 @@
 
 ``low_level`` is the MPC + whole-body controller with no orchestrator.
 ``loka`` is that same controller with the language orchestrator in the loop.
+``loka_ablated`` is LOKA with components switched off (``loka_ablations.yaml``).
 ``unitree_rl`` is the unitree_rl_lab velocity policy on the same plant.
 ``navila`` is the NaVILA mid-level navigation VLA on the MPC or unitree_rl plant.
 
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
+from loka.agent.ablations import AblationSet
 from loka.agent.faults import FaultSpec
 from loka.agent.interactive import FaultVizState, commit_fault
 from loka.agent.runtime import LokaConfig, LokaRuntime
@@ -160,29 +162,54 @@ class UnitreeRLBaseline(LowLevelBaseline):
         self._goal_xy = None
 
 
+def loka_runtime_config(spec, suite, log_path: Path | None = None) -> LokaConfig:
+    """``LokaConfig`` for a ``loka`` or ``loka_ablated`` baseline spec.
+
+    Options: ``orchestrator`` overrides the suite orchestrator (model,
+    provider, latency, prompt_style, reply_check, max_tokens); ``ablations``
+    (``loka_ablated`` only) is the resolved variant.
+    """
+    from loka.agent.model_registry import resolve_model
+
+    options = dict(spec.options or {})
+    orch = suite.orchestrator_for(spec)
+    entry = dict(options.get("model_entry") or resolve_model(orch.model, provider=orch.provider))
+    if orch.max_tokens is not None:
+        entry["max_tokens"] = int(orch.max_tokens)
+    if orch.temperature is not None:
+        entry["temperature"] = float(orch.temperature)
+    ablations = AblationSet.from_dict(options.get("ablations")) if spec.type == "loka_ablated" else AblationSet()
+    return LokaConfig(
+        enable_llm=True,
+        llm_model=str(entry["model"]),
+        llm_provider=str(entry["provider"]),
+        llm_options=entry,
+        llm_latency_mode=orch.latency_mode,
+        llm_latency_s=orch.latency_s,
+        llm_request_timeout_s=orch.request_timeout_s,
+        prompt_style=orch.prompt_style,
+        reply_check=orch.reply_check,
+        ablations=ablations,
+        print_compressor=False,
+        enable_session_log=log_path is not None,
+        log_path=log_path,
+    )
+
+
 @register_baseline("loka")
 class LokaBaseline(Baseline):
-    """The full LOKA loop: the same plant, plus the orchestrator."""
+    """The full LOKA loop: the same plant, plus the orchestrator.
+
+    ``options.orchestrator`` picks the model per baseline, e.g.
+    ``{model: claude-sonnet-4-5}`` or a local key from
+    ``loka/config/orchestrator_models.yaml``.
+    """
 
     supports_directive = True
 
     def __init__(self, spec, suite, log_path: Path | None = None) -> None:
-        del spec
         self._sim = Simulation(locomotion_config(suite))
-        orch = suite.orchestrator
-        self.runtime = LokaRuntime(
-            self._sim,
-            LokaConfig(
-                enable_llm=True,
-                llm_model=orch.model,
-                llm_latency_mode=orch.latency_mode,
-                llm_latency_s=orch.latency_s,
-                llm_request_timeout_s=orch.request_timeout_s,
-                print_compressor=False,
-                enable_session_log=log_path is not None,
-                log_path=log_path,
-            ),
-        )
+        self.runtime = LokaRuntime(self._sim, loka_runtime_config(spec, suite, log_path))
         self.runtime.effort_observer.printout = False
         self._goal_xy = None
 
@@ -227,6 +254,15 @@ class LokaBaseline(Baseline):
 
     def mutation_count(self) -> int:
         return len(self.runtime.loka_state.get("mutations") or [])
+
+
+@register_baseline("loka_ablated")
+class LokaAblatedBaseline(LokaBaseline):
+    """LOKA with components switched off by a variant of ``loka_ablations.yaml``.
+
+    Options: ``variant`` (a name under ``variants``), resolved at config parse
+    time into ``ablations``; ``orchestrator`` as for ``loka``.
+    """
 
 
 @register_baseline("navila")

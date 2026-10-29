@@ -24,6 +24,14 @@ def _window_frames(buffer: Sequence[dict], control_dt: float) -> list[dict]:
 
 def _gait_band_line(stack: str = "legacy_dcm") -> str:
     """Safe gait band from the coarse sweep. apply_updates clips to this."""
+    return (
+        "  gait safe band (out of range is clipped; defaults are the 0.25 m/s walk): "
+        + gait_band_text(stack)
+    )
+
+
+def gait_band_text(stack: str = "legacy_dcm") -> str:
+    """Each gait knob's clip range and default, ``; ``-separated."""
     from loka.control.gait import gait_knobs, gait_schedule_for_speed
 
     sched = gait_schedule_for_speed(0.25)
@@ -45,10 +53,7 @@ def _gait_band_line(stack: str = "legacy_dcm") -> str:
             }.get(knob.name)
         extra = f" default {default:.3g}" if default is not None else ""
         bits.append(f"{knob.name} [{knob.low:.3g}, {knob.high:.3g}]{extra}")
-    return (
-        "  gait safe band (out of range is clipped; defaults are the 0.25 m/s walk): "
-        + "; ".join(bits)
-    )
+    return "; ".join(bits)
 
 
 def _progress_lines(latest: dict, qpos: np.ndarray, qvel: np.ndarray) -> list[str]:
@@ -298,26 +303,78 @@ def synthesize_stand_telemetry(
     control_dt: float,
     observer=None,
     compact: bool = False,
+    hide_residual: bool = False,
 ) -> str:
     """Current state, per-actuator effort deviation, and per-component state cost.
 
     ``compact`` keeps the state, the effort summary and any prop contact, and
-    drops the per-actuator list and the state cost.
+    drops the per-actuator list and the state cost. With a tracking-cost
+    detector (``observer.kind == "cost"``) the report adds the TRACKING COST
+    trigger; ``hide_residual`` then leaves out the effort deviation, motor
+    deficit and stance slip.
     """
     window = _window_frames(frames, control_dt)
     if not window:
         return "No telemetry available.\n"
+    cost_trigger = getattr(observer, "kind", "residual") == "cost"
+    effort = None if hide_residual else (
+        format_compact_effort_section(observer) if compact else format_effort_section(observer)
+    )
+    trigger = None
+    if cost_trigger:
+        trigger = (
+            format_compact_tracking_cost_section(observer)
+            if compact
+            else format_tracking_cost_section(observer)
+        )
     if compact:
         sections = [
             format_compact_state_section(window),
-            format_compact_effort_section(observer),
+            trigger,
+            effort,
             format_prop_contact_section(window),
+            # Without the residual, the per-channel cost is what picks a search.
+            format_cost_section(observer) if hide_residual else None,
         ]
     else:
         sections = [
             format_full_state_section(window),
-            format_effort_section(observer),
+            trigger,
+            effort,
             format_prop_contact_section(window),
             format_cost_section(observer),
         ]
     return "\n".join(section for section in sections if section)
+
+
+def format_tracking_cost_section(observer) -> str:
+    """The cost detector's windowed signal, threshold and streak."""
+    lines = ["TRACKING COST"]
+    value = getattr(observer, "trigger_value", None)
+    if value is None:
+        lines.append("  (no samples)")
+        return "\n".join(lines) + "\n"
+    mode = "walking" if observer.is_walking else "standing"
+    lines.append(
+        "  The anomaly signal: the MPC's weighted state residual summed over "
+        + ", ".join(observer.cost_channels)
+        + " and averaged over the detector window. It rises when the controller cannot "
+        "track its centroidal state, whatever the cause."
+    )
+    lines.append(f"  cost={value:.4g}  mode={mode}  threshold={observer.trigger_threshold:.4g}")
+    lines.append(
+        f"  consecutive out of bounds: {observer.consecutive_out_of_bounds}"
+        f" / {observer.consecutive_steps}"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def format_compact_tracking_cost_section(observer) -> str:
+    value = getattr(observer, "trigger_value", None)
+    if value is None:
+        return "TRACKING COST\n  (no samples)\n"
+    return (
+        "TRACKING COST\n"
+        f"  cost={value:.3g} (threshold {observer.trigger_threshold:.3g}, "
+        f"out of bounds {observer.consecutive_out_of_bounds}/{observer.consecutive_steps})\n"
+    )

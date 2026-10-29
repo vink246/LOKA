@@ -1,0 +1,149 @@
+# Orchestrator models by key. A suite selects one with orchestrator.model,
+# either suite-wide or per baseline:
+#   {name: loka_gemma27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it}}}
+#
+# A name that is not listed here is routed by prefix: claude-* goes to the
+# Anthropic API (ANTHROPIC_API_KEY), gpt-*, o1*, o3*, o4* and anything else go
+# to the OpenAI API (OPENAI_API_KEY). API models need no entry.
+#
+# provider: local entries run only on PACE GPU nodes. The eval job starts an
+# OpenAI-compatible server for the entry (engine vllm: `vllm serve` from the
+# loka-vllm env; engine hf: loka.vla.serve_hf from the loka-mllama env), waits
+# for /health, and points the orchestrator at it with LOKA_LOCAL_BASE_URL.
+#
+#   bash scripts/setup_vllm_env.sh                   # once, on a login node
+#   bash scripts/fetch_local_models.sh gemma-3-27b-it # weights to ~/scratch/models/KEY
+#   bash scripts/serve_local_model.sh gemma-3-27b-it  # smoke test inside salloc
+#
+# Fields:
+#   hf_repo         Hugging Face repo (fetch only; weights load from path)
+#   path            local checkpoint directory (default ~/scratch/models/KEY)
+#   engine          vllm | hf
+#   server_env      conda prefix holding the server (default by engine)
+#   max_model_len   context the server allocates; the full prompt is ~22K tokens
+#   prefill         reply start the server continues from; null for none
+#   max_tokens      reply cap
+#   vision          the model accepts the ego camera image
+#   origin          country of the releasing organisation
+#   base_family     model family the weights derive from (checked by the origin guard)
+#   slurm           gres, mem, cpus, time for one GPU job; flags on the submit command win
+#   vllm_args       extra `vllm serve` arguments
+#
+# Only models from organisations outside China may be listed; the loader
+# refuses Qwen, DeepSeek, GLM, Yi, InternLM, Kimi, MiniMax and Baichuan
+# weights, including fine-tunes whose base_family is one of them.
+# GPU names follow PACE-ICE gres types; check `sinfo -o "%G"` on a login node.
+
+defaults:
+  local:
+    engine: vllm
+    max_model_len: 32768
+    prefill: "Semantic_State:"
+    max_tokens: 2048
+    vision: false
+    slurm: {gres: "gpu:H100:1", mem: 64G, cpus: 4, time: "04:00:00"}
+    vllm_args: ["--max-num-seqs", "2", "--gpu-memory-utilization", "0.88"]
+  anthropic:
+    max_tokens: 4096
+  openai: {}
+
+models:
+  # --- Meta Llama ---------------------------------------------------------
+  llama-3.2-3b:
+    provider: local
+    hf_repo: meta-llama/Llama-3.2-3B-Instruct
+    origin: US
+    base_family: llama
+    slurm: {gres: "gpu:A100:1", mem: 32G}
+  llama-3.1-8b:
+    provider: local
+    hf_repo: meta-llama/Llama-3.1-8B-Instruct
+    origin: US
+    base_family: llama
+    slurm: {gres: "gpu:A100:1", mem: 48G}
+  # The model run_loka --orchestrator-mllama loads. Served in-process by
+  # transformers (loka.vla.serve_hf) because recent vLLM releases dropped
+  # Mllama; switch engine to vllm only if the pinned vLLM still serves it.
+  llama-3.2-11b-vision:
+    provider: local
+    engine: hf
+    hf_repo: meta-llama/Llama-3.2-11B-Vision-Instruct
+    path: ~/scratch/models/llama-3.2-11b-vision-instruct
+    vision: true
+    origin: US
+    base_family: llama
+    slurm: {gres: "gpu:H100:1", mem: 64G}
+  llama-3.3-70b:
+    provider: local
+    hf_repo: meta-llama/Llama-3.3-70B-Instruct
+    origin: US
+    base_family: llama
+    slurm: {gres: "gpu:H200:1", mem: 192G, cpus: 8, time: "06:00:00"}
+    vllm_args: ["--quantization", "fp8", "--max-num-seqs", "1", "--gpu-memory-utilization", "0.92"]
+
+  # --- Google Gemma 3 (same family at three sizes, all with vision) --------
+  gemma-3-4b-it:
+    provider: local
+    hf_repo: google/gemma-3-4b-it
+    vision: true
+    origin: US
+    base_family: gemma
+    slurm: {gres: "gpu:A100:1", mem: 32G}
+  gemma-3-12b-it:
+    provider: local
+    hf_repo: google/gemma-3-12b-it
+    vision: true
+    origin: US
+    base_family: gemma
+    slurm: {gres: "gpu:A100:1", mem: 64G}
+  gemma-3-27b-it:
+    provider: local
+    hf_repo: google/gemma-3-27b-it
+    vision: true
+    origin: US
+    base_family: gemma
+    slurm: {gres: "gpu:H100:1", mem: 96G}
+
+  # --- OpenAI open weights (harmony format: no prefill) -------------------
+  gpt-oss-20b:
+    provider: local
+    hf_repo: openai/gpt-oss-20b
+    prefill: null
+    max_tokens: 8192
+    origin: US
+    base_family: gpt-oss
+    slurm: {gres: "gpu:H100:1", mem: 48G}
+  gpt-oss-120b:
+    provider: local
+    hf_repo: openai/gpt-oss-120b
+    prefill: null
+    max_tokens: 8192
+    origin: US
+    base_family: gpt-oss
+    slurm: {gres: "gpu:H100:1", mem: 128G, cpus: 8, time: "06:00:00"}
+    vllm_args: ["--max-num-seqs", "1", "--gpu-memory-utilization", "0.92"]
+
+  # --- Mistral AI ---------------------------------------------------------
+  ministral-8b:
+    provider: local
+    hf_repo: mistralai/Ministral-8B-Instruct-2410
+    origin: FR
+    base_family: mistral
+    slurm: {gres: "gpu:A100:1", mem: 48G}
+    vllm_args: ["--tokenizer-mode", "mistral", "--config-format", "mistral", "--load-format", "mistral", "--max-num-seqs", "2"]
+  mistral-small-3.2-24b:
+    provider: local
+    hf_repo: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+    vision: true
+    origin: FR
+    base_family: mistral
+    slurm: {gres: "gpu:H100:1", mem: 96G}
+    vllm_args: ["--tokenizer-mode", "mistral", "--config-format", "mistral", "--load-format", "mistral", "--max-num-seqs", "2"]
+
+  # --- Microsoft Phi ------------------------------------------------------
+  phi-4-mini:
+    provider: local
+    hf_repo: microsoft/Phi-4-mini-instruct
+    origin: US
+    base_family: phi
+    slurm: {gres: "gpu:A100:1", mem: 32G}

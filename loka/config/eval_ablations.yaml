@@ -1,0 +1,130 @@
+# LOKA ablation suite: the full system, its component ablations and an
+# orchestrator model ladder, side by side with the baselines.
+#   python -m loka.run_eval --config loka/config/eval_ablations.yaml --baselines low_level,loka,loka_raw_telemetry
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_ablations.yaml --conda-prefix ~/scratch/envs/loka
+#
+# Baselines on API models run as CPU jobs; baselines on a local model
+# (loka/config/orchestrator_models.yaml) run as GPU jobs on PACE that serve the
+# model and run several units against it (submit_pace_ice --gpu-* flags).
+# Prerequisites for local models, once, on a PACE login node:
+#   bash scripts/setup_vllm_env.sh       # engine vllm models
+#   bash scripts/setup_mllama_env.sh     # llama-3.2-11b-vision (engine hf)
+#   bash scripts/fetch_local_models.sh gemma-3-4b-it gemma-3-12b-it gemma-3-27b-it gpt-oss-20b llama-3.2-11b-vision
+# The cost_detector variants need thresholds in loka_ablations.yaml
+# (python scripts/calibrate_cost_detector.py --write).
+
+output_dir: results/g1_ablations
+seed: 0
+num_trials: 5
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+# Shared by every LOKA baseline unless its options.orchestrator overrides it.
+# temperature 0 makes every model decode (near-)greedily, so differences come
+# from the model, not from sampling. A model that accepts only its default
+# temperature (some OpenAI reasoning models) falls back to it; each turn's
+# decoding record in loka_turns.jsonl says what was actually sent. Runs made
+# before this setting used each vendor's default temperature.
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: wall
+    seconds: 2.0
+  request_timeout_s: 120.0
+  temperature: 0.0
+
+ablation_config: loka/config/loka_ablations.yaml
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+baselines:
+  - low_level
+  - loka
+  # Component ablations (same orchestrator as loka).
+  - {name: loka_raw_telemetry, type: loka_ablated, options: {variant: raw_telemetry}}
+  - {name: loka_cost_detector, type: loka_ablated, options: {variant: cost_detector}}
+  - {name: loka_raw_and_cost, type: loka_ablated, options: {variant: raw_and_cost}}
+
+  # Orchestrator model ablation. Latency mode pause (zero simulated latency)
+  # so a slow model is judged on its decisions, not its speed; compare these
+  # with loka_pause, the reference model under the same latency mode.
+  - {name: loka_pause, type: loka, options: {orchestrator: {latency: {mode: pause}}}}
+  - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-4-5, latency: {mode: pause}}}}
+  - {name: loka_gemma3_4b, type: loka, options: {orchestrator: {model: gemma-3-4b-it, latency: {mode: pause}}}}
+  - {name: loka_gemma3_12b, type: loka, options: {orchestrator: {model: gemma-3-12b-it, latency: {mode: pause}}}}
+  - {name: loka_gemma3_27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it, latency: {mode: pause}}}}
+  - {name: loka_llama32_11b, type: loka, options: {orchestrator: {model: llama-3.2-11b-vision, latency: {mode: pause}}}}
+  - {name: loka_gpt_oss_20b, type: loka, options: {orchestrator: {model: gpt-oss-20b, latency: {mode: pause}}}}
+  # Larger or optional models: uncomment once their weights are fetched.
+  # - {name: loka_claude_haiku, type: loka, options: {orchestrator: {model: claude-haiku-4-5, latency: {mode: pause}}}}
+  # - {name: loka_claude_opus, type: loka, options: {orchestrator: {model: claude-opus-4-1, latency: {mode: pause}}}}
+  # - {name: loka_llama31_8b, type: loka, options: {orchestrator: {model: llama-3.1-8b, latency: {mode: pause}}}}
+  # - {name: loka_ministral_8b, type: loka, options: {orchestrator: {model: ministral-8b, latency: {mode: pause}}}}
+  # - {name: loka_mistral_small_24b, type: loka, options: {orchestrator: {model: mistral-small-3.2-24b, latency: {mode: pause}}}}
+  # - {name: loka_gpt_oss_120b, type: loka, options: {orchestrator: {model: gpt-oss-120b, latency: {mode: pause}}}}
+  # - {name: loka_llama33_70b, type: loka, options: {orchestrator: {model: llama-3.3-70b, latency: {mode: pause}}}}
+  # A model and an ablation together:
+  # - {name: loka_raw_gemma3_27b, type: loka_ablated, options: {variant: raw_telemetry, orchestrator: {model: gemma-3-27b-it, latency: {mode: pause}}}}
+
+tasks:
+  - name: stand_push
+    type: stand_push
+    mass:
+      body: left_shoulder_roll_link
+      delta_kg: 10.0
+    mass_time_s: 2.0
+    push_delay_s: 10.0
+    observe_s: 10.0
+    push:
+      direction: [0.0, 1.0]
+      duration_s: 0.05
+    search:
+      lo_n: 0.0
+      hi_n: 200.0
+      max_hi_n: 2000.0
+      resolution_n: 0.2
+    metrics: [max_push_force_n]
+
+  - name: goto_goal
+    type: goto_goal
+    goal:
+      xy: [3.0, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 0.0
+    command_time_s: 0.0
+    perturbation_time_s: 5.0
+    timeout_s: 60.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+      - {name: torso_mass, kind: mass, body: torso_link, delta_kg: 10.0}
+      - {name: shoulder_mass, kind: mass, body: left_shoulder_roll_link, delta_kg: 7.0}
+      - {name: weak_right_knee, kind: actuator_gear, actuator: right_knee, scale: 0.75}
+      - {name: low_friction, kind: friction, mu: 0.4}
+      - {name: shove, kind: push, force_n: 120.0, direction: [0.0, 1.0], duration_s: 0.05}
+    metrics:
+      - num_successes
+      - num_falls
+      - time_to_goal_s
+      - wall_time_to_goal_s
+      - path_efficiency
+      - llm_turn_count
+      - llm_input_tokens
+      - llm_output_tokens
+      - telemetry_tokens_mean

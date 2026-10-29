@@ -1,0 +1,81 @@
+# LOKA ablations. An eval baseline of type loka_ablated picks one variant:
+#   {name: loka_raw_tel, type: loka_ablated, options: {variant: raw_telemetry}}
+# The suite points here with ablation_config. The selected variant and its
+# parameters are copied into config.resolved.yaml, so a finished run does not
+# depend on later edits to this file.
+#
+# Every ablation keeps the system prompt; anchored patches in
+# loka/agent/prompts/ablations/ rewrite only the parts the ablation changes.
+
+ablations:
+  # The telemetry compressor is removed. The orchestrator gets the last
+  # window_s seconds of the raw per-tick stream as a CSV table: no means,
+  # no ranking, no derived speeds, no prose labels. The table is never longer
+  # (in tokens) than the compressor's report for the same turn would have
+  # been: the sample count is lowered until it fits, then channel groups in
+  # drop_order are removed, then precision is lowered.
+  raw_telemetry:
+    # Seconds of stream shown. Defaults to session.telemetry_window_s.
+    window_s: 2.0
+    # match_compressor: the budget is the compressor report's token count on
+    # this turn (same prompt style). An integer is a fixed token cap.
+    budget: match_compressor
+    # Multiplies the budget; < 1 leaves headroom.
+    budget_fraction: 1.0
+    # tiktoken encoding used to count both texts. Without tiktoken, both are
+    # counted as ceil(characters / 4).
+    tokenizer: o200k_base
+    # Highest sample rate tried before fitting the budget [Hz].
+    max_hz: 50.0
+    # Fewest rows the fit tries before it starts dropping channels. On a
+    # full-style walking turn (budget ~1.3K tokens) every channel fits only
+    # 2 rows; 4 keeps base, command, effort_dev and slip at ~2 Hz.
+    min_samples: 4
+    # Significant figures per value. The fit may go down to 2.
+    precision: 3
+    # Channel groups, in column order:
+    #   base        t, pelvis xyz, roll pitch yaw [deg], linear and angular velocity
+    #   command     gait mode, speed, heading, goal x y, goal active, walking
+    #   effort_dev  per-actuator effort deviation of that tick [Nm]
+    #   motor_dev   per-actuator commanded minus applied torque of that tick [Nm]
+    #   slip        fastest planted sole speed of that tick [m/s]
+    #   mpc_cost    MPC weighted residual per state channel of that tick
+    #   contact_fz  normal force at the 8 sole contact points [N]
+    #   prop_force  total contact force from objects [N]
+    channels: [base, command, effort_dev, motor_dev, slip, mpc_cost, contact_fz, prop_force]
+    # Removed first, in this order, when min_samples rows do not fit.
+    drop_order: [contact_fz, prop_force, motor_dev, mpc_cost, command]
+
+  # The anomaly detector trips on the MPC tracking cost only. The effort
+  # residual, motor deficit and stance slip no longer open a failure episode,
+  # block a walk, close an episode or fire bias_under_threshold. The belief
+  # search still reads the residual internally (it is a separate component).
+  cost_detector:
+    # Which MPC state channels are summed: all, or a subset of
+    # roll pitch yaw x y z wx wy wz vx vy vz.
+    cost_channels: all
+    # Windowed tracking cost above which a tick is out of bounds. Set by
+    #   python scripts/calibrate_cost_detector.py --write
+    # (a high percentile of the nominal plant's windowed cost, times a margin).
+    stand_threshold: 0.007183
+    walk_threshold: 13.99
+    # Same streak and recovery as the residual detector (loka.yaml effort_bias).
+    consecutive_steps: 250
+    clear_below_s: 0.5
+    # Remove the effort deviation, motor deficit and stance slip from what the
+    # orchestrator sees (compressor sections and raw channels alike).
+    hide_residual_telemetry: true
+
+# A variant is the set of ablations one baseline applies. ``params`` overrides
+# the defaults above for that variant only, and ``orchestrator`` overrides the
+# suite orchestrator (a baseline's own options.orchestrator wins over both).
+variants:
+  raw_telemetry:
+    apply: [raw_telemetry]
+  cost_detector:
+    apply: [cost_detector]
+  raw_and_cost:
+    apply: [raw_telemetry, cost_detector]
+  # Ablation code path with nothing switched off; should match loka.
+  none:
+    apply: []

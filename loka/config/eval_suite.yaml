@@ -36,9 +36,22 @@ recording:
   stand_push_probes: boundary
   min_push_visible_s: 0.3
 
+# Variants for loka_ablated baselines (see loka/config/eval_ablations.yaml for
+# the full ablation and model-ladder suite).
+ablation_config: loka/config/loka_ablations.yaml
+
 # A baseline is a name, or {name, type, options}. unitree_rl takes
 # options.policy_dir (default models/unitree_rl/g1_29dof_velocity_v0) and
 # options.min_speed (0.30 m/s; the v0 policy stands still below ~0.25).
+# loka and loka_ablated take options.orchestrator, which overrides the
+# orchestrator block above for that baseline (model, provider, latency,
+# prompt_style, reply_check, max_tokens, temperature); loka_ablated also takes
+# options.variant, a name under variants in the ablation config. Examples:
+#   - {name: loka_raw_telemetry, type: loka_ablated, options: {variant: raw_telemetry}}
+#   - {name: loka_cost_detector, type: loka_ablated, options: {variant: cost_detector}}
+#   - {name: loka_claude, type: loka, options: {orchestrator: {model: claude-sonnet-4-5}}}
+#   - {name: loka_gemma3_27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it, latency: {mode: pause}}}}
+# Local models (orchestrator_models.yaml, provider: local) run as PACE GPU jobs.
 baselines: [low_level, loka, unitree_rl]
 
 tasks:

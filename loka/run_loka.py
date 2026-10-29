@@ -36,6 +36,12 @@ local-model setup.
 ``--orchestrator-vila PATH`` does the same with Llama-3-VILA1.5-8B (NaVILA's
 base model, ``loka-navila`` env), but VILA reads only 4,096 tokens, so it sees
 the start of the system prompt and nothing after it.
+``--llm-model NAME`` picks the orchestrator by name: ``claude-*`` goes to the
+Anthropic API (``ANTHROPIC_API_KEY``), other API names to OpenAI, and a local
+key of ``loka/config/orchestrator_models.yaml`` to its server at
+``LOKA_LOCAL_BASE_URL`` (PACE only; ``scripts/serve_local_model.sh``).
+``--ablation VARIANT`` runs a variant of ``loka/config/loka_ablations.yaml``
+(``raw_telemetry``, ``cost_detector``, ``raw_and_cost``).
 ``--vision`` attaches a 512x512 head-camera frame to every orchestrator turn
 (settings in ``loka/config/loka.yaml`` under ``vision``). The scene carries a
 pool of HumanoidBench props (chair, table, box, cube, shelf) parked off-scene;
@@ -374,6 +380,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Device for --orchestrator-mllama / --orchestrator-vila (default: cuda:0). "
         "cpu skips the GPU check; --orchestrator-mllama only, for tiny test checkpoints",
     )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        metavar="NAME",
+        help="Orchestrator model: an API name (claude-* goes to Anthropic, others to OpenAI) "
+        "or a local key of loka/config/orchestrator_models.yaml (needs LOKA_LOCAL_BASE_URL "
+        "pointing at its running server; PACE only). Default: LOKA_STAND_MODEL / OpenAI",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature for --llm-model (default: the model's own)",
+    )
+    parser.add_argument(
+        "--ablation",
+        default=None,
+        metavar="VARIANT",
+        help="Run a variant of loka/config/loka_ablations.yaml, e.g. raw_telemetry, "
+        "cost_detector, raw_and_cost",
+    )
+    parser.add_argument(
+        "--ablation-config",
+        default=None,
+        metavar="PATH",
+        help="Ablation file for --ablation (default: loka/config/loka_ablations.yaml)",
+    )
     add_stack_argument(parser)
     args = parser.parse_args(argv)
     local = [flag for flag, value in (
@@ -382,6 +415,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ) if value is not None]
     if len(local) > 1:
         parser.error("pass only one of --orchestrator-mllama / --orchestrator-vila")
+    if local and args.llm_model:
+        parser.error(f"{local[0]} and --llm-model both pick the orchestrator; pass one")
+    if args.temperature is not None and not args.llm_model:
+        parser.error("--temperature needs --llm-model")
+    if args.ablation and (args.no_llm or args.navila or args.unitree_rl):
+        parser.error("--ablation applies to the LOKA orchestrator; drop --no-llm / --navila / --unitree-rl")
     if local and (args.no_llm or args.navila or args.unitree_rl):
         parser.error(f"{local[0]} replaces the LLM; drop --no-llm / --navila / --unitree-rl")
     if args.orchestrator_vila is not None and not args.orchestrator_device.startswith("cuda"):
@@ -702,6 +741,25 @@ def _install_local_orchestrator(args: argparse.Namespace) -> str | None:
     return backend.label
 
 
+def _orchestrator_selection(args: argparse.Namespace) -> dict:
+    """``LokaConfig`` fields for ``--llm-model`` and ``--ablation``."""
+    from loka.agent.ablations import AblationSet, resolve_variant
+
+    fields: dict = {}
+    if args.ablation:
+        resolved = resolve_variant(args.ablation, args.ablation_config)
+        resolved.pop("orchestrator", None)
+        fields["ablations"] = AblationSet.from_dict(resolved)
+    if args.llm_model:
+        from loka.agent.model_registry import resolve_model
+
+        entry = resolve_model(args.llm_model)
+        if args.temperature is not None:
+            entry["temperature"] = float(args.temperature)
+        fields.update(llm_model=str(entry["model"]), llm_provider=str(entry["provider"]), llm_options=entry)
+    return fields
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     llm_enabled = not args.no_llm
@@ -789,15 +847,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.describe_first and not vision and "--describe-first" in (argv or sys.argv[1:]):
             print("[LOKA] --describe-first needs the camera; add --vision. Describing is off.")
         memory = {} if args.max_memory is None else {"max_memory": int(args.max_memory)}
+        extra = _orchestrator_selection(args)
+        if extra.get("llm_model"):
+            llm_model = extra.pop("llm_model")
+        else:
+            extra.pop("llm_model", None)
         print(
             f"[LOKA] prompt={args.prompt_style} describe_first={describe_first} "
             f"reply_check={args.reply_check} max_memory={memory.get('max_memory', 'loka.yaml')}"
+            f" ablation={args.ablation or 'none'} model={llm_model or 'default'}"
         )
         runtime = LokaRuntime(
             sim,
             LokaConfig(
                 enable_llm=llm_enabled,
                 llm_model=llm_model,
+                **extra,
                 prompt_style=args.prompt_style,
                 describe_first=describe_first,
                 reply_check=bool(args.reply_check),

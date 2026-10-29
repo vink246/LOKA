@@ -132,6 +132,35 @@ def wall_s(episode: EpisodeData):
     return _finite(episode.metadata.get("wall_s"))
 
 
+def _usage_total(episode: EpisodeData, key: str):
+    turns = [turn for turn in episode.turns or () if isinstance(turn.get("usage"), dict)]
+    if not turns:
+        return None
+    return float(sum(float(turn["usage"].get(key) or 0) for turn in turns))
+
+
+@register_metric("llm_input_tokens", scope="episode")
+def llm_input_tokens(episode: EpisodeData):
+    """Prompt tokens over every orchestrator call, as the provider reported them."""
+    return _usage_total(episode, "input_tokens")
+
+
+@register_metric("llm_output_tokens", scope="episode")
+def llm_output_tokens(episode: EpisodeData):
+    return _usage_total(episode, "output_tokens")
+
+
+@register_metric("telemetry_tokens_mean", scope="episode")
+def telemetry_tokens_mean(episode: EpisodeData):
+    """Mean tokens of the raw-telemetry section per turn (raw ablation only)."""
+    values = [
+        float(turn["telemetry"]["telemetry_tokens"])
+        for turn in episode.turns or ()
+        if isinstance(turn.get("telemetry"), dict) and turn["telemetry"].get("telemetry_tokens") is not None
+    ]
+    return float(np.mean(values)) if values else None
+
+
 @register_metric("max_push_force_n", scope="trial")
 def max_push_force_n(episodes: list[EpisodeData]) -> float:
     """Largest push that was survived. 0 if the mass alone caused a fall."""

@@ -1,0 +1,75 @@
+# cost_detector ablation, full prompt (system_prompt.txt).
+# The anomaly signal is the MPC tracking cost. With hide_residual the effort
+# residual, motor deficit and stance slip are not shown to the orchestrator.
+# Every find must occur exactly once (see loka/agent/prompt_ablations.py).
+
+- find: |-
+    If the effort bias crosses the threshold while walking, the runtime has already set gait.mode=stand and gait.speed=0 before this call.
+  replace: |-
+    If the tracking cost crosses its threshold while walking, the runtime has already set gait.mode=stand and gait.speed=0 before this call.
+
+- find: |-
+    Do not set gait.mode=walk while |bias|, |motor|, or stance slip is above its threshold.
+  replace: |-
+    Do not set gait.mode=walk while the tracking cost is above its threshold.
+
+- find: |-
+    Set gait.mode=walk, gait.goal_x, gait.goal_y, and gait.speed only on a later turn, after those are back under threshold. Do not leave the robot standing once the residual is in bounds and the goal is unfinished.
+  replace: |-
+    Set gait.mode=walk, gait.goal_x, gait.goal_y, and gait.speed only on a later turn, after it is back under threshold. Do not leave the robot standing once the tracking cost is in bounds and the goal is unfinished.
+
+- when: [hide_residual]
+  find: |-
+    Mass, com, and gear entries are an unbounded binary search on the effort residual:
+  replace: |-
+    Mass, com, and gear entries are an unbounded binary search on the effort residual, which the runtime measures for the search but does not show you:
+
+- find: |-
+    It fires when |bias| is at or under the mode threshold, after any search in progress has finished.
+  replace: |-
+    It fires when the tracking cost is at or under its mode threshold, after any search in progress has finished.
+
+- when: [hide_residual]
+  find: |-
+    - EFFORT DEVIATION, one signed Nm per actuator: measured force minus the belief model's inverse dynamics. Measured force is motor torque (current) plus foot contact force. Zero means the model explains the motion. Positive means the body outweighs the belief (mass or COM too low). Negative means the belief overshoots. A sign flip means the last edit went too far. |bias| is the sum of absolute values. More than 2 Nm between symmetric actuators is an asymmetric load. MOTOR DEFICIT is commanded joint torque minus the torque the motor applied. Zero means the gear matches. One large actuator is that actuator's gear: queue a gear search on its name. The search writes the believed torque constant. The controller then limits that joint to the torque the motor can deliver and scales the command so the delivered torque matches the plan. STANCE SLIP is the fastest planted sole in the ground plane. Slip that stays up while the motor deficit is quiet is floor friction: queue a friction search on floor. Do not edit mpc.friction_mu yourself; the believed friction sets it. If the search reports no sliding contacts, the slip was not friction.
+  replace: |-
+    - The effort residual, motor deficit and stance slip are not shown. The runtime still measures them for belief searches: a mass, com or gear search drives the residual of its parameter to zero, and a friction search reads the friction from the planted contacts that slid before the fault. The tracking cost rises whenever the controller cannot track its centroidal state, whatever the cause: a model error, a weak motor, a slippery floor, a push, or an obstacle. Choose the parameter from the state and the STATE COST channels: roll, y and vy cost with a steady lean point to a lateral COM offset or a one-sided load; pitch, x and vx cost to a forward COM offset or a trunk load; a pelvis that sits low with z cost to missing mass (search mass first); a sag or lean toward one leg to a weak leg actuator (a gear search on that knee or hip); feet that keep sliding while walking to floor friction (a friction search on floor). The search writes the believed value. Do not edit mpc.friction_mu yourself; the believed friction sets it. If the search reports no sliding contacts, the slip was not friction.
+
+- unless: [hide_residual]
+  find: |-
+    |bias| is the sum of absolute values.
+  replace: |-
+    |bias| is the sum of absolute values; it is shown for diagnosis and does not open a fault.
+
+- find: |-
+    - STATE COST, the MPC residual per component.
+  replace: |-
+    - STATE COST, the MPC residual per component, averaged over the detector window. Their sum is the TRACKING COST, the anomaly signal, shown with its standing or walking threshold and the out-of-bounds streak.
+
+- when: [hide_residual]
+  find: |-
+    That force is an external load in the effort residual, not a model error.
+  replace: |-
+    That force is an external load that raises the tracking cost, not a model error.
+
+- when: [hide_residual]
+  find: |-
+    The residual picks the axis: a roll residual (waist_roll, hip roll, ankle roll) is a com y search, a pitch residual (hip pitch, waist pitch, knee, ankle pitch) is a com x search, and height is a com z search. Queue a COM axis only for the residual you are correcting. A waist_roll residual is axis y, not x.
+  replace: |-
+    The state cost picks the axis: roll cost is a com y search, pitch cost is a com x search, and height is a com z search. Queue a COM axis only for the cost you are correcting.
+
+- find: |-
+    A failure episode stays open until |bias| has been back under the mode threshold for more than 0.5 s.
+  replace: |-
+    A failure episode stays open until the tracking cost has been back under the mode threshold for more than 0.5 s.
+
+- find: |-
+    After the last one you are not called again until the bias is back in bounds.
+  replace: |-
+    After the last one you are not called again until the tracking cost is back in bounds.
+
+- when: [hide_residual]
+  find: |-
+    - Symmetric biases for actuators usually means *the mass itself* is mismatched - not the z axis. On one body, search mass before any COM axis.
+  replace: |-
+    - A low pelvis with height cost but little roll or pitch cost usually means *the mass itself* is mismatched - not the z axis. On one body, search mass before any COM axis.

@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # Submit the G1 evaluation suite on a PACE-ICE login node.
-# Each Slurm job is one task x perturbation x baseline x trial, CPU only,
-# at most 10 jobs in flight.
+# Each CPU Slurm job is one task x perturbation x baseline x trial, at most 10
+# jobs in flight. LOKA baselines on a local orchestrator model
+# (loka/config/orchestrator_models.yaml) run as GPU jobs instead: each serves
+# the model once and runs --gpu-units-per-job units against it, at most
+# --gpu-max-in-flight per model, inside --gpu-max-submitted of the
+# --max-submitted queue slots. All flags pass through to loka.submit_pace_ice.
 #
 #   bash scripts/pace_ice_eval.sh --num-trials 5
 #   bash scripts/pace_ice_eval.sh --num-trials 5 --cpus 2 \
 #       --conda-prefix /home/hice1/vkulkarni46/scratch/envs/loka
+#   # Ablations and model ladder (see loka/config/eval_ablations.yaml):
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_ablations.yaml \
+#       --conda-prefix ~/scratch/envs/loka --gpu-max-in-flight 2 --dry-run
+#   # Rerun only what did not finish (CPU units and GPU bundles alike):
+#   bash scripts/pace_ice_eval.sh --resubmit-missing results/g1_eval/pace_YYYYMMDD_HHMMSS \
+#       --conda-prefix ~/scratch/envs/loka
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

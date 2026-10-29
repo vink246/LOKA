@@ -75,9 +75,16 @@ def _format_intervention_history(interventions, empty_label):
 
 
 class ConversationMixin:
-    def __init__(self):
+    def __init__(self, detector: str = "residual"):
+        if detector not in DETECTOR_TEXT:
+            raise ValueError(f"detector must be one of {sorted(DETECTOR_TEXT)}, got {detector!r}")
         self.interventions = []
         self._messages = []
+        self.detector = detector
+
+    @property
+    def text(self) -> dict:
+        return DETECTOR_TEXT[self.detector]
 
     @property
     def prior_turn_count(self) -> int:
@@ -206,12 +213,65 @@ _RESUME_GOAL_FRESH = (
     "open, finish that fix while standing, then walk on the turn it settles."
 )
 
+#: Detector-specific sentences of the user turns. ``residual`` is LOKA's
+#: detector; ``cost`` is the cost_detector ablation (MPC tracking cost).
+DETECTOR_TEXT = {
+    "residual": {
+        "stood": _STOOD_FOR_FAULT,
+        "resume": _RESUME_GOAL,
+        "resume_fresh": _RESUME_GOAL_FRESH,
+        "last_turn": " This is the last turn until the bias is back in bounds.",
+        "count_reset": "The count resets when the bias returns to normal.",
+        "listener_walk": "set gait.mode=walk, gait.goal_x, and gait.goal_y only when |bias| "
+        "is under the threshold.",
+        "heartbeat_fixed": "fault was fixed, |bias| is under the threshold, and the goal is ",
+    },
+    "cost": {
+        "stood": (
+            "The runtime already set gait.mode=stand and gait.speed=0 before this call. "
+            "It does that whenever the tracking cost crosses its threshold while the robot "
+            "is walking, and it does it before you are invoked. Do not command the stand "
+            "yourself. Diagnose the fault while standing, including belief searches if a "
+            "model parameter is wrong. The stand is temporary. Do not set gait.mode=walk "
+            "on this turn if the tracking cost is still above its threshold. Stay standing "
+            "and queue the search. On a later turn, after the tracking cost is under its "
+            "threshold, set gait.mode=walk, gait.goal_x, gait.goal_y, and gait.speed. "
+            "Do not leave the robot standing once the tracking cost is in bounds and the "
+            "goal is unfinished."
+        ),
+        "resume": (
+            "The runtime is holding stand after it stopped a walk for a tracking-cost "
+            "fault. That stand is not the task. The locked goal is still unfinished and "
+            "it is the priority once the fix is done. If ATTEMPTED FIXES shows the belief "
+            "searches settled and the tracking cost is back in bounds, do not keep "
+            "diagnosing and do not stay in stand. This turn, set gait.mode=walk, "
+            "gait.goal_x, gait.goal_y, and gait.speed, and keep the mission listeners "
+            "armed. If the tracking cost is still high, "
+            "finish that fix while standing, then walk on the turn it settles."
+        ),
+        "resume_fresh": (
+            "The runtime is holding stand after it stopped a walk for a tracking-cost "
+            "fault. That stand is not the task. The locked goal is still unfinished and "
+            "it is the priority once the fix is done. Earlier turns are not shown. "
+            "If the tracking cost is back in bounds, do not keep diagnosing and do not "
+            "stay in stand. This turn, set gait.mode=walk, gait.goal_x, gait.goal_y, and "
+            "gait.speed, and keep the mission listeners armed. If the tracking cost is still "
+            "high, finish that fix while standing, then walk on the turn it settles."
+        ),
+        "last_turn": " This is the last turn until the tracking cost is back in bounds.",
+        "count_reset": "The count resets when the tracking cost returns to normal.",
+        "listener_walk": "set gait.mode=walk, gait.goal_x, and gait.goal_y only when the "
+        "tracking cost is under its threshold.",
+        "heartbeat_fixed": "fault was fixed, the tracking cost is under its threshold, and the goal is ",
+    },
+}
+
 
 class FailureEpisode(ConversationMixin):
     """One continuous LLM conversation from first fault until recovery."""
 
-    def __init__(self, started_at: float):
-        super().__init__()
+    def __init__(self, started_at: float, detector: str = "residual"):
+        super().__init__(detector)
         self.started_at = started_at
         self.interrupted_walk = False
         self._announced_stand = False
@@ -222,14 +282,10 @@ class FailureEpisode(ConversationMixin):
         if not max_turns or max_turns < 1:
             return ""
         number = self.turns_sent + 1
-        last = (
-            " This is the last turn until the bias is back in bounds."
-            if number >= max_turns
-            else ""
-        )
+        last = self.text["last_turn"] if number >= max_turns else ""
         return (
             f"Orchestrator turn {number} of {max_turns} this episode. "
-            f"The count resets when the bias returns to normal.{last}\n"
+            f"{self.text['count_reset']}{last}\n"
         )
 
     def _gait_note(self, *, just_stood: bool = False, recall: bool = True) -> str:
@@ -239,10 +295,10 @@ class FailureEpisode(ConversationMixin):
             return ""
         if just_stood or not self._announced_stand:
             self._announced_stand = True
-            return f"{_STOOD_FOR_FAULT}\n"
+            return f"{self.text['stood']}\n"
         if recall:
-            return f"{_RESUME_GOAL}\n"
-        return f"{_RESUME_GOAL_FRESH}\n"
+            return f"{self.text['resume']}\n"
+        return f"{self.text['resume_fresh']}\n"
 
     @property
     def round_number(self) -> int:
@@ -331,6 +387,11 @@ class FailureEpisode(ConversationMixin):
 class OperatorSession(ConversationMixin):
     """Multi-turn manual operator requests (gait changes, strategy experiments)."""
 
+    def __init__(self, detector: str = "residual", raw_telemetry: bool = False):
+        super().__init__(detector)
+        #: The raw-telemetry ablation: the turn has no closing speed to read.
+        self.raw_telemetry = raw_telemetry
+
     def format_prior_interventions(self, *, max_memory: int | None = None) -> str:
         if not self.shows_prior_turns(max_memory):
             return "None. Earlier turns in this session are not included."
@@ -389,8 +450,7 @@ class OperatorSession(ConversationMixin):
             f"{body}\n\n"
             "Act on the message. Keep pursuing every locked directive. "
             "If gait.mode is stand after a fault fix and the goal is unfinished, "
-            "set gait.mode=walk, gait.goal_x, and gait.goal_y only when |bias| "
-            "is under the threshold. Arm the next listener if the directive is not "
+            f"{self.text['listener_walk']} Arm the next listener if the directive is not "
             "finished, or clear listeners with an empty list when it is.\n\n"
             + _format_context_sections(
                 mpc_config,
@@ -409,14 +469,25 @@ class OperatorSession(ConversationMixin):
         *,
         period_s: float,
     ) -> str:
+        if self.raw_telemetry:
+            motion = (
+                "No listener invoked you in this interval. Work out from RAW TELEMETRY "
+                "whether the robot moves toward the goal: project the pelvis velocity "
+                "(vx, vy) on the direction from the pelvis to the goal. Negative means "
+                "the robot is walking away. If it is walking away, set "
+            )
+        else:
+            motion = (
+                "No listener invoked you in this interval. Read closing speed and "
+                "along heading in the full-state snapshot. Positive closing speed "
+                "is motion toward the goal. Negative means the robot is walking "
+                "away; planar speed has no sign. If it is walking away, set "
+            )
         return (
             f"--- PERIODIC CHECK (t={sim_time:.2f}s, every {period_s:.0f}s) ---\n"
-            "No listener invoked you in this interval. Read closing speed and "
-            "along heading in the full-state snapshot. Positive closing speed "
-            "is motion toward the goal. Negative means the robot is walking "
-            "away; planar speed has no sign. If it is walking away, set "
+            f"{motion}"
             "gait.goal_x and gait.goal_y again. If gait.mode is stand because a "
-            "fault was fixed, |bias| is under the threshold, and the goal is "
+            f"{self.text['heartbeat_fixed']}"
             "unfinished, set gait.mode=walk, gait.goal_x, gait.goal_y, and "
             "gait.speed. Leave listeners armed "
             "if they are still the right wake-up.\n\n"

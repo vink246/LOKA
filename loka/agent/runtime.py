@@ -19,6 +19,7 @@ from loka.agent.model_state import (
     joint_torque_to_command,
     zero_dead_actuator_commands,
 )
+from loka.agent.ablations import AblationSet
 from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
@@ -31,6 +32,7 @@ from loka.agent.context import (
 )
 from loka.agent.robot_context import build_compact_robot_context, build_robot_model_context
 from loka.agent.anomaly import (
+    CostTrackingObserver,
     EffortDeviationObserver,
     belief_actuator_deviation,
     motor_deficit,
@@ -109,6 +111,15 @@ class LokaConfig:
     log_path: Path | None = None
     print_compressor: bool = True
     enable_session_log: bool = False
+    #: ``openai``, ``anthropic`` or ``local`` (an OpenAI-compatible server at
+    #: ``LOKA_LOCAL_BASE_URL``). None keeps the legacy path: a backend set with
+    #: ``set_chat_backend``, else OpenAI with ``llm_model``.
+    llm_provider: str | None = None
+    #: The resolved model entry (``loka.agent.model_registry.resolve_model``):
+    #: ``model``, ``max_tokens``, ``prefill``.
+    llm_options: dict = field(default_factory=dict)
+    #: Components switched off for an ablation run. Empty is the full system.
+    ablations: AblationSet = field(default_factory=AblationSet)
 
 
 class LokaRuntime:
@@ -155,6 +166,34 @@ class LokaRuntime:
         self.ego_renderer: EgoRenderer | None = None
         self.vision_block: str | None = None
         self._frame_count = 0
+        nu = int(self.sim.model.nu)
+        # The detector's per-tick outputs, kept on every frame for raw telemetry.
+        self._detector_sample = {
+            "effort_dev": np.zeros(nu),
+            "motor_dev": np.zeros(nu),
+            "slip": 0.0,
+            "mpc_cost": np.zeros(12),
+        }
+        self._telemetry_stats: dict | None = None
+        self._pending_telemetry_stats: dict | None = None
+        self._actuator_names = tuple(
+            mujoco.mj_id2name(self.sim.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or str(i)
+            for i in range(nu)
+        )
+        self.llm_provider = None
+        if self.config.enable_llm and self.config.llm_provider is not None:
+            from loka.agent.providers import build_provider
+
+            options = {"model": self.config.llm_model, **dict(self.config.llm_options)}
+            self.llm_provider = build_provider(
+                self.config.llm_provider,
+                options,
+                timeout=float(self.config.llm_request_timeout_s) or None,
+            )
+            print(
+                f"[LOKA] orchestrator {self.llm_provider.label}, "
+                f"temperature {self.llm_provider.decoding()['temperature']}"
+            )
         self._rebuild_prompt()
 
         self.recent_frames: deque = deque()
@@ -162,7 +201,11 @@ class LokaRuntime:
         self._last_invoke_t = 0.0
 
         self.failure_episode: FailureEpisode | None = None
-        self.operator_session = OperatorSession()
+        self.detector_kind = "cost" if self.config.ablations.cost_detector is not None else "residual"
+        self.operator_session = OperatorSession(
+            detector=self.detector_kind,
+            raw_telemetry=self.config.ablations.raw_telemetry is not None,
+        )
         self.active_session = None  # FailureEpisode | OperatorSession | None
 
         self.llm_queue: queue.Queue = queue.Queue()
@@ -200,7 +243,10 @@ class LokaRuntime:
         # the QP's joint-torque limit is this times that belief, refreshed
         # every step.
         self._command_limit = self.controller.robot.torque_limit.copy()
-        self.effort_observer = EffortDeviationObserver()
+        cost_spec = self.config.ablations.cost_detector
+        self.effort_observer = (
+            EffortDeviationObserver() if cost_spec is None else CostTrackingObserver(cost_spec)
+        )
         self.effort_observer.dt = float(self.sim.config.control_dt)
         self.effort_observer.names = tuple(
             mujoco.mj_id2name(self.sim.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or str(i)
@@ -306,8 +352,13 @@ class LokaRuntime:
             "goal_y": float(self.controller.gait.config.goal_y),
             "bias_nm": self._bias_nm(),
             "bias_threshold_nm": self._bias_threshold_nm(),
+            # The detector's own signal: |bias| by default, the tracking cost
+            # under the cost_detector ablation.
+            "trigger_value": self.effort_observer.trigger_value,
+            "trigger_threshold": self.effort_observer.trigger_threshold,
             "belief_search_busy": self.belief_search.busy,
             "prop_contacts": prop_contacts(self.sim.model, self.sim.data, self.sim.prop_layout),
+            **self._detector_sample,
         }
 
     def _gated_heading_error(self, tel) -> float:
@@ -341,7 +392,11 @@ class LokaRuntime:
 
     def _push_recent(self, frame: dict) -> None:
         self.recent_frames.append(frame)
-        max_n = max(1, int(self.config.telemetry_window_s / self.sim.config.control_dt))
+        window = float(self.config.telemetry_window_s)
+        raw = self.config.ablations.raw_telemetry
+        if raw is not None:
+            window = max(window, float(raw.window_s))
+        max_n = max(1, int(window / self.sim.config.control_dt))
         while len(self.recent_frames) > max_n:
             self.recent_frames.popleft()
 
@@ -443,7 +498,19 @@ class LokaRuntime:
             robot_context=self.robot_context,
             vision=self.vision_block,
             style=self.config.prompt_style,
+            ablations=self.config.ablations,
+            fills=self._prompt_fills(),
         )
+
+    def _prompt_fills(self) -> dict[str, str]:
+        """Values for the ablation prompt patches' placeholders."""
+        from loka.agent.compress import gait_band_text
+        from loka.agent.raw_telemetry import describe_columns
+
+        fills = {"GAIT_SAFE_BAND": gait_band_text(getattr(self.controller.config, "stack", "legacy_dcm"))}
+        if self.config.ablations.raw_telemetry is not None:
+            fills["RAW_TELEMETRY_COLUMNS"] = describe_columns(self.config.ablations.raw_channels())
+        return fills
 
     def _config_text(self) -> str:
         return format_stand_configuration(self.controller, compact=self.compact)
@@ -466,6 +533,16 @@ class LokaRuntime:
             nominal_camera_pose(self.sim.model),
             floor_cell_size(self.sim.model),
         )
+        ablations = self.config.ablations
+        if ablations.hide_residual:
+            self.vision_block = self.vision_block.replace(
+                "contact force raises |bias|", "contact force raises the tracking cost"
+            )
+        if ablations.raw_telemetry is not None:
+            self.vision_block = self.vision_block.replace(
+                "An OBJECT CONTACT section in the telemetry means",
+                "A nonzero prop_n column in RAW TELEMETRY means",
+            )
         self.ego_renderer = EgoRenderer(self.sim.recipe)
         if self.log is not None and spec.save_frames:
             frames = self._frames_dir()
@@ -534,13 +611,35 @@ class LokaRuntime:
             self.ego_renderer = None
 
     def _telemetry_for(self, frame: dict) -> str:
+        """The telemetry part of a user turn: the compressor report, or raw rows.
+
+        With the raw-telemetry ablation the compressor report is still built,
+        only to set the token budget of the raw table that replaces it.
+        """
         window = list(self.recent_frames) or [frame]
-        return synthesize_stand_telemetry(
+        ablations = self.config.ablations
+        compressed = synthesize_stand_telemetry(
             window,
             control_dt=self.sim.config.control_dt,
             observer=self.effort_observer,
             compact=self.compact,
+            hide_residual=ablations.hide_residual,
         )
+        spec = ablations.raw_telemetry
+        if spec is None:
+            self._telemetry_stats = None
+            return compressed
+        from loka.agent.raw_telemetry import fit_raw_telemetry
+
+        text, stats = fit_raw_telemetry(
+            window,
+            spec,
+            reference=compressed,
+            channels=ablations.raw_channels(),
+            actuator_names=self._actuator_names,
+        )
+        self._telemetry_stats = stats
+        return text
 
     def _consume_listeners(self, frame: dict) -> list:
         armed = list(self.loka_state.get("listeners") or [])
@@ -572,6 +671,7 @@ class LokaRuntime:
         self.active_session = session
         self._pending_user_content = user_content
         self._pending_dispatch_reason = reason
+        self._pending_telemetry_stats = self._telemetry_stats
         self._last_invoke_t = now
         self._dispatch_sim_t = now
         self._dispatch_wall_t = time.perf_counter()
@@ -588,7 +688,12 @@ class LokaRuntime:
         thread = threading.Thread(
             target=stand_llm_worker,
             args=(copy.deepcopy(messages), self.llm_queue),
-            kwargs={"model": self.config.llm_model, "vision": vision, "guard": self._reply_guard()},
+            kwargs={
+                "model": self.config.llm_model,
+                "vision": vision,
+                "guard": self._reply_guard(),
+                "provider": self.llm_provider,
+            },
             daemon=True,
         )
         thread.start()
@@ -671,6 +776,9 @@ class LokaRuntime:
                     "summary": None,
                     "timed_out": timed_out,
                     "model": self.config.llm_model,
+                    "usage": None if not result else result.get("usage"),
+                    "decoding": None if not result else result.get("decoding"),
+                    "telemetry": self._pending_telemetry_stats,
                 }
             )
             self._pending_user_content = None
@@ -732,6 +840,9 @@ class LokaRuntime:
                 "timed_out": False,
                 "model": self.config.llm_model,
                 "frame_path": None if frame_path is None else str(frame_path),
+                "usage": result.get("usage"),
+                "decoding": result.get("decoding"),
+                "telemetry": self._pending_telemetry_stats,
             }
         )
         self._rebuild_prompt()
@@ -856,6 +967,12 @@ class LokaRuntime:
             slip=slip,
             gear_error=gear_error,
         )
+        self._detector_sample = {
+            "effort_dev": np.asarray(deviation, dtype=float).copy(),
+            "motor_dev": np.asarray(deficit, dtype=float).copy(),
+            "slip": float(slip),
+            "mpc_cost": np.asarray(self.controller.mpc.cost_components, dtype=float).copy(),
+        }
         self._sync_walk_block()
 
         telemetry = self.controller.telemetry
@@ -965,7 +1082,7 @@ class LokaRuntime:
             and not self._in_cooldown(now)
         ):
             if self.failure_episode is None:
-                self.failure_episode = FailureEpisode(started_at=now)
+                self.failure_episode = FailureEpisode(started_at=now, detector=self.detector_kind)
                 pending = self.loka_state.pop("search_results", None)
                 if pending:
                     self.failure_episode.interventions.append({
@@ -980,7 +1097,8 @@ class LokaRuntime:
                     self.failure_episode._turn_cap_noted = True
                     note = (
                         f"failure episode turn cap ({self.config.max_turns}) "
-                        f"reached; no further turns until the bias is back in bounds"
+                        f"reached; no further turns until the "
+                        f"{'tracking cost' if self.detector_kind == 'cost' else 'bias'} is back in bounds"
                     )
                     print(f"[LOKA] {note} at t={now:.2f}s")
                     if self.log is not None:
@@ -1044,9 +1162,8 @@ class LokaRuntime:
         return float(obs.stand_threshold_nm)
 
     def _sync_walk_block(self) -> None:
-        """Refuse a walk command while |bias| is above the mode threshold."""
-        total = self._bias_nm()
-        if total is None:
+        """Refuse a walk command while the detector is out of bounds."""
+        if self.effort_observer.trigger_value is None:
             self.controller.gait.block_walk = False
             return
         self.controller.gait.block_walk = self.effort_observer.out_of_bounds

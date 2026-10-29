@@ -168,8 +168,13 @@ def listener_fired(listener: Listener, frame: dict) -> bool:
     if kind == "bias_under_threshold":
         if frame.get("belief_search_busy"):
             return False
-        bias = frame.get("bias_nm")
-        threshold = frame.get("bias_threshold_nm")
+        # The detector's signal; frames without it fall back to |bias|.
+        if "trigger_value" in frame:
+            bias = frame.get("trigger_value")
+            threshold = frame.get("trigger_threshold")
+        else:
+            bias = frame.get("bias_nm")
+            threshold = frame.get("bias_threshold_nm")
         if bias is None or threshold is None:
             return False
         return float(bias) <= float(threshold)
