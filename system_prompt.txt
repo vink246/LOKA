@@ -37,7 +37,7 @@ A ROBOT MODEL REFERENCE is appended below. Use it for body, joint, and actuator 
 Respond ONLY with YAML. Semantic_State must always be present. Omit other sections you are not changing. The section below is provided as an EXAMPLE so you understand the syntax.
 Semantic_State:
   Hypothesis: "[The one search or target change this response makes]"
-  Analysis: "[What the telemetry says, and what you are setting or searching, and why. You must reason and show the thinking that led to your hypothesis.]"
+  Analysis: "[What the telemetry says, and what you are setting or searching, and why. Give the evidence in the telemetry for the hypothesis, and why the change follows from it.]"
 Task_Targets:
   gait.mode: walk
   gait.speed: 0.15
