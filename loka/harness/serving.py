@@ -133,7 +133,11 @@ def main(argv: list[str] | None = None) -> int:
     what = parser.add_mutually_exclusive_group(required=True)
     what.add_argument("--print-command", action="store_true", help="The server argv, shell-quoted.")
     what.add_argument("--print-block", action="store_true", help="The start-and-wait bash block.")
-    what.add_argument("--print-fetch", action="store_true", help="hf_repo and path, tab-separated.")
+    what.add_argument(
+        "--print-fetch",
+        action="store_true",
+        help="hf_repo, path and comma-separated fetch_exclude globs, tab-separated.",
+    )
     what.add_argument("--print-env", action="store_true", help="The server env prefix.")
     parser.add_argument("--port", default="8000")
     parser.add_argument("--log", default="local_model_server.log")
@@ -149,7 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.print_block:
         print("\n".join(render_server_block(entry, log_path=args.log, ready_timeout_s=args.ready_timeout_s)))
     elif args.print_fetch:
-        print(f"{entry.get('hf_repo') or ''}\t{expand(entry['path'])}")
+        excludes = ",".join(str(p) for p in entry.get("fetch_exclude") or ())
+        print(f"{entry.get('hf_repo') or ''}\t{expand(entry['path'])}\t{excludes}")
     else:
         print(expand(entry["server_env"]))
     return 0

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Create the loka-vllm conda env: a vLLM OpenAI-compatible server for the local
-# orchestrator models in loka/config/orchestrator_models.yaml (engine: vllm).
-# The env holds the server only; LOKA itself runs in the regular loka env and
-# talks to the server over HTTP. PACE only: this machine has no CUDA GPU.
+# Create the loka-vllm conda env: the one GPU env that serves every local
+# orchestrator model in loka/config/orchestrator_models.yaml, through vLLM
+# (engine vllm) or loka.vla.serve_hf (engine hf, Llama-3.2-11B-Vision; this
+# replaces the older loka-mllama env). LOKA's evaluation itself runs in the
+# regular CPU loka env and talks to the server over HTTP. NaVILA keeps its own
+# loka-navila env (VILA pins an older transformers/torch). PACE only.
 #
 #   bash scripts/setup_vllm_env.sh                    # env at ~/scratch/envs/loka-vllm
 #   bash scripts/setup_vllm_env.sh --prefix DIR       # env somewhere else
@@ -99,14 +101,26 @@ conda activate "${TARGET[1]}"
 
 python -m pip install -U pip
 python -m pip install "vllm==${VLLM_VERSION}" "huggingface_hub>=0.26"
+# LOKA's light runtime deps, so this env also runs loka.vla.serve_hf (the
+# in-process Llama-3.2-11B-Vision server, engine hf) and fetch_local_models.sh.
+# Installed after vLLM so they fit around its torch/transformers/numpy pins.
+python -m pip install "mujoco==3.2.3" "scipy>=1.10" "pyyaml>=6.0" "osqp>=1.1" \
+  "python-dotenv>=1.0" "Pillow" "accelerate"
 python -m pip check || echo "pip check reported conflicts (vLLM pins its own stack); see above"
-python - <<'PY'
-import torch, vllm
+(cd "$ROOT" && python - <<'PY'
+import mujoco, torch, transformers, vllm
+from transformers import MllamaForConditionalGeneration  # noqa: F401
+import loka.vla.serve_hf  # noqa: F401
 print(
     f"vllm env ok: vllm {vllm.__version__}, torch {torch.__version__} "
-    f"(cuda build {torch.version.cuda}, cuda available here: {torch.cuda.is_available()})"
+    f"(cuda build {torch.version.cuda}, cuda available here: {torch.cuda.is_available()}), "
+    f"transformers {transformers.__version__} (Mllama ok), mujoco {mujoco.__version__}"
 )
 PY
+)
+# Wheels and pip's temp files are not needed once installed.
+python -m pip cache purge >/dev/null 2>&1 || true
+rm -rf "${TMPDIR:?}"/* 2>/dev/null || true
 echo
 echo "Env ready: ${TARGET[1]}"
 echo "Next (on PACE):"

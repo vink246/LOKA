@@ -17,9 +17,11 @@ DEFAULT_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config" / "orches
 PROVIDERS = ("openai", "anthropic", "local")
 ENGINES = ("vllm", "hf")
 DEFAULT_MODELS_DIR = "~/scratch/models"
+#: One GPU env serves both engines (scripts/setup_vllm_env.sh). A model entry's
+#: server_env, or submit_pace_ice --hf-prefix / --vllm-prefix, overrides it.
 DEFAULT_SERVER_ENVS = {
     "vllm": "~/scratch/envs/loka-vllm",
-    "hf": "~/scratch/envs/loka-mllama",
+    "hf": "~/scratch/envs/loka-vllm",
 }
 
 #: Hugging Face organisations of Chinese origin. Their weights, and fine-tunes

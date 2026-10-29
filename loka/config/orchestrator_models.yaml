@@ -7,9 +7,9 @@
 # to the OpenAI API (OPENAI_API_KEY). API models need no entry.
 #
 # provider: local entries run only on PACE GPU nodes. The eval job starts an
-# OpenAI-compatible server for the entry (engine vllm: `vllm serve` from the
-# loka-vllm env; engine hf: loka.vla.serve_hf from the loka-mllama env), waits
-# for /health, and points the orchestrator at it with LOKA_LOCAL_BASE_URL.
+# OpenAI-compatible server for the entry (engine vllm: `vllm serve`; engine hf:
+# loka.vla.serve_hf; both from the loka-vllm env), waits for /health, and
+# points the orchestrator at it with LOKA_LOCAL_BASE_URL.
 #
 #   bash scripts/setup_vllm_env.sh                   # once, on a login node
 #   bash scripts/fetch_local_models.sh gemma-3-27b-it # weights to ~/scratch/models/KEY
@@ -27,6 +27,7 @@
 #   origin          country of the releasing organisation
 #   base_family     model family the weights derive from (checked by the origin guard)
 #   slurm           gres, mem, cpus, time for one GPU job; flags on the submit command win
+#   fetch_exclude   repo paths fetch_local_models.sh skips (duplicate weight copies)
 #   vllm_args       extra `vllm serve` arguments
 #
 # Only models from organisations outside China may be listed; the loader
@@ -65,8 +66,9 @@ models:
     base_family: llama
     slurm: {gres: "gpu:A100:1", mem: 48G}
   # The model run_loka --orchestrator-mllama loads. Served in-process by
-  # transformers (loka.vla.serve_hf) because recent vLLM releases dropped
-  # Mllama; switch engine to vllm only if the pinned vLLM still serves it.
+  # transformers (loka.vla.serve_hf, in the loka-vllm env) because recent vLLM
+  # releases dropped Mllama; switch engine to vllm only if the pinned vLLM
+  # still serves it. Its weights are already on PACE from the NaVILA work.
   llama-3.2-11b-vision:
     provider: local
     engine: hf
@@ -111,6 +113,8 @@ models:
   gpt-oss-20b:
     provider: local
     hf_repo: openai/gpt-oss-20b
+    # original/ and metal/ are two more full copies of the weights.
+    fetch_exclude: ["original/*", "metal/*"]
     prefill: null
     max_tokens: 8192
     origin: US
@@ -119,6 +123,8 @@ models:
   gpt-oss-120b:
     provider: local
     hf_repo: openai/gpt-oss-120b
+    # original/ and metal/ are two more full copies of the weights.
+    fetch_exclude: ["original/*", "metal/*"]
     prefill: null
     max_tokens: 8192
     origin: US
@@ -130,6 +136,8 @@ models:
   ministral-8b:
     provider: local
     hf_repo: mistralai/Ministral-8B-Instruct-2410
+    # --load-format mistral reads consolidated.safetensors; skip the HF-format copy.
+    fetch_exclude: ["model-*.safetensors", "model.safetensors.index.json"]
     origin: FR
     base_family: mistral
     slurm: {gres: "gpu:A100:1", mem: 48G}
@@ -137,6 +145,8 @@ models:
   mistral-small-3.2-24b:
     provider: local
     hf_repo: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+    # --load-format mistral reads consolidated.safetensors; skip the HF-format copy.
+    fetch_exclude: ["model-*.safetensors", "model.safetensors.index.json"]
     vision: true
     origin: FR
     base_family: mistral
