@@ -41,7 +41,7 @@ def _suite(path: Path, *, trials: int = 2) -> None:
 
 
 def test_jobs_are_stable_and_worker_script_is_cpu_only(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("loka.submit_pace_ice._require_openai", lambda *_a, **_k: None)
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
     config = tmp_path / "suite.yaml"
     _suite(config)
     run_dir = tmp_path / "run"
@@ -86,7 +86,7 @@ def test_jobs_are_stable_and_worker_script_is_cpu_only(tmp_path: Path, monkeypat
 
 
 def test_sbatch_merge_depends_on_the_array(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("loka.submit_pace_ice._require_openai", lambda *_a, **_k: None)
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
     config = tmp_path / "suite.yaml"
     _suite(config, trials=1)
     calls: list[tuple] = []
@@ -143,7 +143,7 @@ def test_worker_selects_the_array_index(tmp_path: Path, monkeypatch):
 
 
 def test_merge_and_resubmit_report_missing_units(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("loka.submit_pace_ice._require_openai", lambda *_a, **_k: None)
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
     config = tmp_path / "suite.yaml"
     _suite(config, trials=1)
     run_dir = tmp_path / "run"
@@ -193,7 +193,7 @@ def test_loka_baseline_requires_an_api_key(tmp_path: Path, monkeypatch):
 
 
 def test_unit_flag_submits_only_that_job(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("loka.submit_pace_ice._require_openai", lambda *_a, **_k: None)
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
     config = tmp_path / "suite.yaml"
     _suite(config, trials=2)
     run_dir = tmp_path / "run"
@@ -230,7 +230,7 @@ def test_first_wave_stays_within_the_pace_cap():
 
 
 def test_over_cap_submits_a_wave_then_the_rest(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr("loka.submit_pace_ice._require_openai", lambda *_a, **_k: None)
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
     config = tmp_path / "suite.yaml"
     _suite(config, trials=2)
     run_dir = tmp_path / "run"
@@ -287,3 +287,168 @@ def test_over_cap_submits_a_wave_then_the_rest(tmp_path: Path, monkeypatch):
     assert calls[5] == ("merge.sh", ["--dependency", "afterany:105"])
     manifest = json.loads((run_dir / "slurm" / "jobs.json").read_text(encoding="utf-8"))
     assert manifest["next_offset"] == 8
+
+
+def _mixed_suite(path: Path, *, trials: int = 3) -> None:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "output_dir": str(path.parent / "out"),
+                "num_trials": trials,
+                "baselines": [
+                    "low_level",
+                    {"name": "loka_claude", "type": "loka", "options": {"orchestrator": {"model": "claude-x"}}},
+                    {"name": "loka_g27", "type": "loka", "options": {"orchestrator": {"model": "gemma-3-27b-it"}}},
+                    {
+                        "name": "loka_l11",
+                        "type": "loka_ablated",
+                        "options": {"variant": "raw_telemetry", "orchestrator": {"model": "llama-3.2-11b-vision"}},
+                    },
+                ],
+                "tasks": [
+                    {
+                        "name": "goto_goal",
+                        "type": "goto_goal",
+                        "goal": {"xy": [1.0, 0.0]},
+                        "timeout_s": 5.0,
+                        "perturbations": [
+                            {"name": "nominal", "kind": "none"},
+                            {"name": "ice", "kind": "friction", "mu": 0.3},
+                        ],
+                        "metrics": ["success"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_local_models_run_as_gpu_bundles(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
+    config = tmp_path / "suite.yaml"
+    _mixed_suite(config)
+    run_dir = tmp_path / "run"
+    code = main(
+        [
+            "--config", str(config), "--run-dir", str(run_dir), "--dry-run",
+            "--gpu-units-per-job", "4", "--gpu-lanes", "2", "--gpu-max-submitted", "6",
+        ]
+    )
+    assert code == 0
+    slurm = run_dir / "slurm"
+    cpu = json.loads((slurm / "jobs.json").read_text(encoding="utf-8"))["jobs"]
+    assert {job["baseline"] for job in cpu} == {"low_level", "loka_claude"}
+    bundles = json.loads((slurm / "gpu_gemma-3-27b-it_jobs.json").read_text(encoding="utf-8"))["jobs"]
+    assert [len(b["units"]) for b in bundles] == [4, 2]
+    assert {u["baseline"] for b in bundles for u in b["units"]} == {"loka_g27"}
+    cpu_worker = (slurm / "worker.sh").read_text(encoding="utf-8")
+    assert "--gres" not in cpu_worker
+    gpu = (slurm / "gpu_gemma-3-27b-it_worker.sh").read_text(encoding="utf-8")
+    assert "#SBATCH --gres=gpu:H100:1" in gpu
+    assert "#SBATCH --array=0-1%2" in gpu
+    assert "/bin/vllm serve" in gpu
+    assert "/health" in gpu and "export LOKA_LOCAL_BASE_URL=" in gpu
+    assert "${SLURM_ARRAY_TASK_ID}" in gpu and "--gpu-worker" in gpu
+    hf = (slurm / "gpu_llama-3.2-11b-vision_worker.sh").read_text(encoding="utf-8")
+    assert "loka.vla.serve_hf" in hf
+    # With two lanes, each model is the head of its own lane.
+    for name in ("gpu_gemma-3-27b-it_jobs_chain_args.json", "gpu_llama-3.2-11b-vision_jobs_chain_args.json"):
+        chain = json.loads((slurm / name).read_text(encoding="utf-8"))
+        assert chain["max_submitted"] == 3 and "next_chain" not in chain
+    # CPU keeps the rest of the cap.
+    assert json.loads((slurm / "chain_args.json").read_text(encoding="utf-8"))["max_submitted"] == 19
+
+
+def test_one_lane_runs_models_in_turn(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
+    config = tmp_path / "suite.yaml"
+    _mixed_suite(config, trials=1)
+    run_dir = tmp_path / "run"
+    calls: list[tuple] = []
+
+    def fake_sbatch(script, extra=None):
+        calls.append((Path(script).name, extra))
+        return str(500 + len(calls))
+
+    monkeypatch.setattr("loka.submit_pace_ice._sbatch", fake_sbatch)
+    code = main(["--config", str(config), "--run-dir", str(run_dir), "--gpu-units-per-job", "5"])
+    assert code == 0
+    names = [name for name, _ in calls]
+    assert names[:2] == ["worker.sh", "merge.sh"]
+    # Gemma's only wave hands over to the 11B model, not to merge.
+    assert names[2:] == ["gpu_gemma-3-27b-it_worker.sh", "gpu_gemma-3-27b-it_next.sh"]
+    follow = (run_dir / "slurm" / "gpu_gemma-3-27b-it_next.sh").read_text(encoding="utf-8")
+    assert "gpu_llama-3.2-11b-vision_jobs_chain_args.json" in follow and "--advance" in follow
+    monkeypatch.setenv(
+        "LOKA_CHAIN_ARGS", str(run_dir / "slurm" / "gpu_llama-3.2-11b-vision_jobs_chain_args.json")
+    )
+    assert main(["--advance", "--run-dir", str(run_dir)]) == 0
+    assert [name for name, _ in calls[4:]] == ["gpu_llama-3.2-11b-vision_worker.sh", "merge.sh"]
+
+
+def test_gpu_cap_and_credentials(tmp_path: Path, monkeypatch):
+    config = tmp_path / "suite.yaml"
+    _mixed_suite(config, trials=1)
+    monkeypatch.setattr("loka.submit_pace_ice.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    code = main(["--config", str(config), "--run-dir", str(tmp_path / "a"), "--dry-run", "--no-local-check"])
+    assert code == 2
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    # Local checkpoints are checked on the login node unless told not to.
+    code = main(["--config", str(config), "--run-dir", str(tmp_path / "b"), "--dry-run"])
+    assert code == 2
+    code = main(
+        ["--config", str(config), "--run-dir", str(tmp_path / "c"), "--dry-run", "--no-local-check",
+         "--gpu-lanes", "2", "--gpu-max-submitted", "5"]
+    )
+    assert code == 2
+    code = main(["--config", str(config), "--run-dir", str(tmp_path / "d"), "--dry-run", "--no-local-check"])
+    assert code == 0
+    script = (tmp_path / "d" / "slurm" / "gpu_gemma-3-27b-it_worker.sh").read_text(encoding="utf-8")
+    assert "ANTHROPIC" not in script
+
+
+def test_gpu_worker_runs_every_unit_of_its_bundle(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
+    config = tmp_path / "suite.yaml"
+    _mixed_suite(config)
+    run_dir = tmp_path / "run"
+    assert main(["--config", str(config), "--run-dir", str(run_dir), "--dry-run", "--gpu-units-per-job", "4"]) == 0
+    jobs_file = run_dir / "slurm" / "gpu_gemma-3-27b-it_jobs.json"
+    bundle = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+    seen: list[str] = []
+
+    def fake_run(suite_obj):
+        seen.append(suite_obj.unit)
+        if len(seen) == 2:
+            raise RuntimeError("boom")
+        return run_dir
+
+    monkeypatch.setattr("loka.harness.pipeline.run_suite", fake_run)
+    monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "0")
+    monkeypatch.setenv("LOKA_JOBS_FILE", str(jobs_file))
+    from loka.submit_pace_ice import run_gpu_worker
+
+    assert run_gpu_worker(run_dir) == 1
+    assert seen == [unit["id"] for unit in bundle["units"]]
+
+
+def test_resubmit_includes_unfinished_gpu_units(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("loka.submit_pace_ice._require_credentials", lambda *_a, **_k: None)
+    config = tmp_path / "suite.yaml"
+    _mixed_suite(config, trials=1)
+    run_dir = tmp_path / "run"
+    assert main(["--config", str(config), "--run-dir", str(run_dir), "--dry-run"]) == 0
+    bundles = json.loads((run_dir / "slurm" / "gpu_gemma-3-27b-it_jobs.json").read_text(encoding="utf-8"))["jobs"]
+    done = bundles[0]["units"][0]["id"]
+    (run_dir / done).mkdir(parents=True)
+    (run_dir / done / "done.json").write_text("{}", encoding="utf-8")
+    code = main(["--resubmit-missing", str(run_dir), "--dry-run"])
+    assert code == 0
+    again = json.loads(
+        (run_dir / "slurm" / "resubmit_gpu_gemma-3-27b-it_jobs.json").read_text(encoding="utf-8")
+    )["jobs"]
+    ids = [unit["id"] for bundle in again for unit in bundle["units"]]
+    assert done not in ids and len(ids) == 1
+    assert (run_dir / "slurm" / "gpu_gemma-3-27b-it_resubmit.sh").is_file()

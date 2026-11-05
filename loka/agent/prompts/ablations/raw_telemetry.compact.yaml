@@ -1,0 +1,11 @@
+# raw_telemetry ablation, compact prompt (system_prompt_compact.txt).
+# Applied after cost_detector; the first anchor stops before the part it rewrites.
+
+- find: "a snapshot: pelvis x y z and yaw, speeds (closing speed > 0 means moving toward the goal), and the "
+  replace: "RAW TELEMETRY (the unprocessed per-tick stream of the last seconds as a CSV table, oldest row first, nothing averaged or derived; speed toward the goal is the velocity projected on the goal direction; columns: {{RAW_TELEMETRY_COLUMNS}}) in place of a summary of the "
+
+- find: "OBJECT CONTACT means the robot touched an object:"
+  replace: "A nonzero prop_n column means the robot touched an object:"
+
+- find: "(yaw is in STATE;"
+  replace: "(yaw is a RAW TELEMETRY column;"

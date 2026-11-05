@@ -1,0 +1,99 @@
+# Orchestrator model ablation, API models only (CPU jobs; no local models).
+# Two vendors at two matched price tiers (Oct 2026 list prices per 1M tokens):
+#   frontier: gpt-6.1-sol and claude-sonnet-5-5   ($2 in / $10 out)
+#   smaller:  gpt-6-luna  and claude-haiku-5-5    ($0.10 in / $0.50 out)
+# gpt-6-luna is the model of every earlier LOKA run.
+#
+#   python -m loka.submit_pace_ice --config loka/config/eval_models_api.yaml --dry-run
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_models_api.yaml \
+#       --conda-prefix ~/scratch/envs/loka
+#
+# Every LOKA baseline uses latency mode pause (zero simulated latency), so the
+# models are compared on decisions, not on API speed. temperature 0 is
+# requested for the record; these API models refuse it and run at their
+# default (see each turn's decoding record).
+
+output_dir: results/g1_models_api
+seed: 0
+num_trials: 5
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: pause
+    seconds: 2.0
+  request_timeout_s: 120.0
+  temperature: 0.0
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+baselines:
+  - low_level
+  - {name: loka_gpt6_luna, type: loka, options: {orchestrator: {model: gpt-6-luna}}}
+  - {name: loka_gpt61_sol, type: loka, options: {orchestrator: {model: gpt-6.1-sol}}}
+  - {name: loka_claude_haiku, type: loka, options: {orchestrator: {model: claude-haiku-5-5}}}
+  - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-5-5}}}
+
+tasks:
+  - name: stand_push
+    type: stand_push
+    mass:
+      body: left_shoulder_roll_link
+      delta_kg: 10.0
+    mass_time_s: 2.0
+    push_delay_s: 10.0
+    observe_s: 10.0
+    push:
+      direction: [0.0, 1.0]
+      duration_s: 0.05
+    search:
+      lo_n: 0.0
+      hi_n: 200.0
+      max_hi_n: 2000.0
+      resolution_n: 0.2
+    metrics: [max_push_force_n]
+
+  - name: goto_goal
+    type: goto_goal
+    goal:
+      xy: [3.0, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 0.0
+    command_time_s: 0.0
+    perturbation_time_s: 5.0
+    timeout_s: 60.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+      - {name: torso_mass, kind: mass, body: torso_link, delta_kg: 10.0}
+      - {name: shoulder_mass, kind: mass, body: left_shoulder_roll_link, delta_kg: 7.0}
+      - {name: weak_right_knee, kind: actuator_gear, actuator: right_knee, scale: 0.75}
+      - {name: low_friction, kind: friction, mu: 0.4}
+      - {name: shove, kind: push, force_n: 120.0, direction: [0.0, 1.0], duration_s: 0.05}
+    metrics:
+      - num_successes
+      - num_falls
+      - time_to_goal_s
+      - wall_time_to_goal_s
+      - path_efficiency
+      - llm_turn_count
+      - llm_input_tokens
+      - llm_output_tokens

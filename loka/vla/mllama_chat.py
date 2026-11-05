@@ -108,6 +108,7 @@ class MllamaChatBackend:
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
         self.label = f"mllama:{self.model_path.name}"
+        self.last_usage: dict = {}
         self._torch = torch
         self._lock = threading.Lock()
         # local_files_only: a missing file fails here instead of pulling from the Hub.
@@ -150,6 +151,7 @@ class MllamaChatBackend:
                 top_p=None,
             )
         reply_ids = output[0, n_tokens:]
+        self.last_usage = {"prompt_tokens": n_tokens, "completion_tokens": int(reply_ids.shape[-1])}
         text = self.processor.decode(reply_ids, skip_special_tokens=True).rstrip()
         if not prefill:
             return text.strip()

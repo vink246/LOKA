@@ -37,6 +37,32 @@ class OrchestratorSpec:
     latency_mode: str = "fixed_sim"
     latency_s: float = 2.0
     request_timeout_s: float = 120.0
+    #: openai, anthropic or local. None routes by model name and the registry.
+    provider: str | None = None
+    prompt_style: str = "full"
+    reply_check: bool = False
+    #: Reply cap. None keeps the provider default (registry ``max_tokens``).
+    max_tokens: int | None = None
+    #: Sampling temperature. None sends none (the vendor or server default).
+    temperature: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "latency": {"mode": self.latency_mode, "seconds": float(self.latency_s)},
+            "request_timeout_s": float(self.request_timeout_s),
+        }
+        if self.provider is not None:
+            payload["provider"] = self.provider
+        if self.prompt_style != "full":
+            payload["prompt_style"] = self.prompt_style
+        if self.reply_check:
+            payload["reply_check"] = True
+        if self.max_tokens is not None:
+            payload["max_tokens"] = int(self.max_tokens)
+        if self.temperature is not None:
+            payload["temperature"] = float(self.temperature)
+        return payload
 
 
 @dataclass
@@ -118,6 +144,7 @@ class SuiteConfig:
     trial: int | None = None
     run_dir: Path | None = None
     unit: str | None = None
+    ablation_config: str | None = None
 
     def task(self, name: str) -> TaskSpec:
         for item in self.tasks:
@@ -143,14 +170,7 @@ class SuiteConfig:
                 "config": self.controller.config,
                 "stack": self.controller.stack,
             },
-            "orchestrator": {
-                "model": self.orchestrator.model,
-                "latency": {
-                    "mode": self.orchestrator.latency_mode,
-                    "seconds": float(self.orchestrator.latency_s),
-                },
-                "request_timeout_s": float(self.orchestrator.request_timeout_s),
-            },
+            "orchestrator": self.orchestrator.to_dict(),
             "recording": {
                 "enabled": bool(self.recording.enabled),
                 "fps": float(self.recording.fps),
@@ -173,7 +193,15 @@ class SuiteConfig:
             payload["trial"] = int(self.trial)
         if self.unit is not None:
             payload["unit"] = self.unit
+        if self.ablation_config is not None:
+            payload["ablation_config"] = self.ablation_config
         return payload
+
+    def orchestrator_for(self, baseline: BaselineSpec | str) -> OrchestratorSpec:
+        """The orchestrator a LOKA baseline runs: the suite's, with its overrides."""
+        spec = self.baseline(baseline) if isinstance(baseline, str) else baseline
+        override = (spec.options or {}).get("orchestrator") or {}
+        return _parse_orchestrator(_merge_orchestrator(self.orchestrator.to_dict(), override))
 
 
 def _mapping(raw: Any, label: str) -> dict[str, Any]:
@@ -277,25 +305,93 @@ def _parse_task(raw: Any) -> TaskSpec:
     )
 
 
-def _parse_baseline(raw: Any) -> BaselineSpec:
+#: Baseline types that run the orchestrator and take ``options.orchestrator``.
+LOKA_BASELINE_TYPES = ("loka", "loka_ablated")
+
+
+def _parse_baseline(
+    raw: Any,
+    orchestrator: OrchestratorSpec | None = None,
+    ablation_config: str | None = None,
+) -> BaselineSpec:
     if isinstance(raw, str):
         name = _check_name(raw, "baseline")
         if name not in known_baselines():
             raise ValueError(
                 f"Unknown baseline {name!r}. Known: {', '.join(known_baselines())}"
             )
-        return BaselineSpec(name=name, type=name)
-    data = _mapping(raw, "baseline")
-    kind = str(data.get("type", data.get("name", "")))
-    name = _check_name(data.get("name", kind), "baseline")
-    if kind not in known_baselines():
+        if name == "loka_ablated":
+            raise ValueError("baseline loka_ablated needs options.variant")
+        spec = BaselineSpec(name=name, type=name)
+    else:
+        data = _mapping(raw, "baseline")
+        kind = str(data.get("type", data.get("name", "")))
+        name = _check_name(data.get("name", kind), "baseline")
+        if kind not in known_baselines():
+            raise ValueError(
+                f"Unknown baseline type {kind!r}. Known: {', '.join(known_baselines())}"
+            )
+        options = data.get("options") or {}
+        if not isinstance(options, dict):
+            raise ValueError(f"Baseline {name!r} options must be a mapping")
+        spec = BaselineSpec(name=name, type=kind, options=dict(options))
+    if spec.type in LOKA_BASELINE_TYPES:
+        _resolve_loka_options(spec, orchestrator or OrchestratorSpec(), ablation_config)
+    elif "orchestrator" in spec.options:
+        raise ValueError(f"Baseline {spec.name!r} ({spec.type}) has no orchestrator to configure")
+    return spec
+
+
+def _merge_orchestrator(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in (override or {}).items():
+        if key == "latency" and isinstance(value, dict):
+            merged["latency"] = {**dict(merged.get("latency") or {}), **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_loka_options(
+    spec: BaselineSpec, orchestrator: OrchestratorSpec, ablation_config: str | None
+) -> None:
+    """Inline the ablation variant and the model entry so a resolved config stands alone.
+
+    Precedence: ``options.orchestrator`` over the variant's ``orchestrator``
+    over the suite ``orchestrator``.
+    """
+    from loka.agent.ablations import AblationSet, resolve_variant
+    from loka.agent.model_registry import resolve_model
+
+    options = spec.options
+    override = options.get("orchestrator") or {}
+    if not isinstance(override, dict):
+        raise ValueError(f"Baseline {spec.name!r} options.orchestrator must be a mapping")
+    if spec.type == "loka_ablated":
+        if "ablations" in options:
+            # Already resolved (a config.resolved.yaml): never re-read the file.
+            AblationSet.from_dict(options["ablations"])
+        else:
+            variant = options.get("variant")
+            if not variant:
+                raise ValueError(f"Baseline {spec.name!r} (loka_ablated) needs options.variant")
+            resolved = resolve_variant(str(variant), ablation_config)
+            variant_orch = resolved.pop("orchestrator", {}) or {}
+            options["ablations"] = resolved
+            if variant_orch:
+                override = _merge_orchestrator(variant_orch, override)
+    elif "variant" in options or "ablations" in options:
         raise ValueError(
-            f"Unknown baseline type {kind!r}. Known: {', '.join(known_baselines())}"
+            f"Baseline {spec.name!r} sets an ablation variant; use type loka_ablated"
         )
-    options = data.get("options") or {}
-    if not isinstance(options, dict):
-        raise ValueError(f"Baseline {name!r} options must be a mapping")
-    return BaselineSpec(name=name, type=kind, options=dict(options))
+    if override:
+        options["orchestrator"] = override
+    effective = _parse_orchestrator(_merge_orchestrator(orchestrator.to_dict(), override))
+    entry = resolve_model(effective.model, provider=effective.provider)
+    if entry["provider"] == "local":
+        options["model_entry"] = entry
+    else:
+        options.pop("model_entry", None)
 
 
 def _parse_recording(raw: Any) -> RecordingSpec:
@@ -331,12 +427,42 @@ def _parse_recording(raw: Any) -> RecordingSpec:
 def _parse_orchestrator(raw: Any) -> OrchestratorSpec:
     data = dict(raw or {})
     latency = dict(data.get("latency") or {})
+    known = {
+        "model",
+        "latency",
+        "request_timeout_s",
+        "provider",
+        "prompt_style",
+        "reply_check",
+        "max_tokens",
+        "temperature",
+    }
+    unknown = set(data) - known
+    if unknown:
+        raise ValueError(f"orchestrator has unknown keys {sorted(unknown)}")
+    max_tokens = data.get("max_tokens")
+    temperature = data.get("temperature")
     spec = OrchestratorSpec(
         model=str(data.get("model", "gpt-5.4-mini")),
         latency_mode=str(latency.get("mode", "fixed_sim")),
         latency_s=float(latency.get("seconds", 2.0)),
         request_timeout_s=float(data.get("request_timeout_s", 120.0)),
+        provider=None if data.get("provider") is None else str(data["provider"]),
+        prompt_style=str(data.get("prompt_style", "full")),
+        reply_check=bool(data.get("reply_check", False)),
+        max_tokens=None if max_tokens is None else int(max_tokens),
+        temperature=None if temperature is None else float(temperature),
     )
+    if spec.temperature is not None and not 0.0 <= spec.temperature <= 2.0:
+        raise ValueError(f"orchestrator temperature must be in [0, 2], got {spec.temperature}")
+    if spec.provider is not None and spec.provider not in ("openai", "anthropic", "local"):
+        raise ValueError(
+            f"orchestrator provider must be openai, anthropic or local, got {spec.provider!r}"
+        )
+    if spec.prompt_style not in ("full", "compact"):
+        raise ValueError(f"orchestrator prompt_style must be full or compact, got {spec.prompt_style!r}")
+    if spec.max_tokens is not None and spec.max_tokens < 1:
+        raise ValueError("orchestrator max_tokens must be >= 1")
     if spec.latency_mode not in ("wall", "fixed_sim", "pause"):
         raise ValueError(
             f"orchestrator latency mode must be wall, fixed_sim or pause, "
@@ -355,10 +481,15 @@ def parse_suite(raw: dict[str, Any]) -> SuiteConfig:
     if stack not in STACK_NAMES:
         raise ValueError(f"Unknown controller stack {stack!r}. Known: {STACK_NAMES}")
     config_path = str(controller.get("config", "loka/config/g1.yaml"))
+    orchestrator = _parse_orchestrator(data.get("orchestrator"))
+    ablation_config = data.get("ablation_config")
+    ablation_config = None if not ablation_config else str(ablation_config)
     baselines_raw = data.get("baselines")
     if not isinstance(baselines_raw, list) or not baselines_raw:
         raise ValueError("baselines must be a non-empty list")
-    baselines = [_parse_baseline(item) for item in baselines_raw]
+    baselines = [
+        _parse_baseline(item, orchestrator, ablation_config) for item in baselines_raw
+    ]
     if len({item.name for item in baselines}) != len(baselines):
         raise ValueError("duplicate baseline names")
     tasks_raw = data.get("tasks")
@@ -390,13 +521,14 @@ def parse_suite(raw: dict[str, Any]) -> SuiteConfig:
         log_hz=log_hz,
         workers=workers,
         controller=ControllerSpec(config=config_path, stack=stack),
-        orchestrator=_parse_orchestrator(data.get("orchestrator")),
+        orchestrator=orchestrator,
         recording=_parse_recording(data.get("recording")),
         baselines=baselines,
         tasks=tasks,
         trial=None if trial is None else int(trial),
         run_dir=None if not run_dir else Path(run_dir),
         unit=None if unit is None else str(unit),
+        ablation_config=ablation_config,
     )
 
 
@@ -485,6 +617,7 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
         trial=trial,
         run_dir=run_dir,
         unit=unit,
+        ablation_config=config.ablation_config,
     )
 
 

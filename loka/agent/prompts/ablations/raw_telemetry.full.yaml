@@ -1,0 +1,66 @@
+# raw_telemetry ablation, full prompt (system_prompt.txt). Applied after
+# cost_detector, so some anchors depend on whether that ablation is active.
+# {{RAW_TELEMETRY_COLUMNS}} and {{GAIT_SAFE_BAND}} are filled by the runtime.
+
+- find: |-
+    - a full-state snapshot: pelvis xyz in the world frame, attitude, velocity, along heading, and closing speed
+  replace: |-
+    - RAW TELEMETRY instead of a summary: the unprocessed per-tick stream of the last seconds as a CSV table, oldest row first, the last row at this call. Nothing in it is averaged, ranked or derived, and columns that do not fit the size budget of a turn are left out of that turn. Columns: {{RAW_TELEMETRY_COLUMNS}}
+
+- unless: [hide_residual]
+  find: |-
+    - EFFORT DEVIATION, one signed Nm per actuator:
+  replace: |-
+    - EFFORT DEVIATION (e_<actuator> columns), one signed Nm per actuator per tick:
+
+- unless: [cost_detector]
+  find: |-
+    |bias| is the sum of absolute values.
+  replace: |-
+    |bias|, the sum of the absolute window means, is what the detector compares with its threshold; it is not shown.
+
+- when: [cost_detector]
+  unless: [hide_residual]
+  find: |-
+    |bias| is the sum of absolute values; it is shown for diagnosis and does not open a fault.
+  replace: |-
+    |bias|, the sum of the absolute window means, is not shown and does not open a fault.
+
+- unless: [hide_residual]
+  find: |-
+    MOTOR DEFICIT is commanded joint torque
+  replace: |-
+    MOTOR DEFICIT (m_<actuator> columns) is commanded joint torque
+
+- unless: [hide_residual]
+  find: |-
+    STANCE SLIP is the fastest planted sole
+  replace: |-
+    STANCE SLIP (the slip column) is the fastest planted sole
+
+- unless: [cost_detector]
+  find: |-
+    - STATE COST, the MPC residual per component.
+  replace: |-
+    - STATE COST (c_<channel> columns), the MPC residual per component per tick.
+
+- when: [cost_detector]
+  find: |-
+    - STATE COST, the MPC residual per component, averaged over the detector window. Their sum is the TRACKING COST, the anomaly signal, shown with its standing or walking threshold and the out-of-bounds streak.
+  replace: |-
+    - STATE COST (c_<channel> columns), the MPC residual per component per tick. The TRACKING COST, the anomaly signal, is the sum of their window means; it and its threshold are not shown.
+
+- find: |-
+    - OBJECT CONTACT, only when the robot touched an object in the window: a number for each object touched, the peak contact force, and the robot links in contact.
+  replace: |-
+    - OBJECT CONTACT (prop_n column): the total contact force from objects the robot touches, per tick.
+
+- find: |-
+    Along heading positive means motion the way the heading points. Closing speed positive means motion toward the goal. Planar speed has no sign.
+  replace: |-
+    The table has no derived speeds: motion toward the goal is the pelvis velocity (vx, vy) projected on the direction from the pelvis (x, y) to the goal, and the heading is yaw.
+
+- find: |-
+    Stay inside the gait safe band printed in the snapshot.
+  replace: |-
+    Stay inside the gait safe band (out of range is clipped): {{GAIT_SAFE_BAND}}.

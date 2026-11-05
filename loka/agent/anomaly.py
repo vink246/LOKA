@@ -110,6 +110,7 @@ class EffortDeviationObserver:
         self._line_width = 0
         self._named = False
         self.xyz = None
+        self.ready = False
 
     def update(self, delta_tau, cost, printout=False, xyz=None, motor=None, slip=0.0, gear_error=None):
         # Signed actuator image of plant bias minus belief bias.
@@ -154,6 +155,7 @@ class EffortDeviationObserver:
         # A one-sample mean is the startup spike. Publish zeros, and do not
         # count the step, until the standing window or the two-step walk
         # window is full.
+        self.ready = ready
         if not ready:
             joint_bias = np.zeros_like(delta_tau)
             motor_bias = np.zeros_like(motor)
@@ -164,12 +166,7 @@ class EffortDeviationObserver:
         else:
             total_bias = float(np.sum(np.abs(joint_bias)))
             motor_nm = float(np.sum(np.abs(motor_bias)))
-            threshold = self.walk_threshold_nm if self.is_walking else self.stand_threshold_nm
-            self.out_of_bounds = (
-                total_bias > threshold
-                or motor_nm > self.motor_threshold_nm
-                or slip_m > self.slip_threshold_mps
-            )
+            self.out_of_bounds = self._out_of_bounds(total_bias, motor_nm, slip_m)
             if self.out_of_bounds:
                 self.consecutive_out_of_bounds += 1
                 self.consecutive_in_bounds = 0
@@ -189,6 +186,28 @@ class EffortDeviationObserver:
             self._write(avg_cost, joint_bias, total_bias)
 
         return total_bias, joint_bias, avg_cost
+
+    #: What opens a fault: ``residual`` (effort bias, motor deficit, slip).
+    kind = "residual"
+
+    def _out_of_bounds(self, total_bias: float, motor_nm: float, slip_m: float) -> bool:
+        threshold = self.walk_threshold_nm if self.is_walking else self.stand_threshold_nm
+        return (
+            total_bias > threshold
+            or motor_nm > self.motor_threshold_nm
+            or slip_m > self.slip_threshold_mps
+        )
+
+    @property
+    def trigger_value(self) -> float | None:
+        """The signal the bias_under_threshold listener and walk lock-out compare."""
+        if self.joint_bias is None:
+            return None
+        return float(np.sum(np.abs(self.joint_bias)))
+
+    @property
+    def trigger_threshold(self) -> float:
+        return float(self.walk_threshold_nm if self.is_walking else self.stand_threshold_nm)
 
     @staticmethod
     def _push_walk(buf: deque, sample, n: int):
@@ -224,12 +243,78 @@ class EffortDeviationObserver:
             motor_txt = (
                 f" motor={self.motor_nm:4.1f}({motor_name}={float(self.motor_bias[slot]):+.1f})"
             )
+        cost_txt = ""
+        if self.kind == "cost" and self.trigger_value is not None:
+            cost_txt = f" cost={self.trigger_value:6.2f}/{self.trigger_threshold:.2f}"
         line = (
             f"[effort] |bias|={total_bias:5.1f}{motor_txt}"
-            f" slip={self.slip_mps:4.2f} "
+            f" slip={self.slip_mps:4.2f}{cost_txt} "
             f"oob={self.consecutive_out_of_bounds} {worst_txt}  {vals}{pos}"
         )
         self._line_width = max(self._line_width, len(line))
         sys.stdout.write("\r" + line.ljust(self._line_width))
         sys.stdout.flush()
+
+
+class CostTrackingObserver(EffortDeviationObserver):
+    """Cost-only anomaly detector for the ``cost_detector`` ablation.
+
+    A tick is out of bounds when the MPC tracking cost (the weighted state
+    residual summed over ``cost_channels``), averaged over the same window as
+    the residual detector, is above the standing or walking threshold. The
+    effort residual, motor deficit and slip are still averaged, because the
+    belief search reads them, but they no longer open or close a fault.
+    """
+
+    kind = "cost"
+
+    def __init__(self, spec, window_size_steps: int | None = None):
+        super().__init__(window_size_steps)
+        stand, walk = spec.require_thresholds()
+        self.cost_stand_threshold = float(stand)
+        self.cost_walk_threshold = float(walk)
+        self.consecutive_steps = int(spec.consecutive_steps)
+        self.clear_below_s = float(spec.clear_below_s)
+        self.cost_channels = tuple(spec.cost_channels)
+        self._channel_index = np.array([_COST_NAMES.index(c) for c in self.cost_channels], dtype=int)
+        self._cost_stand = deque(maxlen=self.window_size)
+        self._cost_walk: deque = deque()
+        self._cost_mean = 0.0
+        self.cost_signal: float | None = None
+
+    def update(self, delta_tau, cost, printout=False, xyz=None, motor=None, slip=0.0, gear_error=None):
+        values = np.atleast_1d(np.asarray(cost, dtype=float)).reshape(-1)
+        index = self._channel_index[self._channel_index < values.size]
+        sample = float(np.sum(values[index])) if index.size else 0.0
+        if self.is_walking:
+            n = max(1, int(round(2.0 * self.step_period / self.dt)))
+            self._cost_mean = float(self._push_walk(self._cost_walk, sample, n))
+        else:
+            self._cost_walk.clear()
+            self._cost_stand.append(sample)
+            self._cost_mean = float(np.mean(self._cost_stand))
+        result = super().update(
+            delta_tau,
+            cost,
+            printout=False,
+            xyz=xyz,
+            motor=motor,
+            slip=slip,
+            gear_error=gear_error,
+        )
+        self.cost_signal = self._cost_mean if self.ready else 0.0
+        if printout:
+            self._write(self.avg_cost, self.joint_bias, float(np.sum(np.abs(self.joint_bias))))
+        return result
+
+    def _out_of_bounds(self, total_bias: float, motor_nm: float, slip_m: float) -> bool:
+        return self._cost_mean > self.trigger_threshold
+
+    @property
+    def trigger_value(self) -> float | None:
+        return self.cost_signal
+
+    @property
+    def trigger_threshold(self) -> float:
+        return self.cost_walk_threshold if self.is_walking else self.cost_stand_threshold
 

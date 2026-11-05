@@ -20,3 +20,8 @@ dependencies:
       # the repo runs without an API key.
       - openai>=1.30
       - python-dotenv>=1.0
+      # Claude as the orchestrator (orchestrator.model: claude-*).
+      - anthropic>=0.40
+      # Token counts for the raw-telemetry ablation's budget. Without it the
+      # count falls back to characters / 4.
+      - tiktoken>=0.7

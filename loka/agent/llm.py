@@ -53,11 +53,17 @@ def load_stand_system_prompt(
     objective: str | None = None,
     vision: str | None = None,
     style: str = "full",
+    ablations=None,
+    fills: dict[str, str] | None = None,
 ) -> str:
     """``vision`` is the EGOCENTRIC CAMERA block; None leaves the prompt text-only.
 
-    ``style`` ``compact`` uses ``system_prompt_compact.txt``.
+    ``style`` ``compact`` uses ``system_prompt_compact.txt``. ``ablations``
+    (an :class:`loka.agent.ablations.AblationSet`) applies the anchored edits
+    in ``loka/agent/prompts/ablations``; ``fills`` gives their placeholders.
     """
+    from loka.agent.prompt_ablations import apply_prompt_ablations
+
     if style not in PROMPT_STYLES:
         raise ValueError(f"prompt style must be one of {PROMPT_STYLES}, got {style!r}")
     path = _COMPACT_PROMPT_PATH if style == "compact" else _PROMPT_PATH
@@ -66,6 +72,7 @@ def load_stand_system_prompt(
         "The robot is a Unitree G1 controlled by a centroidal convex MPC and a whole-body QP."
     )
     system_prompt = system_prompt.replace("{{PLANT}}", plant)
+    system_prompt = apply_prompt_ablations(system_prompt, style, ablations, fills)
     if vision:
         line = _COMPACT_VISION_LINE if style == "compact" else _VISION_LINE
         system_prompt = system_prompt.replace("{{VISION}}", line)
@@ -104,11 +111,20 @@ def _attach_camera_frame(api_messages, vision: dict) -> dict:
     return {"image_bytes": len(png), "frame_path": frame_path, "_png": png}
 
 
-def _complete(messages, model=None, *, prefill: str | None = None, max_tokens: int | None = None) -> str:
-    """One chat completion from the local backend, or OpenAI when none is set.
+def _complete(
+    messages,
+    model=None,
+    *,
+    prefill: str | None = None,
+    max_tokens: int | None = None,
+    provider=None,
+    usage: dict | None = None,
+) -> str:
+    """One chat completion: the in-process backend, else ``provider``, else OpenAI.
 
-    ``prefill`` starts the local model's reply (OpenAI has no prefill and ignores
-    it); None keeps the backend's default.
+    ``prefill`` starts the reply (OpenAI has no prefill and ignores it); None
+    keeps the backend's or provider's default. ``usage`` accumulates the
+    provider's token counts.
     """
     if _chat_backend is not None:
         kwargs = {}
@@ -117,6 +133,12 @@ def _complete(messages, model=None, *, prefill: str | None = None, max_tokens: i
         if max_tokens is not None:
             kwargs["max_new_tokens"] = max_tokens
         return _chat_backend.chat(messages, **kwargs)
+    if provider is not None:
+        from loka.agent.providers import add_usage
+
+        text, part = provider.complete(messages, prefill=prefill, max_tokens=max_tokens)
+        add_usage(usage, part)
+        return text
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set")
     chosen = model or os.environ.get("LOKA_STAND_MODEL", "gpt-6-luna")
@@ -125,10 +147,22 @@ def _complete(messages, model=None, *, prefill: str | None = None, max_tokens: i
         messages=messages,
         # temperature=0.1,
     )
+    if usage is not None and getattr(response, "usage", None) is not None:
+        from loka.agent.providers import add_usage
+
+        add_usage(
+            usage,
+            {
+                "input_tokens": int(response.usage.prompt_tokens or 0),
+                "output_tokens": int(response.usage.completion_tokens or 0),
+            },
+        )
     return response.choices[0].message.content or ""
 
 
-def _describe_scene(png: bytes, describe: dict, model=None, detail: str = "high") -> str:
+def _describe_scene(
+    png: bytes, describe: dict, model=None, detail: str = "high", *, provider=None, usage=None
+) -> str:
     """The description call: the frame alone, then the description prompt."""
     import base64
 
@@ -142,11 +176,20 @@ def _describe_scene(png: bytes, describe: dict, model=None, detail: str = "high"
             ],
         }
     ]
-    text = _complete(messages, model, prefill=DESCRIBE_PREFILL, max_tokens=DESCRIBE_MAX_TOKENS)
+    text = _complete(
+        messages,
+        model,
+        prefill=DESCRIBE_PREFILL,
+        max_tokens=DESCRIBE_MAX_TOKENS,
+        provider=provider,
+        usage=usage,
+    )
     return text.strip()
 
 
-def stand_llm_worker(api_messages, result_queue, model=None, vision=None, guard=None) -> None:
+def stand_llm_worker(
+    api_messages, result_queue, model=None, vision=None, guard=None, provider=None
+) -> None:
     """Background thread: never call from the control loop.
 
     ``model`` overrides the ``LOKA_STAND_MODEL`` environment variable. When
@@ -162,24 +205,39 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None, guard=
     ``check`` a reply that copies the template or does not move the robot
     (:func:`loka.agent.reply_guard.check_reply`, given ``pelvis_xy`` and
     ``goal_tolerance``) is asked again once with the reasons.
+
+    ``provider`` (a :class:`loka.agent.providers.ChatProvider`) takes the
+    turn when no backend is set. The result carries ``usage``, the token
+    counts summed over every call of the turn.
     """
     from loka.agent.session import append_text
 
     guard = guard or {}
-    image = {}
+    usage: dict = {}
+    image = {"usage": usage}
+    if provider is not None:
+        # Filled in after the calls: a rejected temperature changes it mid-turn.
+        image["decoding"] = None
     try:
         if vision is not None:
-            image = _attach_camera_frame(api_messages, vision)
+            image.update(_attach_camera_frame(api_messages, vision))
             png = image.pop("_png", None)
             describe = vision.get("describe")
             if describe and png is not None:
-                description = _describe_scene(png, describe, model, vision.get("detail", "high"))
+                description = _describe_scene(
+                    png,
+                    describe,
+                    model,
+                    vision.get("detail", "high"),
+                    provider=provider,
+                    usage=usage,
+                )
                 print(f"\n[LLM] scene description:\n{description}")
                 append_text(api_messages, format_scene_section(description))
                 image["scene_description"] = description
         if guard.get("reminder"):
             append_text(api_messages, guard["reminder"])
-        yaml_text = _complete(api_messages, model)
+        yaml_text = _complete(api_messages, model, provider=provider, usage=usage)
         parsed = _try_parse(yaml_text)
         if guard.get("check"):
             problems = check_reply(
@@ -194,7 +252,7 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None, guard=
                     {"role": "assistant", "content": yaml_text},
                     {"role": "user", "content": feedback_message(problems)},
                 ]
-                retry_text = _complete(retry_messages, model)
+                retry_text = _complete(retry_messages, model, provider=provider, usage=usage)
                 retry_parsed = _try_parse(retry_text)
                 retry_problems = check_reply(
                     retry_text,
@@ -215,6 +273,8 @@ def stand_llm_worker(api_messages, result_queue, model=None, vision=None, guard=
         print(f"\n[LLM Worker Error] {exc}")
         result_queue.put(None)
         return
+    if provider is not None:
+        image["decoding"] = provider.decoding()
     if parsed is None:
         try:
             parse_orchestrator_reply(yaml_text)

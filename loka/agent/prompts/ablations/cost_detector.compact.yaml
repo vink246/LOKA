@@ -1,0 +1,34 @@
+# cost_detector ablation, compact prompt (system_prompt_compact.txt).
+
+- find: |-
+    2. Faults: only when |bias|, |motor|, or stance slip is over its threshold.
+  replace: |-
+    2. Faults: only when the tracking cost (the MPC state residual) is over its threshold.
+
+- when: [hide_residual]
+  find: |-
+    Roll residual -> com y, pitch residual -> com x, height -> com z, symmetric bias -> mass first, one large motor value -> gear on that actuator, slip with a quiet motor -> friction on floor.
+  replace: |-
+    Roll cost -> com y, pitch cost -> com x, a low pelvis -> mass first, then com z, a sag toward one leg -> gear on that leg's knee or hip, feet sliding -> friction on floor. The runtime measures the residual each search needs; you do not see it.
+
+- find: |-
+    With every residual under its threshold, do not send Belief_Searches at all.
+  replace: |-
+    With the tracking cost under its threshold, do not send Belief_Searches at all.
+
+- find: |-
+    bias_under_threshold. Every listener needs a message.
+  replace: |-
+    bias_under_threshold (fires when the tracking cost is back under its threshold). Every listener needs a message.
+
+- when: [hide_residual]
+  find: |-
+    the effort residual (|bias| with its threshold and the largest actuators).
+  replace: |-
+    the tracking cost (with its threshold) and the STATE COST per channel.
+
+- unless: [hide_residual]
+  find: |-
+    the effort residual (|bias| with its threshold and the largest actuators).
+  replace: |-
+    the effort residual (|bias| with its threshold and the largest actuators, for diagnosis only) and the tracking cost with its threshold.
