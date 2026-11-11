@@ -61,6 +61,7 @@ from loka.control.robot import (
     quat_to_rpy,
 )
 from loka.control.wbc import WBCConfig, WholeBodyController, WBCTargets
+from loka.control.contact_estimate import FootLoadEstimator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = REPO_ROOT / "models" / "g1" / "scene.xml"
@@ -274,6 +275,9 @@ class LocomotionController:
             num_contacts=self.robot.num_contacts,
             torque_limit=self.robot.torque_limit,
         )
+        self._load_estimator = FootLoadEstimator(self.robot)
+        #: World force on each foot, from joint torques (see contact_estimate).
+        self.foot_load = np.zeros((2, 3))
 
         self._calibrate_nominal_pose()
         self.reset()
@@ -369,6 +373,28 @@ class LocomotionController:
             for leg in (0, 1)
         ])
 
+    def planted_mask(self) -> np.ndarray:
+        """Sole points on the ground at the belief's current kinematics.
+
+        Same rule as the controller's own contact set, without updating any
+        estimate.
+        """
+        heights = self.robot.data.site_xpos[self.robot.contact_site_ids][:, 2]
+        return heights < self._ground_height + CONTACT_HEIGHT_TOLERANCE
+
+    @property
+    def load_estimator(self) -> FootLoadEstimator:
+        """Leg-torque contact estimate from the last :meth:`sense_proprioception`."""
+        return self._load_estimator
+
+    def sense_proprioception(self, qpos, qvel, qacc, joint_torque) -> None:
+        """Encoder state, its derivative and motor torque after a plant step.
+
+        Feeds the foot-load estimate. Nothing here is a contact or force
+        reading from the simulator.
+        """
+        self.foot_load = self._load_estimator.update(qpos, qvel, qacc, joint_torque)
+
     def _leg_states(self, contact_mask: np.ndarray) -> np.ndarray:
         """Index into the gain tables: 0 where planted, 1 where airborne.
 
@@ -395,6 +421,7 @@ class LocomotionController:
             policy=self._foothold_policy,
             stack_name=getattr(self.config, "stack", "legacy_dcm"),
         )
+        self.foot_load = np.zeros((2, 3))
         self._last_gait = None
         self._last_joint_weights = np.zeros(self.robot.nu)
         self._last_swing_orient_active = False

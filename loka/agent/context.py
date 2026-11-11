@@ -186,9 +186,9 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "- The frame was taken when the message was sent; the robot keeps moving during your "
         "reply, so allow for the distance covered at the current speed.",
         "- Do not plan to step onto any object: the footstep planner assumes flat ground.",
-        "- An OBJECT CONTACT section in the telemetry means the robot is touching an object. The "
-        "contact force raises |bias|; that is an external load, not a model error. Back off "
-        "or steer around before queueing any belief search.",
+        "- The robot has no touch sensing. Pressing on an object also raises |bias|; that is an "
+        "external load, not a model error. If |bias| rises while the frame shows the robot "
+        "against an object, back off or steer around before queueing any belief search.",
         "- Objects beyond about 6 m are a few pixels wide. Do not infer free space far away "
         "from an empty-looking image.",
     ]

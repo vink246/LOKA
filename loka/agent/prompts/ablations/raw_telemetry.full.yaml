@@ -51,11 +51,6 @@
     - STATE COST (c_<channel> columns), the MPC residual per component per tick. The TRACKING COST, the anomaly signal, is the sum of their window means; it and its threshold are not shown.
 
 - find: |-
-    - OBJECT CONTACT, only when the robot touched an object in the window: a number for each object touched, the peak contact force, and the robot links in contact.
-  replace: |-
-    - OBJECT CONTACT (prop_n column): the total contact force from objects the robot touches, per tick.
-
-- find: |-
     Along heading positive means motion the way the heading points. Closing speed positive means motion toward the goal. Planar speed has no sign.
   replace: |-
     The table has no derived speeds: motion toward the goal is the pelvis velocity (vx, vy) projected on the direction from the pelvis (x, y) to the goal, and the heading is yaw.

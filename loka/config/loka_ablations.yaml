@@ -40,11 +40,10 @@ ablations:
     #   motor_dev   per-actuator commanded minus applied torque of that tick [Nm]
     #   slip        fastest planted sole speed of that tick [m/s]
     #   mpc_cost    MPC weighted residual per state channel of that tick
-    #   contact_fz  normal force at the 8 sole contact points [N]
-    #   prop_force  total contact force from objects [N]
-    channels: [base, command, effort_dev, motor_dev, slip, mpc_cost, contact_fz, prop_force]
+    #   contact_fz  planned normal force at the 8 sole contact points [N]
+    channels: [base, command, effort_dev, motor_dev, slip, mpc_cost, contact_fz]
     # Removed first, in this order, when min_samples rows do not fit.
-    drop_order: [contact_fz, prop_force, motor_dev, mpc_cost, command]
+    drop_order: [contact_fz, motor_dev, mpc_cost, command]
 
   # The anomaly detector trips on the MPC tracking cost only. The effort
   # residual, motor deficit and stance slip no longer open a failure episode,

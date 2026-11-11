@@ -205,10 +205,6 @@ class PropLayout:
     robot_nv: int = 0
     robot_root: int = -1
 
-    @property
-    def prop_body_ids(self) -> dict[int, PropSlot]:
-        return {slot.body_id: slot for slot in self.slots}
-
     def by_name(self, name: str) -> PropSlot | None:
         for slot in self.slots:
             if slot.name == name:
@@ -318,36 +314,6 @@ def apply_snapshot(model, data, snapshot: dict) -> None:
         model.body_quat[int(body_id)] = quat
     data.time = float(snapshot.get("time", 0.0))
     mujoco.mj_forward(model, data)
-
-
-def prop_contacts(model, data, layout: PropLayout | None) -> list[dict]:
-    """Robot-to-prop contacts this step: prop, summed normal force, robot links."""
-    if layout is None or not layout.slots:
-        return []
-    props = layout.prop_body_ids
-    touching: dict[str, dict] = {}
-    force = np.zeros(6)
-    for i in range(data.ncon):
-        con = data.contact[i]
-        b1 = int(model.geom_bodyid[con.geom1])
-        b2 = int(model.geom_bodyid[con.geom2])
-        if b1 in props and int(model.body_rootid[b2]) == layout.robot_root:
-            slot, link = props[b1], b2
-        elif b2 in props and int(model.body_rootid[b1]) == layout.robot_root:
-            slot, link = props[b2], b1
-        else:
-            continue
-        mujoco.mj_contactForce(model, data, i, force)
-        entry = touching.setdefault(
-            slot.name, {"prop": slot.name, "kind": slot.kind, "force_n": 0.0, "links": set()}
-        )
-        entry["force_n"] += abs(float(force[0]))
-        entry["links"].add(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, link) or str(link))
-    out = []
-    for entry in touching.values():
-        entry["links"] = sorted(entry["links"])
-        out.append(entry)
-    return sorted(out, key=lambda e: -e["force_n"])
 
 
 # -- runtime prop placement ---------------------------------------------------

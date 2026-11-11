@@ -20,8 +20,10 @@ RAW_CHANNEL_GROUPS = (
     "slip",
     "mpc_cost",
     "contact_fz",
-    "prop_force",
 )
+#: Channels earlier runs recorded in their resolved configs. They carried
+#: simulator contact forces a real G1 cannot sense, and are dropped on load.
+RETIRED_CHANNEL_GROUPS = ("prop_force",)
 #: Channels that carry the effort residual, motor deficit or slip.
 RESIDUAL_CHANNEL_GROUPS = ("effort_dev", "motor_dev", "slip")
 COST_CHANNEL_NAMES = ("roll", "pitch", "yaw", "x", "y", "z", "wx", "wy", "wz", "vx", "vy", "vz")
@@ -37,7 +39,7 @@ class RawTelemetrySpec:
     min_samples: int = 4
     precision: int = 3
     channels: tuple[str, ...] = RAW_CHANNEL_GROUPS
-    drop_order: tuple[str, ...] = ("contact_fz", "prop_force", "motor_dev", "mpc_cost", "command")
+    drop_order: tuple[str, ...] = ("contact_fz", "motor_dev", "mpc_cost", "command")
 
     @classmethod
     def from_dict(cls, raw: dict | None) -> "RawTelemetrySpec":
@@ -45,8 +47,12 @@ class RawTelemetrySpec:
         unknown = set(data) - set(cls.__dataclass_fields__)
         if unknown:
             raise ValueError(f"raw_telemetry has unknown keys {sorted(unknown)}")
-        channels = tuple(str(c) for c in data.get("channels", RAW_CHANNEL_GROUPS))
-        drop = tuple(str(c) for c in data.get("drop_order", cls.drop_order))
+        channels = tuple(
+            str(c) for c in data.get("channels", RAW_CHANNEL_GROUPS) if str(c) not in RETIRED_CHANNEL_GROUPS
+        )
+        drop = tuple(
+            str(c) for c in data.get("drop_order", cls.drop_order) if str(c) not in RETIRED_CHANNEL_GROUPS
+        )
         for name in (*channels, *drop):
             if name not in RAW_CHANNEL_GROUPS:
                 raise ValueError(

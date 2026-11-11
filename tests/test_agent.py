@@ -116,6 +116,66 @@ def test_mass_fault_injection_changes_plant_not_belief():
     clear_plant_faults(sim.model, [backup])
 
 
+def test_leg_torque_contact_force_matches_the_solver_while_standing():
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, enable_session_log=False))
+    for _ in range(300):
+        runtime.step()
+    weight = runtime.controller.robot.total_mass * 9.81
+    estimate = runtime.controller.load_estimator.contact_force
+    # The free joint has no limit or friction-loss rows, so its constraint
+    # force is the foot contacts alone.
+    solver = sim.data.qfrc_constraint[:6]
+    assert estimate[:3] == pytest.approx(solver[:3], abs=0.02 * weight)
+    assert estimate[3:6] == pytest.approx(solver[3:6], abs=2.0)
+
+
+def test_effort_bias_from_leg_torques_separates_a_torso_payload():
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, enable_session_log=False))
+    threshold = runtime.effort_observer.stand_threshold_nm
+    for _ in range(400):
+        runtime.step()
+    assert runtime._bias_nm() < 0.5 * threshold
+    runtime.inject_fault_now(FaultSpec("mass", 0.0, {"delta_kg": 10.0, "body": "torso_link"}))
+    for _ in range(400):
+        runtime.step()
+    assert not sim.fell
+    assert runtime._bias_nm() > 2.0 * threshold
+
+
+def test_runtime_reads_no_simulator_contact_force(monkeypatch):
+    import mujoco
+
+    step = mujoco.mj_step
+
+    def poisoned(model, data, *args, **kwargs):
+        step(model, data, *args, **kwargs)
+        data.qfrc_constraint[:] = np.nan
+        data.efc_force[:] = np.nan
+
+    monkeypatch.setattr(mujoco, "mj_step", poisoned)
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, enable_session_log=False))
+    for _ in range(300):
+        runtime.step()
+    assert not sim.fell
+    bias = runtime._bias_nm()
+    assert bias is not None and np.isfinite(bias)
+    assert np.all(np.isfinite(runtime.controller.load_estimator.contact_force))
+
+
+def test_telemetry_frames_carry_no_contact_readings():
+    sim = Simulation()
+    runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, enable_session_log=False))
+    for _ in range(20):
+        runtime.step()
+    frame = runtime.recent_frames[-1]
+    assert "prop_contacts" not in frame and "terrain_contacts" not in frame
+    text = synthesize_stand_telemetry(runtime.recent_frames, control_dt=sim.config.control_dt)
+    assert "OBJECT CONTACT" not in text
+
+
 def test_runtime_survives_scripted_lean_without_llm():
     sim = Simulation()
     runtime = LokaRuntime(sim, LokaConfig(enable_llm=False))

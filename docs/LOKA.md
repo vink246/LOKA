@@ -366,13 +366,19 @@ The detector tracks three signals: the effort bias, the motor deficit and the st
 
 At every control tick, after the plant has stepped, the *measured generalised force* is
 $$
-\tilde\tau = S^\top \tau_{m} + J_c^\top f_{m} + \tau_{ext},
+\tilde\tau = S^\top \tau_{m} + \hat\tau_{p} + \sum_{\ell \in \{L, R\}} J_{F,\ell}^\top \hat w_\ell + \tau_{ext},
 $$
-where $\tau_m$ is the torque the actuators actually applied, $f_m$ the measured contact forces and $\tau_{ext}$ any externally applied generalised force known to the runtime. The belief model's inverse dynamics at the measured position, velocity and acceleration is computed with the recursive Newton–Euler algorithm [61],
+where $\tau_m$ is the torque the actuators actually applied (motor current), $\hat\tau_p$ the belief's passive joint force (damping), $\hat w_\ell \in \mathbb{R}^6$ the force and moment the ground exerts on foot $\ell$, $J_{F,\ell}$ the spatial Jacobian of that foot's centre, and $\tau_{ext}$ any externally applied generalised force known to the runtime. The belief model's inverse dynamics at the measured position, velocity and acceleration is computed with the recursive Newton–Euler algorithm [61],
 $$
 \hat\tau = \hat M(q)\,\ddot q + \hat h(q, \dot q).
 $$
-Their difference $\Delta = \tilde\tau - \hat\tau \in \mathbb{R}^{35}$ is zero when the belief explains the motion. It has a floating-base part $\Delta_b \in \mathbb{R}^6$ and an actuated part $\Delta_a \in \mathbb{R}^{29}$.
+No foot force sensing is assumed; a factory G1 has none. The foot wrenches are read from the legs instead. The rows of the equation of motion that belong to leg $\ell$'s six joints involve only that foot's contact, and six joints resolve a six-axis wrench, so
+$$
+J_{F,\ell,a}^\top\, \hat w_\ell = \big(\hat\tau - S^\top\tau_m - \hat\tau_p\big)_{\ell},
+$$
+where $J_{F,\ell,a} \in \mathbb{R}^{6\times 6}$ is the block of $J_{F,\ell}$ on that leg's joints, solved by least squares. Because each leg measures its own foot, the load split between two planted feet, including any force the feet exert against each other, is measured rather than assumed. Inferring the contact forces from the six floating-base equations alone cannot do this: in double support it leaves that internal force undetermined, and in simulation it raised the healthy residual to about 24 Nm while walking.
+
+Their difference $\Delta = \tilde\tau - \hat\tau \in \mathbb{R}^{35}$ is zero when the belief explains the motion. It has a floating-base part $\Delta_b \in \mathbb{R}^6$ and an actuated part $\Delta_a \in \mathbb{R}^{29}$. The leg rows of $\Delta_a$ are zero by construction, since they define $\hat w_\ell$; a model error appears on the floating base and on the waist and arm joints.
 
 A torso payload or a centre-of-mass error acts mainly on the floating base, which has no actuator; a residual expressed only on joints would therefore miss most of it. LOKA resolves the base part through the contacts: it finds the minimum-norm set of contact forces that would account for the base residual,
 $$
@@ -413,7 +419,7 @@ where $\mathcal{P}$ is the set of sole points within 5 mm of the estimated groun
 $$
 \beta > \beta_{th} \quad\lor\quad \|\bar d\|_1 > d_{th} \quad\lor\quad \bar\sigma > \sigma_{th},
 $$
-with $\beta_{th} = 5$ Nm (standing and walking), $d_{th} = 0.75$ Nm and $\sigma_{th} = 0.15$ m/s in the default configuration. These sit just above the noise floor of the healthy plant; for reference, a knee motor at 75 % strength produces a motor deficit of about 4 Nm while standing, and a 10 kg torso payload produced an effort bias of 7.4 Nm in the run of Section 6.4. A failure episode opens after 250 consecutive out-of-bounds ticks (0.5 s), and closes only after the signals have been back in bounds for more than 0.5 s and no belief search is running.
+with $\beta_{th} = 6$ Nm (standing and walking), $d_{th} = 0.75$ Nm and $\sigma_{th} = 0.15$ m/s in the default configuration. The healthy effort bias, which includes joint friction the belief does not model, stays at or below 2.7 Nm standing and 2.4 Nm walking, and a corrected belief settles near 3 Nm. A 120 N, 50 ms lateral shove peaks at 5.1 Nm in the window average, so it does not open a fault; a 10 kg torso payload holds about 16 Nm while walking and 24 Nm while standing. For reference, a knee motor at 75 % strength produces a motor deficit of about 4 Nm while standing. A failure episode opens after 250 consecutive out-of-bounds ticks (0.5 s), and closes only after the signals have been back in bounds for more than 0.5 s and no belief search is running.
 
 **Immediate reflexes.** Two actions are taken by the runtime itself, without waiting for the language model:
 
@@ -422,7 +428,7 @@ with $\beta_{th} = 5$ Nm (standing and walking), $d_{th} = 0.75$ Nm and $\sigma_
 
 ### 5.6 Auxiliary friction estimate
 
-Friction does not appear in the effort residual. It is identified from the contact forces themselves: a planted point that slides sits on the boundary of its friction cone, so the ratio of tangential to normal force there reads the friction coefficient. The runtime keeps a 2 s window of this ratio over sole contacts that are planted, sliding faster than 0.05 m/s and loaded with more than 20 N, and freezes a copy of the window at the moment a fault trips. A friction search (Section 9) reads the 75th percentile of the frozen window, provided it contains at least 50 samples; the percentile rather than the mean is used because partly stuck contacts read below the cone.
+Friction does not appear in the effort residual. It is identified from the foot forces of Section 5.2: a sole that slides sits on the boundary of its friction cone, so the ratio of tangential to normal force on that foot reads the friction coefficient. The runtime keeps a 2 s window of this ratio over feet that are planted, have a sole point sliding faster than 0.05 m/s, and carry more than 20 N, and freezes a copy of the window at the moment a fault trips. A friction search (Section 9) reads the 75th percentile of the frozen window, provided it contains at least 50 samples; the percentile rather than the mean is used because a partly stuck sole reads below the cone.
 
 ### 5.7 Computation in simulation and on hardware
 
@@ -433,11 +439,11 @@ All three signals use only quantities that a torque-controlled humanoid can meas
 | Joint position and velocity; floating-base pose and twist | Ground-truth plant state | Joint encoders, plus a floating-base estimator fusing leg kinematics and the inertial measurement unit [62], [63] |
 | Generalised acceleration | The plant's acceleration at the step just taken | Numerical differentiation with low-pass filtering; alternatively, a generalised-momentum observer formulation removes the need for acceleration altogether [58], [59] |
 | Applied actuator torque | The simulator's actuator generalised force (the stand-in for current-derived torque) | Motor current times torque constant times gear ratio, as reported by the motor drivers |
-| Contact forces | The simulator's constraint generalised force (contact solver output) | Foot force/torque or pressure sensors. Where these are unavailable and contact forces are inferred from the belief model's own base dynamics, the floating-base residual vanishes by construction and the effort deviation reduces to the joint-space residual, which still responds to mass error but loses the independent check through the base |
-| Planted set | Belief kinematics at the measured state: sole point within 5 mm of the estimated floor | Contact estimation from foot sensors or probabilistic fusion of kinematics and dynamics [10], [64] |
+| Contact forces | Each foot's six-axis wrench from its leg's joint torques and the belief inverse dynamics (Section 5.2); the simulator's contact and constraint forces are never read | Same, from the motor-current joint torques; no foot sensing is needed. Accuracy follows the joint-torque estimate, particularly at the ankles, and degrades as a knee approaches full extension, where the leg Jacobian loses rank |
+| Planted set | Belief kinematics at the measured state: sole point within 5 mm of the estimated floor | Same, optionally confirmed by the joint-torque foot load, or by probabilistic fusion of kinematics and dynamics [10], [64] |
 | Slip velocity | Contact Jacobian of the belief model times measured velocity | Same, with the estimated base velocity; this is the slip signal used for slippery-ground locomotion on quadrupeds [11], [65] |
 | Commanded torque | Output of the WBC after belief scaling | Same |
-| Friction ratio | Contact solver forces at sliding sole contacts | Three-axis foot force sensing at sliding contacts |
+| Friction ratio | Tangential over normal component of the joint-torque foot force on a sliding foot | Same |
 
 The detector requires no learned component and no training data. Its thresholds are the only tuned quantities; they sit just above the noise floor of the healthy plant.
 
@@ -463,7 +469,7 @@ The report consists of the following sections. Sections without content are omit
 
 **Effort deviation.** The effort bias $\beta$, the current mode (standing or walking) and its threshold, and the current out-of-bounds streak against the streak length. Then all 29 per-actuator values of $\bar e$ by decreasing magnitude, with their signs. Then the motor deficit with its threshold and up to four actuators whose individual deficit exceeds 0.2 Nm. Then the stance slip with its threshold.
 
-**Prop contact (only if the robot touched an object in the window).** For each object: its kind, the peak normal force, the fraction of the window spent in contact, whether contact is ongoing, and the robot links involved. The section states explicitly that this force enters the effort residual as an external load and is not a model error, so that a collision with furniture is not misdiagnosed as a payload.
+The report carries no contact readings. A factory G1 has no touch or force sensing on its links, so contact with objects or terrain is neither reported nor computed from the simulator. Pressing on an object shows up only as it would on the robot, as an external load in the effort residual; in VLM mode the system prompt tells the model to check the frame for an object against the robot before attributing a rise in $\beta$ to the model.
 
 **State cost.** The MPC's weighted residual per state channel (roll, pitch, yaw, three CoM coordinates, three angular and three linear velocities), averaged over the detector's window. This tells the model which part of the centroidal state the controller is failing to track.
 

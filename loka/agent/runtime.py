@@ -12,7 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
-from loka.control.locomotion import CONTACT_HEIGHT_TOLERANCE, LocomotionController
+from loka.control.contact_estimate import rigid_body_inverse
+from loka.control.locomotion import LocomotionController
 from loka.agent.model_state import (
     actuator_torque_scale,
     apply_loka_mutations,
@@ -42,7 +43,6 @@ from loka.agent.faults import FaultSpec, capture_nominal_params
 from loka.agent.interactive import FaultVizState, commit_fault, restore_faults
 from loka.agent.llm import PROMPT_STYLES, load_stand_system_prompt, stand_llm_worker
 from loka.agent.session_log import StandSessionLog, default_log_path
-from loka.scene_props import prop_contacts
 from loka.vision import EgoCameraSpec, EgoRenderer, camera_pose
 import mujoco
 
@@ -357,7 +357,6 @@ class LokaRuntime:
             "trigger_value": self.effort_observer.trigger_value,
             "trigger_threshold": self.effort_observer.trigger_threshold,
             "belief_search_busy": self.belief_search.busy,
-            "prop_contacts": prop_contacts(self.sim.model, self.sim.data, self.sim.prop_layout),
             **self._detector_sample,
         }
 
@@ -458,25 +457,23 @@ class LokaRuntime:
                 legs[g] = 1
         return legs
 
-    def _sample_friction_ratio(self, tang: np.ndarray, planted: np.ndarray) -> None:
-        sim = self.sim
-        now = float(sim.data.time)
+    def _sample_friction_ratio(self, tang: np.ndarray, planted: np.ndarray, foot_forces: np.ndarray) -> None:
+        """Tangential over normal force of each sliding planted foot.
+
+        ``foot_forces`` is the world force on each foot from its leg's joint
+        torques. A sole sliding as a whole sits on its friction cone, so the
+        ratio of the net foot force reads mu without foot force sensing.
+        """
+        now = float(self.sim.data.time)
         per_foot = len(tang) // 2
-        sliding = [
-            bool(np.any(planted[leg * per_foot:(leg + 1) * per_foot]))
-            and float(tang[leg * per_foot:(leg + 1) * per_foot][planted[leg * per_foot:(leg + 1) * per_foot]].max()) > MU_SLIDE_MPS
-            for leg in (0, 1)
-        ]
-        if any(sliding):
-            force = np.zeros(6)
-            for i in range(sim.data.ncon):
-                con = sim.data.contact[i]
-                leg = self._foot_geom_leg.get(int(con.geom1), self._foot_geom_leg.get(int(con.geom2)))
-                if leg is None or not sliding[leg]:
-                    continue
-                mujoco.mj_contactForce(sim.model, sim.data, i, force)
-                if force[0] > MU_MIN_NORMAL_N:
-                    self._mu_samples.append((now, float(np.hypot(force[1], force[2]) / force[0])))
+        for leg in (0, 1):
+            rows = slice(leg * per_foot, (leg + 1) * per_foot)
+            down = planted[rows]
+            if not np.any(down) or float(tang[rows][down].max()) <= MU_SLIDE_MPS:
+                continue
+            fx, fy, fz = (float(v) for v in foot_forces[leg])
+            if fz > MU_MIN_NORMAL_N:
+                self._mu_samples.append((now, float(np.hypot(fx, fy) / fz)))
         while self._mu_samples and self._mu_samples[0][0] < now - MU_WINDOW_S:
             self._mu_samples.popleft()
 
@@ -536,12 +533,7 @@ class LokaRuntime:
         ablations = self.config.ablations
         if ablations.hide_residual:
             self.vision_block = self.vision_block.replace(
-                "contact force raises |bias|", "contact force raises the tracking cost"
-            )
-        if ablations.raw_telemetry is not None:
-            self.vision_block = self.vision_block.replace(
-                "An OBJECT CONTACT section in the telemetry means",
-                "A nonzero prop_n column in RAW TELEMETRY means",
+                "also raises |bias|", "also raises the tracking cost"
             )
         self.ego_renderer = EgoRenderer(self.sim.recipe)
         if self.log is not None and spec.save_frames:
@@ -917,11 +909,14 @@ class LokaRuntime:
             mujoco.mj_step(sim.model, sim.data)
 
         sim.data.xfrc_applied[sim.pelvis_id, :3] = 0.0
+        sim.sense_feet()
 
         # Post-step qpos is ahead of xpos. The mass residual is the measured
         # generalized force minus the belief model's inverse dynamics at that
-        # state. Actuator torque stands in for current, and the contact
-        # constraint force for foot sensors. The plant's inertias are not read.
+        # state. Actuator torque stands in for motor current. The contact force
+        # is what each leg's joint torques imply (contact_estimate); no contact
+        # or constraint force from the simulator is read, and neither are the
+        # plant's inertias.
         mujoco.mj_kinematics(sim.model, sim.data)
         mujoco.mj_comPos(sim.model, sim.data)
         robot = self.controller.robot
@@ -930,11 +925,12 @@ class LokaRuntime:
         contact_jac = robot.contact_jacobian()
         belief = robot.data
         belief.qacc[:] = sim.data.qacc[:nv]
-        belief_inverse = np.empty(robot.model.nv)
-        mujoco.mj_rne(robot.model, belief, 1, belief_inverse)
+        belief_inverse = rigid_body_inverse(robot.model, belief)
+        load = self.controller.load_estimator
         measured = (
             sim.data.qfrc_actuator[:nv]
-            + sim.data.qfrc_constraint[:nv]
+            + load.passive
+            + load.contact_force
             + sim.data.qfrc_applied[:nv]
         )
         deviation = belief_actuator_deviation(
@@ -947,14 +943,13 @@ class LokaRuntime:
             sim.data.ctrl,
             sim.data.qfrc_actuator[:nv],
         )
-        heights = robot.data.site_xpos[robot.contact_site_ids][:, 2]
-        planted = heights < self.controller._ground_height + CONTACT_HEIGHT_TOLERANCE
+        planted = self.controller.planted_mask()
         tang = np.linalg.norm(
             (contact_jac @ sim.robot_qvel).reshape(-1, 3)[:, :2],
             axis=1,
         )
         slip = float(tang[planted].max()) if np.any(planted) else 0.0
-        self._sample_friction_ratio(tang, planted)
+        self._sample_friction_ratio(tang, planted, load.forces)
         tel = self.controller.telemetry
         self.effort_observer.is_walking = bool(tel is not None and tel.walking)
         self.effort_observer.step_period = float(self.controller.gait.config.step_period)

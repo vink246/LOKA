@@ -135,7 +135,8 @@ def format_full_state_section(frames: Sequence[dict]) -> str:
 
 _EFFORT_NOTE = (
     "Measured force minus the belief model's inverse dynamics, resolved into actuators through the foot contacts. "
-    "Measured force is actuator torque (current) plus contact force (foot sensors). "
+    "Measured force is actuator torque (current) plus the ground force on each foot as read from that leg's "
+    "joint torques; there are no foot force sensors. "
     "Zero means the believed dynamics explain the motion. "
     "A persistent positive value means the plant outweighs the belief along that joint (mass or COM too low). "
     "A persistent negative value means the belief overshoots the plant. "
@@ -215,41 +216,6 @@ def format_cost_section(observer) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_prop_contact_section(frames: Sequence[dict]) -> str:
-    """Robot-to-prop contact over the window. Empty when nothing was touched.
-
-    Objects are numbered, not named: what the robot bumped into is for the
-    orchestrator to find in the image, as a robot only feels the force.
-    """
-    peak: dict[str, dict] = {}
-    touching_steps: dict[str, int] = {}
-    for frame in frames:
-        for entry in frame.get("prop_contacts") or ():
-            name = entry["prop"]
-            touching_steps[name] = touching_steps.get(name, 0) + 1
-            best = peak.get(name)
-            if best is None or entry["force_n"] > best["force_n"]:
-                peak[name] = entry
-    if not peak:
-        return ""
-    latest = {e["prop"] for e in (frames[-1].get("prop_contacts") or ())}
-    lines = [
-        "OBJECT CONTACT",
-        "  The robot touched an object in this window. Contact force enters the effort "
-        "residual as an external load. It is not a model error; do not queue a belief "
-        "search for it.",
-    ]
-    ranked = sorted(peak.items(), key=lambda kv: -kv[1]["force_n"])
-    for index, (name, entry) in enumerate(ranked, start=1):
-        share = touching_steps[name] / max(len(frames), 1)
-        now = "touching now" if name in latest else "released"
-        lines.append(
-            f"  object {index}: peak normal {entry['force_n']:.1f} N, "
-            f"{share:.0%} of the window, {now}; robot links {', '.join(entry['links'])}"
-        )
-    return "\n".join(lines) + "\n"
-
-
 def format_compact_state_section(frames: Sequence[dict]) -> str:
     """Pose, motion, goal progress and gait command in four lines."""
     latest = frames[-1]
@@ -307,8 +273,8 @@ def synthesize_stand_telemetry(
 ) -> str:
     """Current state, per-actuator effort deviation, and per-component state cost.
 
-    ``compact`` keeps the state, the effort summary and any prop contact, and
-    drops the per-actuator list and the state cost. With a tracking-cost
+    ``compact`` keeps the state and the effort summary, and drops the
+    per-actuator list and the state cost. With a tracking-cost
     detector (``observer.kind == "cost"``) the report adds the TRACKING COST
     trigger; ``hide_residual`` then leaves out the effort deviation, motor
     deficit and stance slip.
@@ -332,7 +298,6 @@ def synthesize_stand_telemetry(
             format_compact_state_section(window),
             trigger,
             effort,
-            format_prop_contact_section(window),
             # Without the residual, the per-channel cost is what picks a search.
             format_cost_section(observer) if hide_residual else None,
         ]
@@ -341,7 +306,6 @@ def synthesize_stand_telemetry(
             format_full_state_section(window),
             trigger,
             effort,
-            format_prop_contact_section(window),
             format_cost_section(observer),
         ]
     return "\n".join(section for section in sections if section)

@@ -3,11 +3,18 @@
 
 # |bias| is the sum of absolute per-actuator effort deviations [Nm].
 # Each value is measured force minus the belief inverse dynamics: actuator
-# torque (current) plus contact force (foot sensors) plus a known push,
-# minus M(q)q̈ + h(q, q̇) of the belief model at the measured state. The
-# floating-base wrench is resolved through the foot contacts. The plant
-# inertias are not used. A matched model sits at 0. A +10 kg torso error
-# while walking is about 20 Nm, so the thresholds sit just above the noise floor.
+# torque (motor current) plus the contact force each leg's joint torques
+# imply plus a known push, minus M(q)q̈ + h(q, q̇) of the belief model at the
+# measured state. No foot force sensing is assumed; a factory G1 has none.
+# The floating-base wrench is resolved through the foot contacts. The plant
+# inertias are not used.
+# Healthy noise (joint friction the model cannot see, contact transients) sits
+# at or below 2.7 Nm standing and 2.4 Nm walking, and a corrected belief
+# settles near 3 Nm. A 120 N, 50 ms shove peaks at 5.1 Nm in the window
+# average, and a +10 kg torso error holds about 16 Nm walking and 24 Nm
+# standing. 6 Nm keeps shoves and other short events out while every
+# systematic model error in the eval suite still trips; the 250-step streak
+# below also requires the deviation to persist for 0.5 s.
 # A step is out of bounds when |bias|, the motor deficit, or stance slip
 # is above its threshold.
 # consecutive_steps is how many steps in a row must be out of bounds before
@@ -28,8 +35,8 @@
 # stays under 0.11 m/s; ice does not.
 effort_bias:
   consecutive_steps: 250
-  stand_threshold_nm: 5.0
-  walk_threshold_nm: 5.0
+  stand_threshold_nm: 6.0
+  walk_threshold_nm: 6.0
   motor_threshold_nm: 0.75
   slip_threshold_mps: 0.15
   stand_window_steps: 100

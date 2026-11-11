@@ -122,6 +122,23 @@ class Simulation:
         self.robot_nv = self.prop_layout.robot_nv
         self.props = PropManager(self) if self.prop_layout.slots else None
 
+    def sense_feet(self) -> None:
+        """Hand the controller the proprioceptive reading of the step just taken.
+
+        Encoders give ``qpos`` / ``qvel``, differentiation gives ``qacc``, and
+        the actuator force is the motor-current torque. No contact or
+        constraint force from the simulator is read.
+        """
+        sense = getattr(self.controller, "sense_proprioception", None)
+        if sense is not None:
+            nv = self.robot_nv
+            sense(
+                self.robot_qpos,
+                self.robot_qvel,
+                self.data.qacc[:nv],
+                self.data.qfrc_actuator[:nv],
+            )
+
     @property
     def robot_qpos(self) -> np.ndarray:
         return self.data.qpos[: self.robot_nq]
@@ -174,6 +191,7 @@ class Simulation:
             self.data.xfrc_applied[self.pelvis_id, :3] = force
             mujoco.mj_step(self.model, self.data)
         self.data.xfrc_applied[self.pelvis_id, :3] = 0.0
+        self.sense_feet()
 
         telemetry = self.controller.telemetry
         self.history.append(

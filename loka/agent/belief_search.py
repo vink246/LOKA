@@ -12,7 +12,8 @@ says which way the live belief is wrong:
 - com y: waist-roll residual. Positive means the COM is too far right.
 - com z: pitch residual, much weaker than x. Positive means the COM is too low.
 - friction does not enter this residual. Its search is not probed: it reads
-  mu off the contact-force ratio of sliding feet in the window captured when
+  mu off the tangential-to-normal force ratio of sliding feet, each foot's
+  force read from its leg's joint torques, in the window captured when
   the fault tripped. A gear search reads the motor deficit instead:
   commanded torque minus applied torque.
 
