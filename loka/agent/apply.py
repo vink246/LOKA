@@ -11,6 +11,11 @@ from loka.agent.directives import LISTENER_KINDS, parse_listeners
 from loka.agent.model_state import resolve_mjcf_name
 from loka.agent.plan import apply_plan
 from loka.agent.context import format_stand_configuration
+from loka.agent.terrain_state import (
+    TERRAIN_OBJECT_TYPES,
+    apply_terrain_mutation,
+    sync_controller_terrain,
+)
 
 
 _SCRATCHPAD_KEYS = {
@@ -110,8 +115,23 @@ def apply_stand_scratchpad(
     mutations = scratchpad.get("Model_Mutations") or []
     if mutations:
         print("  -> Model_Mutations queued onto controller belief:")
+        if isinstance(mutations, dict):
+            mutations = [mutations]
         for mut in mutations:
+            if not isinstance(mut, dict):
+                print(f"     * [WARN] Mutation is not a mapping: {mut!r}")
+                continue
             obj_type = mut.get("object_type")
+            if str(obj_type or "").strip().lower() in TERRAIN_OBJECT_TYPES:
+                try:
+                    line = apply_terrain_mutation(loka_state, mut, sim_time)
+                except (TypeError, ValueError, KeyError) as exc:
+                    print(f"     * [WARN] Terrain mutation rejected: {exc}")
+                    continue
+                summary["mutations"] += 1
+                summary.setdefault("terrain", []).append(line)
+                print(f"     * {line}")
+                continue
             name = mut.get("name")
             attr = mut.get("attribute")
             val = mut.get("value")
@@ -149,6 +169,7 @@ def apply_stand_scratchpad(
             nominal = belief_model.actuator_gear[:, 0].copy()
             loka_state["nominal_gears"] = nominal
         apply_loka_mutations(belief_model, loka_state, nominal)
+        sync_controller_terrain(controller, loka_state)
 
     # -- Listeners (wake conditions; omit the key to leave them armed) -----
     if "Listeners" in scratchpad:

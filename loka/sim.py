@@ -16,7 +16,7 @@ import numpy as np
 
 from loka.control.locomotion import LocomotionConfig, LocomotionController
 
-#: Pelvis height below which the run is called a fall.
+#: Pelvis height above the ground under it below which the run is a fall.
 FALL_HEIGHT = 0.45
 
 
@@ -84,6 +84,7 @@ class Simulation:
         props: dict[str, int] | None = None,
         static_props=None,
         camera: dict | None = None,
+        terrain=None,
     ) -> None:
         self.config = config or LocomotionConfig()
         if model_path is not None:
@@ -91,7 +92,7 @@ class Simulation:
         from loka.control.stacks import make as make_stack
 
         self.controller = make_stack(self.config)
-        self._load_plant(props, static_props, camera)
+        self._load_plant(props, static_props, camera, terrain)
         self.steps_per_control = max(
             1, int(round(self.config.control_dt / self.model.opt.timestep))
         )
@@ -99,7 +100,8 @@ class Simulation:
         self.history: list[dict] = []
         self.reset()
 
-    def _load_plant(self, props, static_props, camera) -> None:
+    def _load_plant(self, props, static_props, camera, terrain=None) -> None:
+        from loka.control.terrain import TerrainBelief, stairs_volumes
         from loka.scene_props import (
             DEFAULT_STATIC_KINDS,
             PropManager,
@@ -112,6 +114,7 @@ class Simulation:
             props,
             DEFAULT_STATIC_KINDS if static_props is None else static_props,
             camera,
+            terrain,
         )
         self.model, self.prop_layout = build_plant_model(self.recipe)
         self.data = mujoco.MjData(self.model)
@@ -121,6 +124,16 @@ class Simulation:
         self.robot_nq = self.prop_layout.robot_nq
         self.robot_nv = self.prop_layout.robot_nv
         self.props = PropManager(self) if self.prop_layout.slots else None
+        #: The plant's true terrain. Only the fall check and an oracle belief read it.
+        self.plant_terrain = TerrainBelief()
+        volumes = []
+        for flight in self.recipe.get("terrain") or []:
+            volumes.extend(stairs_volumes(flight))
+        self.plant_terrain.set_volumes(volumes)
+
+    @property
+    def terrain_specs(self) -> list[dict]:
+        return list(self.recipe.get("terrain") or [])
 
     def sense_feet(self) -> None:
         """Hand the controller the proprioceptive reading of the step just taken.
@@ -207,7 +220,21 @@ class Simulation:
 
     @property
     def fell(self) -> bool:
-        return bool(self.data.qpos[2] < FALL_HEIGHT)
+        """Pelvis below :data:`FALL_HEIGHT` above the lowest ground under it or a foot.
+
+        On stairs the pelvis can lean out over a higher tread than the feet
+        stand on, so the ground under the pelvis alone reads a fall too early.
+        """
+        ground = 0.0
+        terrain = getattr(self, "plant_terrain", None)
+        if terrain is not None and terrain.active:
+            points = [self.data.qpos[:2]]
+            for name in ("left_foot_center", "right_foot_center"):
+                site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
+                if site >= 0:
+                    points.append(self.data.site_xpos[site][:2])
+            ground = float(terrain.heights_at(np.asarray(points)).min())
+        return bool(self.data.qpos[2] - ground < FALL_HEIGHT)
 
     def run(self, duration: float, stop_on_fall: bool = True) -> RunStats:
         while self.data.time < duration:
@@ -261,13 +288,14 @@ class UnitreeRLSimulation(Simulation):
         props: dict[str, int] | None = None,
         static_props=None,
         camera: dict | None = None,
+        terrain=None,
     ) -> None:
         from loka.control.unitree_rl import MIN_WALK_SPEED, UnitreeRLController
 
         self.config = config or LocomotionConfig()
         if model_path is not None:
             self.config.model_path = str(model_path)
-        self._load_plant(props, static_props, camera)
+        self._load_plant(props, static_props, camera, terrain)
         self.controller = UnitreeRLController(
             self.model,
             policy_dir,

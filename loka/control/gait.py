@@ -49,6 +49,7 @@ from enum import Enum
 import numpy as np
 
 from loka.control.qp import QP, Sparsity
+from loka.control.terrain import STAIR_STEP_DZ, classical_stack
 
 GRAVITY = 9.81
 
@@ -237,6 +238,92 @@ STOP_OFFSET = 0.06
 #: Footholds land about 1 cm inside the planned width, so a requested stop
 #: accepts a gap this much narrower.
 STOP_GAP_SLACK = 0.02  # m
+
+#: Terrain. Everything below is read only while the terrain belief holds a
+#: volume; on a flat belief the scheduler is the flat-floor scheduler.
+#: Swing time of a step that changes height [s]. The default cadence swings
+#: in about 0.13 s, too short to lift a sole over a riser. In a quasi-static
+#: step the CoM has to stay over one sole while about 6 kg of leg moves a
+#: tread forward; at 0.45 s the leg's peak speed (1.9 m/s) pushed the CoM
+#: over the stance toe.
+STAIR_SWING_TIME = 0.50
+#: The quasi-static CoM target sits this far behind the stance sole's centre
+#: [m]; the swinging leg carries the whole-body CoM forward.
+QS_HEEL_BIAS = 0.02
+#: Largest sideways capture of a quasi-static stair swing [m]. The stairs
+#: are wide; along them the foothold keeps its tread.
+QS_LATERAL_CAPTURE = 0.10
+#: Cap on the measured CoM velocity a quasi-static transfer starts from [m/s].
+QS_START_SPEED = 0.6
+#: Double support of a quasi-static stair step [s]. The CoM crosses up to a
+#: tread forward and a stance width sideways onto the new stance foot, and
+#: comes to rest there before the other foot lifts. A quintic over 1.0 s
+#: peaks near 1.2 m/s², about what the soles can push sideways.
+QS_DS_TIME = 1.0
+#: Clearance over the higher tread on a stair swing [m].
+STAIR_CLEARANCE = 0.07
+#: Swing phase at which a stair swing reaches its apex, and the window in
+#: which it moves horizontally, for a step up and a step down.
+STAIR_UP_APEX_S = 0.45
+STAIR_UP_MOVE_S = (0.35, 0.95)
+STAIR_DOWN_APEX_S = 0.25
+STAIR_DOWN_MOVE_S = (0.10, 0.70)
+#: A stair swing is long, so a DCM error at lift-off grows about six-fold
+#: before touchdown. Lift-off waits, up to the hold below, until the
+#: measured DCM is this close to the stance target [m].
+STAIR_READY_DCM = 0.01
+STAIR_READY_HOLD = 1.50  # s
+#: Stance width while terrain is in the plan [m], the bottom of the safe
+#: band. The CoM has to sit over one sole in a quasi-static step, and at a
+#: wider stance the other leg needs more ankle roll than its ±15° joint range.
+TERRAIN_STANCE_WIDTH = 0.18
+#: Cap on the capture correction of a footfall that changes height [m]. A
+#: wider correction walks the sole off its tread.
+STAIR_MAX_CORRECTION = 0.06
+#: Bench switch: walk every terrain step quasi-statically, stairs or not.
+QUASI_STATIC_ALWAYS = False
+#: Quasi-static stair steps. Off: the G1's 6 cm sole cannot hold the CoM
+#: through a long single support; stairs are walked dynamically, with
+#: capture stepping and trailing-foot toe-off, as Atlas and TORO do.
+QUASI_STATIC_STAIRS = False
+#: CoM height on terrain from the vertical channel of the 3D DCM (VRP at each
+#: foothold height) rather than a ramp across each step.
+DCM_3D = True
+#: Classical stack: stair swing time = base + per metre of swing + per metre
+#: of rise [s]. A 0.3 m, 0.1 m step takes 0.63 s; a 0.6 m, 0.2 m one 0.91 s.
+CLASSICAL_SWING_BASE = 0.35
+CLASSICAL_SWING_PER_M = 0.6
+CLASSICAL_SWING_PER_RISE = 1.0
+#: Heel-to-toe VRP across a stair step (Englsberger et al. 2014): behind and
+#: ahead of the sole centre at the start and end of the step [m]. Off: on
+#: 0.10 m stairs it lowered the mean highest tread from 0.42 m to 0.26 m
+#: (0.37 m at 4/6 cm); the curb stayed 5/5.
+VRP_HEEL_TO_TOE = False
+VRP_HEEL = 0.03
+VRP_TOE = 0.04
+#: Plan stairs tread by tread: within this reach of the other foot, the next
+#: foothold is the middle of the next tread [m]. Off: on 0.10 m stairs both
+#: modes did worse than snapping the cruise stride onto treads (mean highest
+#: 0.21 m step-over, 0.13 m step-to, against 0.42 m; scripts/riser_sweep.py).
+STAIR_TREAD_STEPS = False
+STAIR_PITCH_MAX = 0.40
+STAIR_APPROACH_MAX = 0.32
+#: A tread-by-tread step only when the walk is still striding forward; a
+#: stopping walk keeps its own (shrinking) footholds instead of climbing on [m].
+STAIR_TREAD_MIN_STRIDE = 0.02
+#: ``step_to``: the lead foot climbs one tread and the other joins it, so
+#: every swing is one tread long and one riser high. ``step_over``: one foot
+#: per tread, each swing two treads long and two risers high.
+STAIR_GAIT = "step_over"
+#: Extra transfer time after a footfall that changed height [s]. Zero: the
+#: cadence's own 0.23 s transfer is IHMC's simulated 0.25 s (Griffin et al.
+#: 2018), and a longer one let the CoM stall behind the upper foot.
+STAIR_DS_EXTRA = 0.0
+#: Late-swing hold on terrain, which may have to wait for a reach-down [s].
+TERRAIN_TOUCHDOWN_HOLD = 0.35
+#: While held, the swing target sinks at this rate, to at most this depth.
+REACH_DOWN_SPEED = 0.25  # m/s
+REACH_DOWN_MAX = 0.08  # m
 
 #: Plant-side go-to-point (``gait.goal_*``). The scheduler re-aims
 #: ``heading`` at the goal and sets ``speed`` every tick, so the orchestrator
@@ -564,6 +651,67 @@ def swing_reference(
     return pos, vel, acc
 
 
+def _quintic(u: float) -> tuple[float, float, float]:
+    """Smootherstep and its first two derivatives; zero rate and curvature at both ends."""
+    u = float(np.clip(u, 0.0, 1.0))
+    u2, u3 = u * u, u * u * u
+    return (
+        u3 * (10.0 - 15.0 * u + 6.0 * u2),
+        30.0 * u2 * (1.0 - u) * (1.0 - u),
+        60.0 * u - 180.0 * u2 + 120.0 * u3,
+    )
+
+
+def stair_swing_reference(
+    start: np.ndarray,
+    end: np.ndarray,
+    s: float,
+    *,
+    clearance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Swing arc between treads at different heights, with ``d/ds`` derivatives.
+
+    Lift, then move. A step up rises to ``clearance`` above the higher tread
+    before the foot moves forward, so the toe, which starts a few centimetres
+    behind the riser, passes over the nosing. A step down moves out over
+    the edge first and descends after. Every segment is a quintic, so the
+    feed-forward acceleration is continuous.
+    """
+    s = float(np.clip(s, 0.0, 1.0))
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    z0, z1 = float(start[2]), float(end[2])
+    apex = max(z0, z1) + float(clearance)
+    if z1 >= z0:
+        peak, (h0, h1) = STAIR_UP_APEX_S, STAIR_UP_MOVE_S
+    else:
+        peak, (h0, h1) = STAIR_DOWN_APEX_S, STAIR_DOWN_MOVE_S
+    pos = np.zeros(3)
+    vel = np.zeros(3)
+    acc = np.zeros(3)
+    if s < peak:
+        q, dq, ddq = _quintic(s / peak)
+        span = apex - z0
+        pos[2] = z0 + span * q
+        vel[2] = span * dq / peak
+        acc[2] = span * ddq / (peak * peak)
+    else:
+        width = 1.0 - peak
+        q, dq, ddq = _quintic((s - peak) / width)
+        span = z1 - apex
+        pos[2] = apex + span * q
+        vel[2] = span * dq / width
+        acc[2] = span * ddq / (width * width)
+    window = h1 - h0
+    q, dq, ddq = _quintic((s - h0) / window)
+    inside = h0 < s < h1
+    delta = end[:2] - start[:2]
+    pos[:2] = start[:2] + delta * q
+    vel[:2] = delta * (dq / window if inside else 0.0)
+    acc[:2] = delta * (ddq / (window * window) if inside else 0.0)
+    return pos, vel, acc
+
+
 @dataclass
 class Footstep:
     """One planned footfall: which leg, where, and whether it may still move."""
@@ -585,6 +733,17 @@ class Footstep:
     #: The opening step of a walk, where both feet stay planted while the
     #: opening ZMP slides onto the upcoming swing foot (APA).
     initial: bool = False
+    #: World z of the tread the sole lands on. None on a flat belief, where
+    #: every foothold sits at the scheduler's ground height.
+    z: float | None = None
+    #: This footfall changes height from the same leg's previous one, so its
+    #: swing uses the stair arc and the stair swing time.
+    stair: bool = False
+    #: Set once the swing has started, so the step's duration cannot change.
+    stair_locked: bool = False
+    #: Height the terrain belief gave this footfall, kept when a measured
+    #: landing overrides ``z``.
+    planned_z: float | None = None
 
 
 @dataclass
@@ -619,6 +778,22 @@ class GaitOutput:
     yaw_ref: float = 0.0
     yaw_rate_ref: float = 0.0
     stance_yaw: float = 0.0
+    #: Ground height the CoM reference rides on, and its rate. None on a
+    #: flat belief, where the controller uses its ground estimate.
+    support_z: float | None = None
+    support_vz: float = 0.0
+    #: Leg whose foothold supports the step in progress, -1 when standing.
+    support_leg: int = -1
+    #: A step within the plan horizon changes height.
+    terrain_ahead: bool = False
+    #: The step in progress lands on, or lifts off toward, another tread.
+    stair_step: bool = False
+    #: The support or landing foothold of the step in progress changes tread,
+    #: in either stepping mode.
+    stair_transfer: bool = False
+    #: A footfall from the step in progress through the plan horizon climbs
+    #: onto a higher tread.
+    ascent_ahead: bool = False
 
 
 class GaitScheduler:
@@ -651,6 +826,8 @@ class GaitScheduler:
         self._goal_point = None
         # Set by the runtime while |bias| is above the mode threshold.
         self.block_walk = False
+        #: The controller's :class:`~loka.control.terrain.TerrainBelief`.
+        self.terrain = None
         self._step_qp = QP(
             "step_adjust",
             hessian_pattern=Sparsity.diagonal(5),
@@ -697,9 +874,430 @@ class GaitScheduler:
         self._ds_rate = 1.0
         self._swing_rate = 1.0
         self._L_meas = np.zeros(3)
+        self._floor_z = 0.0
+        self._feet_z = np.zeros(2)
+        self._initial_z = np.zeros(2)
+        #: Per-leg ground height the controller measured under a planted foot.
+        self._leg_ref = None
+        #: Height a swing foot was found resting on before its target.
+        self._landing_override = None
+        #: Footfalls completed on terrain since the controller last drained them.
+        #: Kept across the reset that ends a walk, so its last footfall is
+        #: still read; the controller's own reset clears it.
+        if not hasattr(self, "touchdowns"):
+            self.touchdowns: list[dict] = []
+        self._liftoff_hold = 0.0
+        self._qs_step = -1
+        self._cz = None
+        self._omega_last = 4.0
+        self._dt_last = 0.002
+        self._qs_start = np.zeros(2)
+        self._qs_start_vel = np.zeros(2)
+        self._com_meas = np.zeros(2)
+        self._com_vel_meas = np.zeros(2)
 
     def set_config(self, config: GaitConfig) -> None:
         self.config = config
+
+    # -- terrain -------------------------------------------------------------
+
+    @property
+    def terrain_active(self) -> bool:
+        return self.terrain is not None and bool(self.terrain.active)
+
+    def _step_z(self, step: "Footstep | None", leg: int | None = None) -> float:
+        """Tread height of a footstep; the floor when the plan has none."""
+        if step is not None and step.z is not None:
+            return float(step.z)
+        if leg is not None and 0 <= int(leg) < 2:
+            return float(self._initial_z[int(leg)])
+        return float(self._floor_z)
+
+    def _leg_ground(self, leg: int, ground_z: float) -> float:
+        """Height a planted foot of ``leg`` is compared against."""
+        if self.terrain_active and self._leg_ref is not None:
+            return float(self._leg_ref[int(leg)])
+        return float(ground_z)
+
+    def _landing_z(self, ground_z: float) -> float:
+        """Height the in-flight foot is expected to land at."""
+        if not self.terrain_active:
+            return float(ground_z)
+        if self._landing_override is not None:
+            return float(self._landing_override)
+        landing = self._steps.get(self._step + 1)
+        return self._step_z(landing)
+
+    def note_measured_landing(self, z: float) -> None:
+        """The swing foot met ground at ``z`` before reaching its target.
+
+        The footfall is re-planned at the measured height, so the touchdown
+        test, the CoM height and the next step all use where the sole is.
+        """
+        self._landing_override = float(z)
+        landing = self._steps.get(self._step + 1)
+        if landing is not None:
+            landing.z = float(z)
+
+    def _step_span(self, index: int) -> float:
+        """Duration of support step ``index`` [s].
+
+        On a flat belief this is ``T_step`` (the opening transfer aside). A
+        step whose swing changes height keeps the double support and gets
+        :data:`STAIR_SWING_TIME` of swing.
+        """
+        t_step, t_swing, t_ds = self._durations()
+        step = self._steps.get(index)
+        if step is not None and step.initial:
+            return t_step * OPENING_TRANSFER_STEPS
+        if not self.terrain_active:
+            return t_step
+        return self._ds_span(index) + self._swing_span(index)
+
+    def _ds_span(self, index: int) -> float:
+        """Double support of step ``index``; long for a quasi-static stair step."""
+        _, _, t_ds = self._durations()
+        if not self.terrain_active:
+            return t_ds
+        if self._quasi_static_at(index):
+            return max(t_ds, QS_DS_TIME)
+        step = self._steps.get(index)
+        if step is not None and step.stair and not step.initial and step.leg >= 0:
+            # Transfer onto a new tread: the CoM rises here (Griffin et al. 2017).
+            return t_ds + STAIR_DS_EXTRA
+        return t_ds
+
+    def _quasi_static_at(self, index: int) -> bool:
+        """Step ``index`` lands on, or lifts off toward, another tread."""
+        if not self.terrain_active:
+            return False
+        here = self._steps.get(index)
+        if here is None or here.initial or here.leg < 0:
+            return False
+        if QUASI_STATIC_ALWAYS:
+            return True
+        if not QUASI_STATIC_STAIRS:
+            return False
+        landing = self._steps.get(index + 1)
+        return bool(here.stair or (landing is not None and landing.stair))
+
+    def _swing_span(self, index: int) -> float:
+        _, t_swing, _ = self._durations()
+        if not self.terrain_active:
+            return t_swing
+        landing = self._steps.get(index + 1)
+        if landing is not None and landing.stair and landing.leg >= 0:
+            if classical_stack():
+                return max(t_swing, self._distance_swing_time(index))
+            return max(t_swing, STAIR_SWING_TIME)
+        return t_swing
+
+    def _distance_swing_time(self, index: int) -> float:
+        """Swing time growing with swing length and height (IHMC's stair timing).
+
+        A tread-by-tread climb swings each foot two treads and two risers;
+        at a fixed swing time that is a 2 m/s foot.
+        """
+        landing = self._steps[index + 1]
+        start = self._steps.get(index - 1)
+        if start is None or start.leg != landing.leg:
+            start_xy = self._initial_feet[landing.leg]
+            start_z = float(self._initial_z[landing.leg])
+        else:
+            start_xy = np.asarray(start.pos, dtype=float)
+            start_z = self._step_z(start, start.leg)
+        reach = float(np.linalg.norm(np.asarray(landing.pos, dtype=float) - start_xy))
+        rise = abs(self._step_z(landing, landing.leg) - start_z)
+        return CLASSICAL_SWING_BASE + CLASSICAL_SWING_PER_M * reach + CLASSICAL_SWING_PER_RISE * rise
+
+    def _terrain_ahead(self) -> bool:
+        if not self.terrain_active or not self._active:
+            return False
+        return any(
+            self._steps.get(i) is not None and self._steps[i].stair
+            for i in range(self._step + 1, self._step + PLAN_HORIZON + 1)
+        )
+
+    def _ascent_ahead(self) -> bool:
+        if not self.terrain_active or not self._active:
+            return False
+        # From the next footfall: the step in progress has lost its same-leg
+        # predecessor to pruning (stair_transfer covers it).
+        for i in range(self._step + 1, self._step + PLAN_HORIZON + 1):
+            step = self._steps.get(i)
+            if step is None or step.initial or step.leg < 0 or not step.stair:
+                continue
+            same = self._steps.get(i - 2)
+            before = (
+                self._step_z(same, step.leg)
+                if same is not None and same.leg == step.leg
+                else float(self._initial_z[step.leg])
+            )
+            if self._step_z(step, step.leg) > before:
+                return True
+        return False
+
+    def _support_height_ref(self) -> tuple[float, float]:
+        """Ground height under the CoM reference, and its rate.
+
+        Across step ``k`` the weight moves from the previous foothold onto
+        this one, so the reference slides from tread ``k - 1`` to tread
+        ``k``. After a change of tread the slide happens in double support,
+        while both legs push: the trailing leg lifts the body as it moves
+        over the new stance foot, rather than leaving the lead leg a deep
+        one-legged squat once the trailing foot is in the air. The
+        controller's reach clamp keeps the trailing leg within reach.
+        """
+        here = self._steps.get(self._step)
+        if here is None:
+            return float(self._floor_z), 0.0
+        if DCM_3D:
+            return self._vrp_height_ref()
+        z1 = self._step_z(here, here.leg if here.leg >= 0 else None)
+        prev = self._steps.get(self._step - 1)
+        if prev is None or here.initial:
+            return z1, 0.0
+        z0 = self._step_z(prev, prev.leg if prev.leg >= 0 else None)
+        span = self._current_duration(0.0)
+        if abs(z1 - z0) >= STAIR_STEP_DZ:
+            span = min(span, self._ds_span(self._step))
+        if span <= 1e-6 or self._touchdown_hold > 0.0:
+            return z1, 0.0
+        u = float(np.clip(self._tau / span, 0.0, 1.0))
+        shape = u * u * (3.0 - 2.0 * u)
+        rate = 6.0 * u * (1.0 - u) / span
+        return z0 + (z1 - z0) * shape, (z1 - z0) * rate
+
+    def _vrp_height_ref(self) -> tuple[float, float]:
+        """Support-height reference from the vertical channel of the 3D DCM.
+
+        Englsberger et al. (TRO 2015): each step's virtual repellent point sits
+        at its foothold height plus the walking height (Δz_vrp = g/ω²), and the
+        DCM recursion runs on that vertical channel exactly as it does in xy,
+        with the same per-step durations. The CoM height follows the DCM with
+        the stable filter ż = ω(ξ − z) on plan state. Returned relative to the
+        walking height, i.e. as the ground height the CoM rides on.
+        """
+        omega = float(self._omega_last)
+        last = self._step + PLAN_HORIZON
+        eos = self._step_z(self._steps.get(last))
+        for index in range(last, self._step, -1):
+            zk = self._step_z(self._steps.get(index))
+            eos = zk + (eos - zk) * float(np.exp(-omega * self._step_span(index)))
+        here = self._steps[self._step]
+        z_here = self._step_z(here, here.leg if here.leg >= 0 else None)
+        span = self._current_duration(0.0)
+        xi = z_here + (eos - z_here) * float(np.exp(omega * (min(self._tau, span) - span)))
+        if self._cz is None:
+            self._cz = z_here
+        vz = omega * (xi - self._cz)
+        self._cz += vz * self._dt_last
+        return float(self._cz), float(vz)
+
+    def _terrain_place(self, index: int, nominal: np.ndarray, yaw: float, in_place: bool) -> np.ndarray:
+        """Snap a planned footfall onto a tread and record its height."""
+        step = self._steps.get(index)
+        prev = self._steps.get(index - 1)
+        if prev is None:
+            return nominal
+        anchor_leg = prev.leg if prev.leg >= 0 else None
+        anchor_z = self._step_z(prev, anchor_leg)
+        forward, _ = heading_frame(yaw)
+        if (
+            (STAIR_TREAD_STEPS or classical_stack())
+            and not in_place
+            and not self._stop_requested
+        ):
+            # One foot per tread (Griffin et al. 2018; Caron et al. 2019): the
+            # cruise stride is several times shorter than a tread, and
+            # snapping it onto treads alternates 0.3 m step-ups with
+            # shuffles that the CoM, moving at the step-up's pace, overruns.
+            anchor = np.asarray(prev.pos, dtype=float)
+            offset = np.asarray(nominal, dtype=float) - anchor
+            along_nominal = float(np.dot(offset, forward))
+            lateral = offset - along_nominal * forward
+            own = self._steps.get(index - 2)
+            gait_mode = "step_over" if classical_stack() else STAIR_GAIT
+            if gait_mode == "step_to" and own is not None and own.leg == self._leg_of(index):
+                own_z = self._step_z(own, own.leg)
+                if anchor_z - own_z >= STAIR_STEP_DZ:
+                    # Mark time: the trailing foot joins the lead on its tread.
+                    return anchor + lateral
+            # Scan the swing foot's own line, so on stairs met at an angle the
+            # sole still lands on the tread it is aimed at.
+            ahead = self.terrain.next_tread_center(
+                anchor + lateral, forward, anchor_z, floor=self._floor_z
+            )
+            # From the floor the approach first closes on the riser; on a
+            # tread the other foot is already as close as the tread allows.
+            reach = STAIR_PITCH_MAX if anchor_z - self._floor_z >= STAIR_STEP_DZ else STAIR_APPROACH_MAX
+            if (
+                ahead is not None
+                and STAIR_TREAD_MIN_STRIDE <= along_nominal < ahead[0] <= reach
+            ):
+                candidate = anchor + ahead[0] * forward + lateral
+                if self.terrain.footprint_uniform(candidate, yaw, floor=self._floor_z):
+                    return candidate
+        return self.terrain.snap_foothold(
+            nominal, yaw, forward, prev.pos, anchor_z, floor=self._floor_z, nearest=in_place
+        )
+
+    def _terrain_finish(self, index: int) -> None:
+        """Height and stair flag of a footfall once its position is set."""
+        step = self._steps.get(index)
+        if step is None or step.leg < 0:
+            return
+        if step.nominal is not None:
+            step.pos = self.terrain.clamp_to_surface(
+                step.pos, step.nominal, float(step.yaw), self.terrain.support_height(
+                    step.nominal, float(step.yaw), floor=self._floor_z
+                ),
+                floor=self._floor_z,
+            )
+            step.correction = np.asarray(step.pos, dtype=float) - np.asarray(step.nominal, dtype=float)
+        believed = self.terrain.support_height(step.pos, float(step.yaw), floor=self._floor_z)
+        if not (step.stair_locked and step.planned_z is not None):
+            step.planned_z = believed
+        if index == self._step + 1 and self._landing_override is not None:
+            step.z = float(self._landing_override)
+        else:
+            step.z = believed
+        if step.stair_locked:
+            return
+        same = self._steps.get(index - 2)
+        if same is None or same.leg != step.leg:
+            before = float(self._initial_z[step.leg])
+        else:
+            before = self._step_z(same, step.leg)
+        step.stair = abs(float(step.z) - before) >= STAIR_STEP_DZ
+
+    def _hold_for_stair_liftoff(self, com_xy, com_vel_xy, omega, t_ds, clock, dt) -> bool:
+        """Stop the clock at the end of double support before a stair swing.
+
+        Holds while the measured DCM is off the plan sideways, so the long
+        single support starts with the CoM where the plan put it. Bounded by
+        :data:`STAIR_READY_HOLD` per step.
+        """
+        if not self.terrain_active or not self._quasi_static_at(self._step):
+            # A dynamic step's DCM moves by design; holding the clock tips it forward.
+            return False
+        here = self._steps.get(self._step)
+        landing = self._steps.get(self._step + 1)
+        if here is None or here.initial or landing is None or not landing.stair:
+            self._liftoff_hold = 0.0
+            return False
+        if self._tau + clock < t_ds or self._tau > t_ds + 1e-9:
+            if self._tau + clock < t_ds:
+                self._liftoff_hold = 0.0
+            return False
+        if self._liftoff_hold >= STAIR_READY_HOLD:
+            return False
+        dcm = np.asarray(com_xy, dtype=float) + np.asarray(com_vel_xy, dtype=float) / omega
+        error = float(np.linalg.norm(dcm - self._dcm_ref))
+        if error <= STAIR_READY_DCM:
+            return False
+        # Just short of the swing window, so the leg stays a stance leg.
+        self._tau = t_ds - 1e-6
+        self._liftoff_hold += dt
+        return True
+
+    def _quasi_static_reference(self, *, t_ds: float):
+        """CoM reference for a stair step: over the stance foot, at rest.
+
+        The DCM orbit is a dynamic walk: in a stair step's long single
+        support its lateral divergence grows about six-fold, and the capture
+        law then steps the foot off its tread. Instead the CoM slides onto
+        the stance foot (inset toward the midline) during double support and
+        holds there while the other foot swings. Returns ``(ref, vel)``.
+        """
+        here = self._steps[self._step]
+        if self._qs_step != self._step:
+            # Start from where the CoM is and how it moves, so a step that
+            # lands under a sideways-moving CoM brakes it instead of first
+            # pulling it back toward the old stance foot.
+            self._qs_step = self._step
+            self._qs_start = np.asarray(self._com_meas, dtype=float).reshape(2).copy()
+            vel0 = np.asarray(self._com_vel_meas, dtype=float).reshape(2).copy()
+            speed = float(np.linalg.norm(vel0))
+            if speed > QS_START_SPEED:
+                vel0 *= QS_START_SPEED / speed
+            self._qs_start_vel = vel0
+        target = self._qs_target(here)
+        if self._tau < t_ds and t_ds > 1e-6:
+            # Cubic Hermite: measured position and velocity to rest on target.
+            u = float(np.clip(self._tau / t_ds, 0.0, 1.0))
+            h00, h10 = 2 * u**3 - 3 * u**2 + 1, u**3 - 2 * u**2 + u
+            h01 = -2 * u**3 + 3 * u**2
+            d00, d10, d01 = 6 * u**2 - 6 * u, 3 * u**2 - 4 * u + 1, -6 * u**2 + 6 * u
+            p0, v0 = self._qs_start, self._qs_start_vel
+            ref = h00 * p0 + h10 * t_ds * v0 + h01 * target
+            vel = (d00 * p0 + d01 * target) / t_ds + d10 * v0
+        else:
+            ref, vel = target.copy(), np.zeros(2)
+        return ref, vel
+
+    def _qs_lateral_capture(self, target: "Footstep", *, dcm, s: float, omega: float) -> None:
+        """Sideways capture for a quasi-static stair swing.
+
+        The G1 sole is 6 cm wide, so ankle torque cannot hold a CoM that
+        drifts off it during a long single support. The swing foot goes
+        sideways to where the DCM will be at touchdown, measured against
+        the stance target, the way a narrow-footed walker steps to balance.
+        Along the stairs the foothold keeps its tread.
+        """
+        here = self._steps.get(self._step)
+        if here is None or target.nominal is None:
+            return
+        forward, left = heading_frame(float(here.yaw))
+        stance = self._qs_target(here)
+        remaining = max(self._current_duration(0.0) - self._tau, 0.0)
+        predicted = stance + (np.asarray(dcm, dtype=float) - stance) * float(np.exp(omega * remaining))
+        shift = float(np.clip(np.dot(predicted - stance, left), -QS_LATERAL_CAPTURE, QS_LATERAL_CAPTURE))
+        pos = np.asarray(target.nominal, dtype=float) + shift * left
+        side = 1.0 if target.leg == 0 else -1.0
+        gap = side * float(np.dot(pos - np.asarray(here.pos, dtype=float), left))
+        if gap < MIN_FOOT_SEPARATION:
+            pos = pos + side * (MIN_FOOT_SEPARATION - gap) * left
+        if s > 0.45:
+            budget = SWING_CATCHUP_SPEED * max((1.0 - s) * self._swing_span(self._step), 1e-3)
+            delta = pos - np.asarray(target.pos, dtype=float)
+            norm = float(np.linalg.norm(delta))
+            if norm > budget:
+                pos = np.asarray(target.pos, dtype=float) + delta * (budget / norm)
+        target.correction = pos - np.asarray(target.nominal, dtype=float)
+        target.pos = pos
+        self._clamp_target(target)
+
+    def _qs_target(self, here: "Footstep") -> np.ndarray:
+        forward, _ = heading_frame(float(here.yaw))
+        return self._zmp_of(here) - QS_HEEL_BIAS * forward
+
+    def _stair_transfer_now(self) -> bool:
+        if not self.terrain_active or not self._active:
+            return False
+        here = self._steps.get(self._step)
+        landing = self._steps.get(self._step + 1)
+        if here is None or here.initial or here.leg < 0:
+            return False
+        return bool(here.stair or (landing is not None and landing.stair))
+
+    def _stair_step_now(self) -> bool:
+        """The step in progress lands on, or lifts off toward, another tread."""
+        if not self._active:
+            return False
+        return self._quasi_static_at(self._step)
+
+    def _clamp_target(self, target: "Footstep | None") -> None:
+        """Keep a capture-corrected foothold on the tread it was planned on."""
+        if not self.terrain_active or target is None or target.nominal is None:
+            return
+        # The surface it was planned on: after an early contact ``z`` is the
+        # measured height, which the belief does not have under the foot.
+        z = target.planned_z if target.planned_z is not None else self._step_z(target, target.leg)
+        target.pos = self.terrain.clamp_to_surface(
+            target.pos, target.nominal, float(target.yaw), z, floor=self._floor_z
+        )
+        target.correction = np.asarray(target.pos, dtype=float) - np.asarray(target.nominal, dtype=float)
 
     @property
     def cmd_speed(self) -> float:
@@ -971,7 +1569,20 @@ class GaitScheduler:
                 duty = scheduled["gait.duty_factor"]
             if "stance_width" not in self._user_gait_fields:
                 width = scheduled["gait.stance_width"]
+        if self.terrain_active and (self._terrain_within(1.2) or self._stair_step_now()):
+            width = min(width, TERRAIN_STANCE_WIDTH)
         return period, duty, width, height
+
+    def _terrain_within(self, distance: float) -> bool:
+        """A height change in the belief within ``distance`` along the heading."""
+        here = self._steps.get(self._step) if self._steps else None
+        if here is None:
+            return False
+        forward, _ = heading_frame(float(self.config.heading))
+        dist = np.linspace(-0.2, float(distance), 15)
+        points = np.asarray(here.pos, dtype=float)[None, :] + dist[:, None] * forward[None, :]
+        heights = self.terrain.heights_at(points, self._floor_z)
+        return float(heights.max() - heights.min()) >= STAIR_STEP_DZ
 
     def _latch_step_params(self, *, exact: bool) -> None:
         """Copy or slew timing and geometry. Call only at a step boundary."""
@@ -1045,8 +1656,11 @@ class GaitScheduler:
         """Duration of the step in progress [s].
 
         Only the opening double-support transfer differs; see
-        :data:`OPENING_TRANSFER_STEPS`.
+        :data:`OPENING_TRANSFER_STEPS`. On terrain a stair step is longer;
+        see :meth:`_step_span`.
         """
+        if self.terrain_active:
+            return self._step_span(self._step)
         step = self._steps.get(self._step)
         if step is not None and step.initial:
             return t_step * OPENING_TRANSFER_STEPS
@@ -1081,7 +1695,7 @@ class GaitScheduler:
         leg = self._swing_leg()
         if leg < 0:
             return True
-        height = float(feet[leg, 2] - ground_z)
+        height = float(feet[leg, 2] - self._landing_z(ground_z))
         rows = slice(0, 4) if leg == 0 else slice(4, 8)
         planted = bool(np.asarray(measured_mask, dtype=bool).reshape(-1)[rows].any())
         if height > TOUCHDOWN_HEIGHT or not planted:
@@ -1253,6 +1867,7 @@ class GaitScheduler:
         width = float(self._width if self._latch_valid else self.config.stance_width)
         goal = self._heading_goal()
         turn = max_turn_per_step(speed, t_step, float(self.config.turn_rate))
+        terrain = self.terrain_active
         support = self._steps[self._step]
         yaw = float(support.yaw)
         center = np.asarray(support.pos, dtype=float) - (
@@ -1284,6 +1899,12 @@ class GaitScheduler:
                 center = center + speed * t_step * forward
                 yaw = yaw + dyaw
                 nominal = center + _side(leg) * 0.5 * width * left
+            if terrain and existing is not None and existing.stair_locked and existing.nominal is not None:
+                # The swing is under way toward a tread; keep its foothold.
+                nominal = np.asarray(existing.nominal, dtype=float).copy()
+                yaw = float(existing.nominal_yaw if existing.nominal_yaw is not None else existing.yaw)
+            elif terrain:
+                nominal = self._terrain_place(index, nominal, yaw, in_place)
             if existing is None:
                 self._steps[index] = Footstep(
                     leg=leg,
@@ -1297,6 +1918,8 @@ class GaitScheduler:
                 existing.nominal_yaw = yaw
                 existing.pos = nominal + existing.correction
                 existing.yaw = yaw
+            if terrain:
+                self._terrain_finish(index)
             if in_place:
                 yaw = float(self._steps[index].yaw)
                 continue
@@ -1472,6 +2095,7 @@ class GaitScheduler:
         pos = solution[:2] - inset
         target.correction = pos - np.asarray(target.nominal, dtype=float)
         target.pos = pos
+        self._clamp_target(target)
         duration = float(np.clip(np.log(max(solution[2], 1.0)) / omega, t_min, t_nom))
         cut = t_nom - duration
         if cut <= ds_rem - ds_floor + 1e-9:
@@ -1516,9 +2140,19 @@ class GaitScheduler:
         if s > float(np.clip(cfg.foothold_retarget_s, 0.05, 0.95)):
             target.frozen = True
             return
+        if self._stair_step_now():
+            # A quasi-static stair step: the foothold stays on its tread
+            # along the stairs, and only moves sideways (see below).
+            self._qs_lateral_capture(target, dcm=dcm, s=s, omega=omega)
+            return
 
         support_zmp = self._zmp_of(self._steps[self._step])
         remaining = max(self._current_duration(t_step) - self._tau, 1e-3)
+        # Known mismatch, kept on purpose: on a classical stair step the plan's
+        # VRP moves heel to toe (_vrp_segment) while this prediction holds it
+        # at the sole centre. The consistent prediction lowered the classical
+        # stairs from 21/30 to 6/30 successes (0.06-0.10 m risers); the
+        # resulting forward correction is part of what the stack was tuned on.
         predicted = support_zmp + (np.asarray(dcm) - support_zmp) * float(
             np.exp(omega * remaining)
         )
@@ -1531,9 +2165,23 @@ class GaitScheduler:
         want = predicted - offset - inset
         correction = float(cfg.capture_gain) * (want - target.nominal)
         norm = float(np.linalg.norm(correction))
-        saturated = norm > MAX_DCM_CORRECTION
-        if saturated:
-            correction *= MAX_DCM_CORRECTION / norm
+        stair_target = self.terrain_active and target.stair
+        if stair_target and classical_stack():
+            # Step adjustment (Griffin et al. 2017 on Atlas): along the stairs
+            # the tread bounds the foothold; across them it is free to catch
+            # the DCM, which a two-tread swing lets diverge for ~0.6 s.
+            forward, left = heading_frame(float(target.yaw))
+            along = float(np.clip(np.dot(correction, forward), -STAIR_MAX_CORRECTION, STAIR_MAX_CORRECTION))
+            across = float(np.clip(np.dot(correction, left), -MAX_DCM_CORRECTION, MAX_DCM_CORRECTION))
+            saturated = abs(along) < abs(float(np.dot(correction, forward))) or abs(across) < abs(
+                float(np.dot(correction, left))
+            )
+            correction = along * forward + across * left
+        else:
+            cap = STAIR_MAX_CORRECTION if stair_target else MAX_DCM_CORRECTION
+            saturated = norm > cap
+            if saturated:
+                correction *= cap / norm
         # The opening weight shift is not a sideways step. Lateral capture on
         # the first two swings walks the second foot out to the right before
         # the stride is going forward. Keep the forward correction.
@@ -1549,7 +2197,7 @@ class GaitScheduler:
         # how step 5 landed 21 mm short — Galliker: the foot pose at contact
         # is kinematic, not an unbounded DCM nudge.
         if s > 0.45:
-            _, t_swing, _ = self._durations()
+            t_swing = self._swing_span(self._step)
             budget = SWING_CATCHUP_SPEED * max((1.0 - s) * t_swing, 1e-3)
             delta = pos - np.asarray(target.pos, dtype=float)
             dnorm = float(np.linalg.norm(delta))
@@ -1577,6 +2225,7 @@ class GaitScheduler:
         self._capture_hot = bool(saturated)
         target.correction = pos - target.nominal
         target.pos = pos
+        self._clamp_target(target)
 
     # -- DCM reference -----------------------------------------------------
 
@@ -1615,6 +2264,14 @@ class GaitScheduler:
         """
         last = self._step + PLAN_HORIZON
         eos = self._zmp_of(self._steps[last])
+        if self.terrain_active:
+            # A stair step dwells longer on its foothold, so it attenuates more.
+            for index in range(last, self._step, -1):
+                zmp = self._zmp_of(self._steps[index])
+                span = self._step_span(index)
+                p0, p1, drift = self._vrp_segment(index, zmp, span, omega)
+                eos = p0 + drift + (eos - p1 - drift) * float(np.exp(-omega * span))
+            return eos
         decay = float(np.exp(-omega * t_step))
         for index in range(last, self._step, -1):
             zmp = self._zmp_of(self._steps[index])
@@ -1626,7 +2283,55 @@ class GaitScheduler:
         eos = self._dcm_eos(omega=omega, t_step=t_step)
         span = self._current_duration(t_step)
         zmp = self._zmp_now(t_step=t_step, t_ds=t_ds)
+        if self.terrain_active:
+            p0, p1, drift = self._vrp_segment(self._step, zmp, span, omega)
+            u = float(np.clip(self._tau / span, 0.0, 1.0)) if span > 1e-6 else 1.0
+            here = p0 + (p1 - p0) * u
+            return here + drift + (eos - p1 - drift) * float(np.exp(omega * (self._tau - span)))
         return zmp + (eos - zmp) * float(np.exp(omega * (self._tau - span)))
+
+    def vrp_now(self) -> np.ndarray:
+        """Horizontal VRP of the DCM plan at this instant; ``ξ̇_ref = ω(ξ_ref − vrp)``."""
+        t_step, _, t_ds = self._durations()
+        zmp = self._zmp_now(t_step=t_step, t_ds=t_ds)
+        if not self.terrain_active or not self._active:
+            return zmp
+        span = self._current_duration(t_step)
+        p0, p1, _ = self._vrp_segment(self._step, zmp, span, float(self._omega_last))
+        u = float(np.clip(self._tau / span, 0.0, 1.0)) if span > 1e-6 else 1.0
+        return p0 + (p1 - p0) * u
+
+    @property
+    def omega(self) -> float:
+        """Natural frequency of the plan at the walking height [1/s]."""
+        return float(self._omega_last)
+
+    def _vrp_segment(self, index: int, zmp: np.ndarray, span: float, omega: float):
+        """Start, end and DCM offset of step ``index``'s VRP: heel to toe on a stair step.
+
+        Englsberger et al. (IROS 2014): across a stance the VRP moves from
+        the heel toward the toe. For a VRP moving at constant rate ``v``,
+        ``ξ(t) = p(t) + v/ω + (ξ_T − p_T − v/ω) e^{ω(t−T)}``. Flat steps keep a
+        fixed VRP (zero shift, zero offset).
+        """
+        zmp = np.asarray(zmp, dtype=float).reshape(2)
+        step = self._steps.get(index)
+        landing = self._steps.get(index + 1)
+        stair = (
+            (VRP_HEEL_TO_TOE or classical_stack())
+            and step is not None
+            and not step.initial
+            and step.leg >= 0
+            and span > 1e-6
+            and (step.stair or (landing is not None and landing.stair))
+        )
+        if not stair:
+            return zmp, zmp, np.zeros(2)
+        forward, _ = heading_frame(float(step.yaw))
+        p0 = zmp - VRP_HEEL * forward
+        p1 = zmp + VRP_TOE * forward
+        drift = (p1 - p0) / (span * omega)
+        return p0, p1, drift
 
     def _integrate_com_ref(self, *, dt: float, omega: float, dcm_ref: np.ndarray) -> None:
         """``ċ = ω(ξ − c)``, on plan state only.
@@ -1675,13 +2380,18 @@ class GaitScheduler:
         swing = 1 - stance
         swing_inset = feet_xy[swing] - _side(swing) * ZMP_INSET * left
         self._opening_zmp = swing_inset
+        stance_z = None
+        if self.terrain_active:
+            self._initial_z = np.asarray(self._feet_z, dtype=float).reshape(2).copy()
+            stance_z = float(self._initial_z[stance])
+        self._landing_override = None
         self._steps = {
             0: Footstep(
                 leg=stance, pos=feet_xy[stance].copy(), yaw=yaw,
-                frozen=True, initial=True,
+                frozen=True, initial=True, z=stance_z,
             ),
             1: Footstep(
-                leg=stance, pos=feet_xy[stance].copy(), yaw=yaw, frozen=True,
+                leg=stance, pos=feet_xy[stance].copy(), yaw=yaw, frozen=True, z=stance_z,
             ),
         }
         self._first_leg = stance
@@ -1776,7 +2486,7 @@ class GaitScheduler:
         feet = np.asarray(feet, dtype=float).reshape(2, 3)
         mask = np.asarray(measured_mask, dtype=bool).reshape(-1)
         for leg, rows in ((0, slice(0, 4)), (1, slice(4, 8))):
-            if float(feet[leg, 2] - ground_z) > TOUCHDOWN_HEIGHT:
+            if float(feet[leg, 2] - self._leg_ground(leg, ground_z)) > TOUCHDOWN_HEIGHT:
                 return False
             if mask.size >= 8 and not mask[rows].any():
                 return False
@@ -1829,11 +2539,22 @@ class GaitScheduler:
         foot_yaws: np.ndarray | None = None,
         L_meas: np.ndarray | None = None,
         pelvis_xy: np.ndarray | None = None,
+        support_z: np.ndarray | None = None,
     ) -> GaitOutput:
+        """One gait tick.
+
+        ``support_z`` is the controller's per-leg ground height under each
+        planted foot. It is read only while the terrain belief is active.
+        """
         com_xy = np.asarray(com[:2], dtype=float)
         com_vel_xy = np.asarray(com_vel[:2], dtype=float)
         feet = np.asarray(foot_centers, dtype=float).reshape(2, 3)
         feet_xy = feet[:, :2]
+        self._floor_z = float(ground_z)
+        self._feet_z = feet[:, 2].copy()
+        self._com_meas = com_xy.copy()
+        self._com_vel_meas = com_vel_xy.copy()
+        self._leg_ref = None if support_z is None else np.asarray(support_z, dtype=float).reshape(2)
         if foot_yaws is None:
             yaws = np.zeros(2)
         else:
@@ -1853,11 +2574,13 @@ class GaitScheduler:
             return self._stand_output(measured_mask, feet_xy)
 
         if not self._active:
+            self._feet_z = feet[:, 2].copy() if self._leg_ref is None else self._leg_ref.copy()
             self._begin(feet_xy=feet_xy, com_xy=com_xy, foot_yaws=yaws)
 
         t_step, t_swing, t_ds = self._durations()
         speed = self._velocity_command(dt)
         omega = self._omega(height)
+        self._omega_last, self._dt_last = omega, float(dt)
 
         # -- advance the clock ---------------------------------------------
         # The Bézier is scheduled to arrive at T_step, but the plant does not
@@ -1868,6 +2591,9 @@ class GaitScheduler:
         # commits once a *real* swing has seated, so a late Bézier does not
         # keep dragging a planted foot.
         span = self._current_duration(t_step)
+        if self.terrain_active:
+            t_swing = self._swing_span(self._step)
+            t_ds = self._ds_span(self._step)
         # A saturated capture correction means the next step is late. Advance
         # the swing clock up to 1.5×, but never below a 0.2 s swing. With step
         # timing on, the QP's rates replace that speed-up.
@@ -1876,6 +2602,8 @@ class GaitScheduler:
             clock *= self._ds_rate if self._tau < t_ds else self._swing_rate
         elif self._capture_hot and t_swing > 0.20:
             clock *= min(1.5, t_swing / 0.20)
+        if self._hold_for_stair_liftoff(com_xy, com_vel_xy, omega, t_ds, clock, dt):
+            clock = 0.0
         self._tau += clock
         if (
             self._swing_cleared
@@ -1892,11 +2620,12 @@ class GaitScheduler:
                 if support is None or support.initial
                 else self._swing_foot_down(feet, ground_z, measured_mask)
             )
+            hold_cap = TERRAIN_TOUCHDOWN_HOLD if self.terrain_active else MAX_TOUCHDOWN_HOLD
             waiting = (
                 support is not None
                 and not support.initial
                 and not foot_down
-                and self._touchdown_hold < MAX_TOUCHDOWN_HOLD
+                and self._touchdown_hold < hold_cap
             )
             if waiting:
                 self._tau = span
@@ -1946,7 +2675,24 @@ class GaitScheduler:
                         if support.nominal is not None:
                             support.correction = support.pos - support.nominal
                         support.yaw = float(yaws[support.leg])
+                        if self.terrain_active and not foot_down:
+                            # The hold timed out with the foot in the air; its
+                            # ground estimate is still the tread it left.
+                            if support.planned_z is not None:
+                                support.z = float(support.planned_z)
+                        elif self.terrain_active:
+                            # The tread is where the sole came to rest.
+                            support.z = float(self._leg_ground(support.leg, feet[support.leg, 2]))
+                            self.touchdowns.append({
+                                "leg": int(support.leg),
+                                "xy": [float(v) for v in support.pos],
+                                "yaw": float(support.yaw),
+                                "believed_z": None if support.planned_z is None else float(support.planned_z),
+                                "measured_z": float(support.z),
+                                "step": int(self._step),
+                            })
                     support.frozen = True
+                self._landing_override = None
                 self._swing = SwingState()
                 self._ds_rate = 1.0
                 self._swing_rate = 1.0
@@ -1968,6 +2714,9 @@ class GaitScheduler:
             return self._stand_output(measured_mask, feet_xy)
 
         self.policy.refresh_plan(self, t_step=t_step, speed=speed)
+        if self.terrain_active:
+            t_swing = self._swing_span(self._step)
+            t_ds = self._ds_span(self._step)
 
         # -- swing window ---------------------------------------------------
         support = self._steps[self._step]
@@ -1996,6 +2745,11 @@ class GaitScheduler:
             t_ds=t_ds,
             omega=omega,
         )
+        quasi_static = self._stair_step_now()
+        if quasi_static:
+            ref, vel = self._quasi_static_reference(t_ds=t_ds)
+            self._com_ref = ref.copy()
+            com_ref_xy, com_vel_ref, dcm_ref = self._com_ref_output(com_xy), vel, ref
         self._com_vel_ref = np.asarray(com_vel_ref, dtype=float).reshape(2)
         self._dcm_ref = np.asarray(dcm_ref, dtype=float).reshape(2)
 
@@ -2016,23 +2770,44 @@ class GaitScheduler:
                     start_yaw=float(yaws[leg]),
                 )
                 self._swing_cleared = False
-            if float(feet[leg, 2] - ground_z) > SWING_CLEARED_HEIGHT:
+                landing.stair_locked = True
+            lift_base = float(self._swing.start[2]) if self.terrain_active else ground_z
+            if float(feet[leg, 2] - lift_base) > SWING_CLEARED_HEIGHT:
                 self._swing_cleared = True
-            foothold = np.array([landing.pos[0], landing.pos[1], ground_z])
+            foothold = np.array([landing.pos[0], landing.pos[1], self._landing_z(ground_z)])
             clock = 1.0
             if STEP_TIMING:
                 clock = self._swing_rate
             elif self._capture_hot and t_swing > 0.20:
                 clock = min(1.5, t_swing / 0.20)
-            des_pos, des_vel_s, des_acc_s = swing_reference(
-                self._swing.start,
-                foothold,
-                s,
-                swing_height=float(
-                    self._swing_height if self._latch_valid else self.config.swing_height
-                ),
-                t_swing=t_swing / clock,
+            clearance = float(
+                self._swing_height if self._latch_valid else self.config.swing_height
             )
+            stair_arc = (
+                self.terrain_active
+                and abs(float(foothold[2]) - float(self._swing.start[2])) >= STAIR_STEP_DZ
+            )
+            if stair_arc:
+                des_pos, des_vel_s, des_acc_s = stair_swing_reference(
+                    self._swing.start,
+                    foothold,
+                    s,
+                    clearance=max(clearance, STAIR_CLEARANCE),
+                )
+            else:
+                des_pos, des_vel_s, des_acc_s = swing_reference(
+                    self._swing.start,
+                    foothold,
+                    s,
+                    swing_height=clearance,
+                    t_swing=t_swing / clock,
+                )
+            if self.terrain_active and self._touchdown_hold > 0.0:
+                # The tread is lower than believed: keep reaching down for it.
+                des_pos = des_pos.copy()
+                des_pos[2] -= min(REACH_DOWN_SPEED * self._touchdown_hold, REACH_DOWN_MAX)
+                des_vel_s = des_vel_s.copy()
+                des_vel_s[2] = 0.0
             span_swing = max(t_swing / clock, 1e-3) if STEP_TIMING else max(t_swing, 1e-3)
             shape_d = 6.0 * s * (1.0 - s)
             dyaw = wrap_angle(float(landing.yaw) - float(self._swing.start_yaw))
@@ -2053,6 +2828,9 @@ class GaitScheduler:
             self._swing = SwingState(active=False)
 
         yaw_ref, yaw_rate = self._yaw_now(t_step)
+        support_z, support_vz = (None, 0.0)
+        if self.terrain_active:
+            support_z, support_vz = self._support_height_ref()
         return GaitOutput(
             contact_mask=mask,
             com_ref_xy=np.asarray(com_ref_xy, dtype=float).reshape(2),
@@ -2066,6 +2844,13 @@ class GaitScheduler:
             yaw_ref=yaw_ref,
             yaw_rate_ref=yaw_rate,
             stance_yaw=float(support.yaw),
+            support_z=support_z,
+            support_vz=float(support_vz),
+            support_leg=int(support.leg),
+            terrain_ahead=self._terrain_ahead(),
+            stair_step=quasi_static,
+            stair_transfer=self._stair_transfer_now(),
+            ascent_ahead=self._ascent_ahead(),
         )
 
     # -- MPC preview -------------------------------------------------------
@@ -2079,6 +2864,8 @@ class GaitScheduler:
         ahead, which spans most of a step, so replicating the *current*
         contact set across the horizon misstates who is touching the ground.
         """
+        if self.terrain_active:
+            return self._preview_terrain(horizon=horizon, dt=dt)
         contact = np.ones((horizon, 2), dtype=bool)
         foot_pose = np.zeros((horizon, 2, 3))
         foot_yaw = np.zeros((horizon, 2))
@@ -2156,4 +2943,99 @@ class GaitScheduler:
                 # Double support: the swing leg is still on its last foothold.
                 foot_pose[k, swing_leg, :2] = previous.pos
                 foot_yaw[k, swing_leg] = previous.yaw
+        return contact, foot_pose, foot_yaw
+
+    def _preview_terrain(self, *, horizon: int, dt: float):
+        """:meth:`preview` on terrain: absolute foot heights, per-step durations.
+
+        ``foot_pose[..., 2]`` is the world height of the sole, not clearance.
+        """
+        contact = np.ones((horizon, 2), dtype=bool)
+        foot_pose = np.zeros((horizon, 2, 3))
+        foot_yaw = np.zeros((horizon, 2))
+        clearance = float(self._swing_height if self._latch_valid else self.config.swing_height)
+        here = self._steps.get(self._step)
+        if not self._active or here is None or here.initial:
+            fallback = self._initial_feet if self._active else np.zeros((2, 2))
+            yaws = self._initial_yaws if self._active else np.zeros(2)
+            foot_pose[:, :, :2] = fallback
+            foot_pose[:, :, 2] = self._initial_z if self._active else self._feet_z
+            foot_yaw[:] = yaws
+            return contact, foot_pose, foot_yaw
+
+        def pose_of(step, leg):
+            out = np.zeros(3)
+            out[:2] = step.pos
+            out[2] = self._step_z(step, leg)
+            return out
+
+        holding_liftoff = (
+            self._liftoff_hold > 0.0
+            and self._liftoff_hold < STAIR_READY_HOLD
+            and self._tau >= self._ds_span(self._step) - 1e-5
+            and not self._swing.active
+        )
+        for k in range(horizon):
+            if self._touchdown_hold > 0.0:
+                ahead = (self._current_duration(0.0) - 1e-6) + k * dt
+            elif holding_liftoff:
+                # The clock is held at the end of double support until the
+                # CoM is over the stance sole; plan for both feet down.
+                ahead = self._tau
+            else:
+                ahead = self._tau + (k + 1) * dt
+            index = self._step
+            span = self._step_span(index)
+            guard = 0
+            while ahead >= span and guard < PLAN_HORIZON:
+                ahead -= span
+                index += 1
+                span = self._step_span(index)
+                guard += 1
+            tau = ahead
+            support = self._steps.get(index)
+            landing = self._steps.get(index + 1)
+            previous = self._steps.get(index - 1)
+            if support is None or landing is None:
+                if k:
+                    foot_pose[k] = foot_pose[k - 1]
+                    foot_yaw[k] = foot_yaw[k - 1]
+                continue
+            if support.initial:
+                foot_pose[k, :, :2] = self._initial_feet
+                foot_pose[k, :, 2] = self._initial_z
+                foot_yaw[k] = self._initial_yaws
+                continue
+            swing_leg = landing.leg
+            foot_pose[k, support.leg] = pose_of(support, support.leg)
+            foot_yaw[k, support.leg] = support.yaw
+            t_ds = self._ds_span(index)
+            t_swing = max(span - t_ds, 0.0)
+            if previous is None or previous.initial:
+                start = np.zeros(3)
+                start[:2] = self._initial_feet[swing_leg]
+                start[2] = self._initial_z[swing_leg]
+                start_yaw = float(self._initial_yaws[swing_leg])
+            else:
+                start = pose_of(previous, swing_leg)
+                start_yaw = float(previous.yaw)
+            if tau >= t_ds and t_swing > 1e-6:
+                contact[k, swing_leg] = False
+                s = float(np.clip((tau - t_ds) / t_swing, 0.0, 1.0))
+                end = pose_of(landing, swing_leg)
+                if index == self._step:
+                    end[2] = self._landing_z(self._floor_z)
+                if abs(end[2] - start[2]) >= STAIR_STEP_DZ:
+                    pos, _, _ = stair_swing_reference(
+                        start, end, s, clearance=max(clearance, STAIR_CLEARANCE)
+                    )
+                else:
+                    pos, _, _ = swing_reference(start, end, s, swing_height=clearance)
+                foot_pose[k, swing_leg] = pos
+                foot_yaw[k, swing_leg] = start_yaw + wrap_angle(
+                    float(landing.yaw) - start_yaw
+                ) * s * s * (3.0 - 2.0 * s)
+            else:
+                foot_pose[k, swing_leg] = start
+                foot_yaw[k, swing_leg] = start_yaw
         return contact, foot_pose, foot_yaw

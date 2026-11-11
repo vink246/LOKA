@@ -290,7 +290,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="NAME",
         help="Place a saved prop layout at startup: a name in loka/config/scenes/ "
-        "(e.g. obstacle_course) or a path to a scene .yaml. Combines with --props",
+        "(e.g. obstacle_course) or a path to a scene .yaml. Combines with --props. "
+        "A scene's terrain (stairs_regular, stairs_irregular, curb) is built into the plant",
+    )
+    parser.add_argument(
+        "--riser",
+        type=float,
+        default=None,
+        help="Override the riser height [m] of every flight in the --scene terrain",
+    )
+    parser.add_argument(
+        "--terrain-belief",
+        choices=("empty", "oracle"),
+        default="empty",
+        help="Controller's starting terrain belief: empty (LOKA must declare the stairs) "
+        "or oracle (the plant's own stairs, the controller-only bench)",
+    )
+    parser.add_argument(
+        "--terrain-stack",
+        choices=("classical", "heuristic"),
+        default=None,
+        help="Terrain-mode controller variant (loka.control.terrain.TERRAIN_STACK); "
+        "defaults to the module setting (classical). See docs/LOKA.md Section 4.9.",
     )
     parser.add_argument(
         "--no-props",
@@ -683,6 +704,19 @@ def _make_key_callback(runtime: LokaRuntime):
     return key_callback
 
 
+def _scene_terrain(args):
+    """Stairs from the --scene file, built into the plant (props are spawned later)."""
+    if not args.scene:
+        return None
+    from loka.scene_props import load_scene_terrain
+
+    terrain = load_scene_terrain(args.scene)
+    if args.riser is not None:
+        for flight in terrain:
+            flight["riser"] = float(args.riser)
+    return terrain or None
+
+
 def _install_local_orchestrator(args: argparse.Namespace) -> str | None:
     """Route orchestrator turns to a local VLM. Returns its label, or None for OpenAI.
 
@@ -765,6 +799,10 @@ def main(argv: list[str] | None = None) -> int:
     llm_enabled = not args.no_llm
     config = LocomotionConfig.from_yaml(args.config) if args.config else LocomotionConfig()
     apply_stack_arg(config, args)
+    if args.terrain_stack:
+        from loka.control import terrain
+
+        terrain.TERRAIN_STACK = args.terrain_stack
     settings = loka_config()
     vision_cfg = settings.get("vision") or {}
     navila_cfg_raw = dict(settings.get("navila") or {})
@@ -780,6 +818,7 @@ def main(argv: list[str] | None = None) -> int:
         "props": None if args.no_props else dict(prop_cfg.get("slots") or {}),
         "static_props": tuple(prop_cfg.get("static") or ()),
         "camera": camera.recipe() if need_camera else None,
+        "terrain": _scene_terrain(args),
     }
     if args.navila:
         from loka.vla.navila import (
@@ -869,6 +908,7 @@ def main(argv: list[str] | None = None) -> int:
                 **memory,
                 enable_vision=vision,
                 vision=camera,
+                terrain_belief=args.terrain_belief,
                 enable_session_log=not args.no_log,
                 log_path=log_path,
                 print_compressor=not args.quiet_compressor,

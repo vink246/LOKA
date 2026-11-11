@@ -43,6 +43,21 @@ effort_bias:
   clear_below_s: 0.5
   stand_on_fault: true
 
+# Terrain belief. Footfalls are measured from leg kinematics and the
+# joint-torque foot-load estimate; no foot force sensing is assumed.
+# A footfall on a believed volume at a different height is refined in place
+# (the volume's top moves to the measured height, and the rest of a declared
+# flight moves with it). A footfall the belief cannot explain, an early
+# contact over believed floor, or a swing blocked mid-air opens a failure
+# episode for the orchestrator. fault_on_refined also opens one when a
+# refinement moves a volume by more than refine_fault_m.
+# fault_cooldown_s keeps one stumble from opening several episodes.
+terrain:
+  belief: empty            # empty | oracle (the plant's own stairs; bench only)
+  fault_on_refined: false
+  refine_fault_m: 0.05
+  fault_cooldown_s: 3.0
+
 # cooldown_s starts when an orchestrator edit is applied. No LLM call
 # (effort episode, listener, heartbeat, or operator) is sent during it.
 # max_turns is how many orchestrator turns one failure episode may use

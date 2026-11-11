@@ -96,7 +96,8 @@ def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) ->
             f"{spec.pitch_down_deg:.0f} deg down, horizontal FOV {spec.fovx_deg:.0f} deg, "
             f"about {h:.2f} m above the floor. The image's left is the robot's left. Horizon "
             f"near row {horizon:.0f}; floor distance ahead by image row: {', '.join(ranges)}.{floor}",
-            "The plant does not see obstacles: route around them with waypoints.",
+            "The plant does not see obstacles: route around them with waypoints. Stairs and "
+            "curbs are terrain: declare them with a stairs Model_Mutation and set the goal on top.",
         ]
     )
 
@@ -185,7 +186,15 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "after_s listener (2 to 4 s) or a near_xy listener short of them to look again.",
         "- The frame was taken when the message was sent; the robot keeps moving during your "
         "reply, so allow for the distance covered at the current speed.",
-        "- Do not plan to step onto any object: the footstep planner assumes flat ground.",
+        "- Stairs, curbs and platforms are terrain, not obstacles: declare them with a stairs "
+        "or volume Model_Mutation before the walk reaches them, and put the goal on top. The "
+        "foot of the first riser is where the bottom step meets the floor: use the floor "
+        "formulas above on its lowest visible row. A point on a raised surface of height t "
+        "projects with h - t in place of h, so the nosing of step k (top at k x riser) gives "
+        "its distance from its image row once you assume a riser. Count the treads; a typical "
+        "riser is 0.10 to 0.18 m and a tread 0.25 to 0.32 m. Rough numbers are enough: the "
+        "robot measures every tread it steps on and corrects the belief.",
+        "- Do not plan to step onto movable objects: route around them.",
         "- The robot has no touch sensing. Pressing on an object also raises |bias|; that is an "
         "external load, not a model error. If |bias| rises while the frame shows the robot "
         "against an object, back off or steer around before queueing any belief search.",

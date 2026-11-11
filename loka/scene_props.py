@@ -15,6 +15,11 @@ have no joint; placing one edits ``model.body_pos``.
 
 Only the plant gets this. The controller's belief model is loaded from the
 plain MJCF in :class:`loka.control.robot.G1Model` and never sees a prop.
+
+Terrain (stairs) is static geometry fixed at build time, one body per flight
+with a box per step. It is built from :func:`loka.control.terrain.stairs_volumes`,
+the same boxes an oracle terrain belief holds. It is not a prop slot: it is
+never parked, moved or reported as an object.
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ import numpy as np
 
 PROPS_DIR = Path(__file__).resolve().parents[1] / "models" / "props"
 PROP_KINDS = ("chair", "table", "box", "cube", "shelf")
+TERRAIN_KINDS = ("stairs",)
+#: Tread and riser friction, the floor's nominal.
+TERRAIN_FRICTION = (1.0, 0.02, 0.001)
+TERRAIN_RGBA = (0.62, 0.58, 0.52, 1.0)
 #: Named prop layouts for ``run_loka --scene`` and ``scene save/load``.
 SCENES_DIR = Path(__file__).resolve().parent / "config" / "scenes"
 DEFAULT_STATIC_KINDS = ("shelf",)
@@ -161,11 +170,29 @@ def _add_prop_geom(body, kind: str, slot: str, attrs: dict[str, str]) -> None:
 # -- plant model --------------------------------------------------------------
 
 
+def normalize_terrain(terrain) -> list[dict]:
+    """Validated copies of terrain specs, each with a unique ``name``."""
+    out = []
+    for i, raw in enumerate(terrain or []):
+        spec = dict(raw)
+        kind = str(spec.get("kind", "stairs")).strip().lower()
+        if kind not in TERRAIN_KINDS:
+            raise ValueError(f"unknown terrain kind {kind!r}; known: {', '.join(TERRAIN_KINDS)}")
+        spec["kind"] = kind
+        spec.setdefault("name", f"{kind}_{i}")
+        out.append(spec)
+    names = [spec["name"] for spec in out]
+    if len(set(names)) != len(names):
+        raise ValueError(f"terrain names must be unique: {names}")
+    return out
+
+
 def plant_recipe(
     model_path: str | Path,
     prop_slots: dict[str, int] | None = None,
     static_kinds=DEFAULT_STATIC_KINDS,
     camera: dict | None = None,
+    terrain=None,
 ) -> dict:
     """Everything needed to rebuild the identical plant in another process."""
     slots = {str(k): int(v) for k, v in (prop_slots or {}).items() if int(v) > 0}
@@ -177,11 +204,14 @@ def plant_recipe(
         "prop_slots": slots,
         "static_kinds": [str(k) for k in static_kinds],
         "camera": dict(camera) if camera else None,
+        "terrain": normalize_terrain(terrain),
     }
 
 
 def recipe_is_plain(recipe: dict | None) -> bool:
-    return not recipe or (not recipe.get("prop_slots") and not recipe.get("camera"))
+    return not recipe or (
+        not recipe.get("prop_slots") and not recipe.get("camera") and not recipe.get("terrain")
+    )
 
 
 @dataclass
@@ -204,6 +234,9 @@ class PropLayout:
     robot_nq: int = 0
     robot_nv: int = 0
     robot_root: int = -1
+    #: Terrain body id -> flight name, and the specs it was built from.
+    terrain_bodies: dict[int, str] = field(default_factory=dict)
+    terrain: list[dict] = field(default_factory=list)
 
     def by_name(self, name: str) -> PropSlot | None:
         for slot in self.slots:
@@ -212,7 +245,13 @@ class PropLayout:
         return None
 
 
-def _layout(model, names: list[tuple[str, str, bool, tuple]]) -> PropLayout:
+def _layout(model, names: list[tuple[str, str, bool, tuple]], terrain=None) -> PropLayout:
+    terrain = list(terrain or [])
+    terrain_bodies = {}
+    for spec in terrain:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, spec["name"])
+        if body_id >= 0:
+            terrain_bodies[int(body_id)] = spec["name"]
     slots = []
     for name, kind, static, park in names:
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
@@ -235,7 +274,30 @@ def _layout(model, names: list[tuple[str, str, bool, tuple]]) -> PropLayout:
     robot_nv = min((s.dof_adr for s in dynamic), default=int(model.nv))
     pelvis = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
     root = int(model.body_rootid[pelvis]) if pelvis >= 0 else -1
-    return PropLayout(slots, int(robot_nq), int(robot_nv), root)
+    return PropLayout(slots, int(robot_nq), int(robot_nv), root, terrain_bodies, terrain)
+
+
+def add_stairs(spec, flight: dict) -> None:
+    """One static body of box geoms for a flight of stairs.
+
+    Each step is a solid block from the floor to its tread, so a riser is
+    the front face of the block above it. Geoms are ``<name>/step_<k>``.
+    """
+    from loka.control.terrain import stairs_volumes
+
+    body = spec.worldbody.add_body()
+    body.name = flight["name"]
+    for vol in stairs_volumes(flight):
+        geom = body.add_geom()
+        geom.name = f"{flight['name']}/step_{vol.index}"
+        geom.type = mujoco.mjtGeom.mjGEOM_BOX
+        geom.size = [0.5 * float(vol.size[0]), 0.5 * float(vol.size[1]), 0.5 * vol.top]
+        geom.pos = [float(vol.center[0]), float(vol.center[1]), 0.5 * vol.top]
+        geom.quat = list(yaw_quat(vol.yaw))
+        geom.friction = list(TERRAIN_FRICTION)
+        geom.rgba = list(TERRAIN_RGBA)
+        # Wins the friction mix against the feet, as the floor does.
+        geom.priority = 1
 
 
 def build_plant_model(recipe: dict):
@@ -277,12 +339,15 @@ def build_plant_model(recipe: dict):
                 _add_prop_geom(body, kind, name, attrs)
             names.append((name, kind, static, park))
             index += 1
+    terrain = list(recipe.get("terrain") or [])
+    for flight in terrain:
+        add_stairs(spec, flight)
     for key in spec.key:
         key.qpos = list(key.qpos) + park_qpos
     model = spec.compile()
     if camera is not None:
         fit_offscreen_buffer(model, camera)
-    return model, _layout(model, names)
+    return model, _layout(model, names, terrain)
 
 
 def yaw_quat(yaw: float) -> np.ndarray:
@@ -556,6 +621,22 @@ def load_scene(name: str | Path) -> list[tuple[str, float, float, float]]:
             raise ValueError(f"{path}: unknown prop kind {kind!r}; known: {', '.join(PROP_KINDS)}")
         out.append((kind, float(item["x"]), float(item["y"]), float(item.get("yaw", 0.0))))
     return out
+
+
+def load_scene_terrain(name: str | Path) -> list[dict]:
+    """The ``terrain:`` list of a scene file; empty when it has none.
+
+    Terrain is built into the plant, so it has to be known before the
+    simulation exists, unlike props, which are spawned into slots later.
+    """
+    import yaml
+
+    path = scene_path(name)
+    if not path.is_file():
+        known = ", ".join(list_scenes()) or "none"
+        raise ValueError(f"no scene {str(name)!r} ({path}); saved scenes: {known}")
+    data = yaml.safe_load(path.read_text()) or {}
+    return normalize_terrain(data.get("terrain") or [])
 
 
 def save_scene(name: str | Path, placed, description: str = "") -> Path:

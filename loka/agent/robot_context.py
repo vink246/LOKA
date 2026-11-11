@@ -94,11 +94,17 @@ def _lookup_nominal(loka_state, mutation):
 
 def format_current_model_belief(loka_state):
     """Summarize LOKA's active internal-model mutations (no diagnosis history)."""
+    from loka.agent.terrain_state import format_terrain_belief
+
     mutations = loka_state.get("mutations", [])
     nominal_params = loka_state.get("nominal_params", {})
+    terrain = format_terrain_belief(loka_state)
 
     if not mutations:
-        return "No active mutations. Internal model matches nominal MJCF."
+        robot = "No active mutations. Internal model matches nominal MJCF."
+        if terrain:
+            return robot + "\n" + terrain
+        return robot + "\nTerrain belief: flat floor, no volumes."
 
     latest = {}
     for mutation in mutations:
@@ -115,6 +121,7 @@ def format_current_model_belief(loka_state):
             f"{mutation['val']} (nominal: {nominal_val}{time_note})"
         )
 
+    lines.append(terrain if terrain else "Terrain belief: flat floor, no volumes.")
     return "\n".join(lines)
 
 

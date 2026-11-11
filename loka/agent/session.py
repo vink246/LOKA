@@ -179,6 +179,14 @@ def _message_text(message: dict) -> str:
     )
 
 
+TERRAIN_FAULT_TEXT = (
+    "A terrain event opened this episode: a foot met ground the terrain belief does not "
+    "have, or a swing was blocked (see TERRAIN). This is not a model-parameter error. "
+    "Declare the ground with a volume or stairs Model_Mutation (estimate it from the "
+    "camera frame if there is one, else from where the foot was stopped); the robot "
+    "measures the exact tread heights as it steps. Do not queue a belief search for it."
+)
+
 _STOOD_FOR_FAULT = (
     "The runtime already set gait.mode=stand and gait.speed=0 before this call. "
     "It does that whenever the effort bias crosses the threshold while the robot "
@@ -322,10 +330,13 @@ class FailureEpisode(ConversationMixin):
         just_stood: bool = False,
         max_turns: int | None = None,
         max_memory: int | None = None,
+        terrain: bool = False,
     ) -> str:
         objective = loka_state.get("primary_objective", "")
         recall = self.shows_prior_turns(max_memory)
         walking_note = self._gait_note(just_stood=just_stood, recall=recall)
+        if terrain:
+            walking_note = f"{TERRAIN_FAULT_TEXT}\n{walking_note}"
         if recall:
             situation = (
                 "The robot is still unstable after prior intervention(s). "
@@ -364,12 +375,18 @@ class FailureEpisode(ConversationMixin):
         just_stood: bool = False,
         max_turns: int | None = None,
         max_memory: int | None = None,
+        terrain: bool = False,
     ) -> str:
         objective = loka_state.get("primary_objective", "")
         walking_note = self._gait_note(just_stood=just_stood)
+        opening = (
+            f"{TERRAIN_FAULT_TEXT}\n"
+            if terrain
+            else "Initial instability detected. Queue Belief_Searches for the model mismatch.\n"
+        )
         return (
             f"--- FAILURE EPISODE (round 1, t={sim_time:.2f}s) ---\n"
-            "Initial instability detected. Queue Belief_Searches for the model mismatch.\n"
+            f"{opening}"
             f"{self._budget_note(max_turns)}"
             f"{walking_note}"
             f"Primary objective: {objective}\n\n"

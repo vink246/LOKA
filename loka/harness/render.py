@@ -39,6 +39,10 @@ def render_episode_dir(directory, *, recording, model_path: str) -> Path:
     if times.size == 0 or qpos.size == 0:
         raise ValueError(f"No frames in {blob_path}")
     out_path = directory / "episode.mp4"
+    terrain = None
+    meta_path = directory / "metadata.json"
+    if meta_path.is_file():
+        terrain = json.loads(meta_path.read_text(encoding="utf-8")).get("terrain") or None
     _spawn_render(
         model_path=model_path,
         times=times,
@@ -46,11 +50,12 @@ def render_episode_dir(directory, *, recording, model_path: str) -> Path:
         overlays=overlays,
         out_path=out_path,
         recording=recording,
+        terrain=terrain,
     )
     return out_path
 
 
-def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording) -> None:
+def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, terrain=None) -> None:
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
         frames_path = tmp.name
     np.savez_compressed(
@@ -70,6 +75,7 @@ def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording) -> 
         "elevation": float(recording.elevation),
         "distance": float(recording.distance),
         "min_push_visible_s": float(recording.min_push_visible_s),
+        "terrain": terrain,
     }
     # Spawn re-imports the main module, and that import pulls MuJoCo in,
     # before ``_render_worker`` runs. The GL backend is chosen on first
@@ -103,7 +109,12 @@ def _render_worker(job: dict) -> None:
         hide_foot_contact_markers,
     )
 
-    model = mujoco.MjModel.from_xml_path(job["model_path"])
+    if job.get("terrain"):
+        from loka.scene_props import build_plant_model, plant_recipe
+
+        model, _ = build_plant_model(plant_recipe(job["model_path"], terrain=job["terrain"]))
+    else:
+        model = mujoco.MjModel.from_xml_path(job["model_path"])
     hide_foot_contact_markers(model)
     data = mujoco.MjData(model)
     with np.load(job["frames_path"]) as blob:

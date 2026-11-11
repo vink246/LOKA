@@ -48,10 +48,13 @@ def build_describe_prompt(directive: str, spec, pose) -> str:
         "SCENE: <one sentence about the room and the floor>\n"
         "OBJECT: <name> | <left, ahead, or right>, about <degrees> degrees | about <metres> m away "
         "| blocks path: <yes or no>\n"
+        "STAIRS: <none, or: ahead/left/right, about <metres> m to the first riser, about <n> steps, "
+        "riser about <metres> m, tread about <metres> m>\n"
         "TARGET: <the object the task refers to and its direction, or none>\n"
         "Write one OBJECT line for every object you see, closest first. blocks path means it is "
-        "on or near the straight line ahead of the robot. If you are unsure of a distance, give "
-        "your best guess; the direction matters most."
+        "on or near the straight line ahead of the robot. Stairs, curbs and platforms go on the "
+        "STAIRS line, not as objects. If you are unsure of a distance, give your best guess; the "
+        "direction matters most."
     )
 
 

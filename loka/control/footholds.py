@@ -68,7 +68,10 @@ def _project_step(sched, pos: np.ndarray, s: float) -> np.ndarray:
     if target is None or support is None or support.initial:
         return pos
     if s > 0.45:
-        _, t_swing, _ = sched._durations()
+        if sched.terrain_active:
+            t_swing = float(sched._swing_span(sched._step))
+        else:
+            _, t_swing, _ = sched._durations()
         budget = SWING_CATCHUP_SPEED * max((1.0 - s) * t_swing, 1e-3)
         delta = pos - np.asarray(target.pos, dtype=float)
         norm = float(np.linalg.norm(delta))
@@ -182,6 +185,8 @@ class AlipStepFootholdPolicy:
         if s > float(np.clip(sched.config.foothold_retarget_s, 0.05, 0.95)):
             target.frozen = True
             return
+        if sched._stair_step_now():
+            return
         if in_swing and (
             getattr(sched, "_turning", False) or float(sched.config.mode) == MODE_TREAD
         ):
@@ -198,7 +203,11 @@ class AlipStepFootholdPolicy:
         # to pre-impact by the ALIP model. The reference and measurement
         # share the double-support transfer, so it cancels.
         tau = float(sched._tau)
-        t_ss = max(t_step - t_ds, 1e-3)
+        if sched.terrain_active:
+            # A stair swing is longer than the cadence's.
+            t_ss = max(float(sched._swing_span(sched._step)), 1e-3)
+        else:
+            t_ss = max(t_step - t_ds, 1e-3)
         mh = max(mass, 1e-3) * max(float(height), 0.05)
         ref_rel = np.asarray(sched._com_ref, dtype=float).reshape(2) - np.asarray(
             support.pos, dtype=float
@@ -234,6 +243,7 @@ class AlipStepFootholdPolicy:
         pos = _project_step(sched, pos, s)
         target.correction = pos - np.asarray(target.nominal, dtype=float)
         target.pos = pos
+        sched._clamp_target(target)
 
     def com_reference(self, sched, *, com, dt, height, t_step, t_ds, omega=None, **_ignored):
         # The convex MPC was tuned against the DCM CoM reference. ALIP only

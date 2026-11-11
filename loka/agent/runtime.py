@@ -24,6 +24,12 @@ from loka.agent.ablations import AblationSet
 from loka.agent.session import FailureEpisode, OperatorSession
 from loka.sim import Simulation
 from loka.agent.apply import apply_stand_scratchpad
+from loka.agent.terrain_refine import refine_from_touchdown
+from loka.agent.terrain_state import (
+    ensure_terrain_state,
+    seed_oracle_terrain,
+    sync_controller_terrain,
+)
 from loka.agent.compress import synthesize_stand_telemetry
 from loka.agent.loka_config import loka_config
 from loka.agent.directives import heartbeat_due, register_directive, take_fired
@@ -49,6 +55,7 @@ import mujoco
 _SESSION = loka_config()["session"]
 _BIAS = loka_config().get("effort_bias", {})
 _VISION = loka_config().get("vision", {}) or {}
+_TERRAIN = loka_config().get("terrain", {}) or {}
 
 MU_SLIDE_MPS = 0.05  # planted-site speed that counts as sliding
 MU_MIN_NORMAL_N = 20.0
@@ -120,6 +127,13 @@ class LokaConfig:
     llm_options: dict = field(default_factory=dict)
     #: Components switched off for an ablation run. Empty is the full system.
     ablations: AblationSet = field(default_factory=AblationSet)
+    #: Initial terrain belief: ``empty`` or ``oracle`` (the plant's own stairs).
+    terrain_belief: str = str(_TERRAIN.get("belief", "empty"))
+    #: Fold measured footfalls into believed volumes. Off is the no-refine ablation.
+    terrain_refine: bool = True
+    terrain_fault_on_refined: bool = bool(_TERRAIN.get("fault_on_refined", False))
+    terrain_refine_fault_m: float = float(_TERRAIN.get("refine_fault_m", 0.05))
+    terrain_fault_cooldown_s: float = float(_TERRAIN.get("fault_cooldown_s", 3.0))
 
 
 class LokaRuntime:
@@ -155,6 +169,7 @@ class LokaRuntime:
             "listeners": [],
             "plan": None,
         }
+        ensure_terrain_state(self.loka_state)
         self.compact = self.config.prompt_style == "compact"
         if self.compact:
             self.robot_context = build_compact_robot_context(self.controller.robot.model)
@@ -261,11 +276,127 @@ class LokaRuntime:
         self.mu_fault_window: list[float] = []
         self._foot_geom_leg = self._foot_geoms(self.sim.model)
         self._floor_geom = mujoco.mj_name2id(self.sim.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        #: Recent terrain events (touchdowns, early contacts, obstructions), sim-timed.
+        self.terrain_log: deque = deque(maxlen=40)
+        self._terrain_fault: dict | None = None
+        self._last_terrain_fault_t = -1e9
+        self.seed_terrain_belief(self.config.terrain_belief)
         self._mu_capped = False
         self._base_friction_mu = (
             float(self.controller.config.mpc.friction_mu),
             float(self.controller.config.wbc.friction_mu),
         )
+
+    def seed_terrain_belief(self, mode: str) -> int:
+        """Start from an ``empty`` terrain belief or the plant's own (``oracle``)."""
+        mode = str(mode or "empty").strip().lower()
+        if mode == "oracle":
+            count = seed_oracle_terrain(self.loka_state, getattr(self.sim, "terrain_specs", []))
+        elif mode in ("empty", "llm"):
+            count = seed_oracle_terrain(self.loka_state, [])
+        else:
+            raise ValueError(f"terrain_belief must be empty, oracle or llm, got {mode!r}")
+        sync_controller_terrain(self.controller, self.loka_state)
+        return count
+
+    def _process_terrain_events(self, now: float) -> None:
+        """Drain the controller's terrain events: refine the belief or raise a fault.
+
+        A touchdown on a believed volume is measured into it (the robot
+        decides the number). Load where the belief has only floor, or a swing
+        blocked mid-air, is terrain the orchestrator has to declare.
+        """
+        events = getattr(self.controller, "terrain_events", None)
+        if not events:
+            return
+        drained = list(events)
+        events.clear()
+        floor = float(getattr(self.controller, "_ground_height", 0.0))
+        for event in drained:
+            record = {**event, "sim_t": now}
+            self.terrain_log.append(record)
+            kind = event.get("kind")
+            if kind == "touchdown":
+                if not self.config.terrain_refine or event.get("believed_z") is None:
+                    continue
+                result = refine_from_touchdown(self.loka_state, event, floor_z=floor)
+                record["refine"] = result.kind
+                if result.kind == "refined":
+                    print(f"[LOKA] {result.note} at t={now:.2f}s")
+                    self.note_search_result(result.note)
+                    if self.log is not None:
+                        self.log.note(result.note, sim_time=now)
+                    if (
+                        self.config.terrain_fault_on_refined
+                        and abs(result.error_m) > self.config.terrain_refine_fault_m
+                    ):
+                        self._raise_terrain_fault(record, now, result.note)
+                elif result.kind == "unexplained":
+                    self._raise_terrain_fault(record, now, result.note)
+            elif kind == "early_contact":
+                belief_has = self.controller.terrain.volume_at(event["xy"]) is not None
+                if not belief_has:
+                    self._raise_terrain_fault(
+                        record,
+                        now,
+                        f"swing foot met ground at z={event['measured_z']:.3f} m, "
+                        f"{event['measured_z'] - event['believed_z']:+.3f} m above where it was "
+                        f"expected, at ({event['xy'][0]:+.2f}, {event['xy'][1]:+.2f}); "
+                        "the belief has only floor there",
+                    )
+            elif kind == "swing_obstructed":
+                load = np.asarray(event["load_n"], dtype=float)
+                self._raise_terrain_fault(
+                    record,
+                    now,
+                    f"swing foot blocked at {event['s']:.0%} of its swing, sole at "
+                    f"z={event['foot_z']:.3f} m, ({event['xy'][0]:+.2f}, {event['xy'][1]:+.2f}); "
+                    f"load on the foot {np.linalg.norm(load):.0f} N "
+                    f"(x {load[0]:+.0f}, y {load[1]:+.0f}, z {load[2]:+.0f})",
+                )
+
+    def _raise_terrain_fault(self, record: dict, now: float, note: str) -> None:
+        if now - self._last_terrain_fault_t < float(self.config.terrain_fault_cooldown_s):
+            return
+        self._last_terrain_fault_t = now
+        record["note"] = note
+        self._terrain_fault = record
+        print(f"[LOKA] terrain fault at t={now:.2f}s: {note}")
+        if self.log is not None:
+            self.log.note(f"terrain fault: {note}", sim_time=now)
+
+    def _terrain_frame(self) -> dict:
+        """Terrain state for the compressor: belief under the feet and recent events."""
+        ctrl = self.controller
+        feet = ctrl.robot.foot_center_positions()
+        floor = float(getattr(ctrl, "_ground_height", 0.0))
+        terrain = ctrl.terrain
+        believed = [
+            terrain.support_height(feet[leg, :2], float(ctrl.robot.foot_yaws()[leg]), floor=floor)
+            for leg in (0, 1)
+        ]
+        ahead = []
+        gait = ctrl.gait
+        steps = getattr(gait, "_steps", {}) or {}
+        for index in range(gait.step_index + 1, gait.step_index + 4):
+            step = steps.get(index)
+            if step is not None and step.leg >= 0:
+                ahead.append({
+                    "leg": int(step.leg),
+                    "xy": [float(v) for v in step.pos],
+                    "z": None if step.z is None else float(step.z),
+                })
+        return {
+            "active": bool(terrain.active),
+            "volumes": len(terrain.volumes),
+            "feet": [[float(v) for v in feet[leg]] for leg in (0, 1)],
+            "leg_z": [float(v) for v in getattr(ctrl, "_leg_z", np.zeros(2))],
+            "believed_z": [float(v) for v in believed],
+            "load_n": [[float(v) for v in row] for row in getattr(ctrl, "foot_load", np.zeros((2, 3)))],
+            "footholds": ahead,
+            "events": list(self.terrain_log)[-6:],
+            "fault": self._terrain_fault,
+        }
 
     def note_search_result(self, line: str) -> None:
         """Attach a finished search to the fix the next orchestrator turn reads."""
@@ -357,6 +488,7 @@ class LokaRuntime:
             "trigger_value": self.effort_observer.trigger_value,
             "trigger_threshold": self.effort_observer.trigger_threshold,
             "belief_search_busy": self.belief_search.busy,
+            "terrain": self._terrain_frame(),
             **self._detector_sample,
         }
 
@@ -995,6 +1127,7 @@ class LokaRuntime:
         )
         self._refresh_belief_mass()
         self._refresh_belief_friction()
+        sync_controller_terrain(self.controller, self.loka_state)
 
         self._control_step()
         self.belief_search.tick()
@@ -1009,6 +1142,9 @@ class LokaRuntime:
         )
 
         now = frame["time"]
+        self._process_terrain_events(float(now))
+        if self._terrain_fault is not None:
+            frame["terrain"]["fault"] = self._terrain_fault
         self._push_recent(frame)
 
         # Operator directives are locked text. They do not replace the charter.
@@ -1063,13 +1199,17 @@ class LokaRuntime:
                 return frame
 
         obs = self.effort_observer
-        effort_fault = obs.consecutive_out_of_bounds >= obs.consecutive_steps
+        terrain_fault = self._terrain_fault is not None
+        effort_fault = obs.consecutive_out_of_bounds >= obs.consecutive_steps or terrain_fault
         if obs.consecutive_out_of_bounds == obs.consecutive_steps:
             self.mu_fault_window = list(self._mu_samples)
         recovered = (obs.consecutive_in_bounds * obs.dt) > obs.clear_below_s
         just_stood = False
         if effort_fault and self.config.enable_llm and self.config.stand_on_fault:
             just_stood = self._stand_for_walking_bias(now, frame)
+        if terrain_fault and not self.config.enable_llm:
+            # Nothing will read it; a stale fault would hold the episode open.
+            self._terrain_fault = None
         if (
             effort_fault
             and self.config.enable_llm
@@ -1098,6 +1238,7 @@ class LokaRuntime:
                     print(f"[LOKA] {note} at t={now:.2f}s")
                     if self.log is not None:
                         self.log.note(note, sim_time=now)
+                self._terrain_fault = None
             else:
                 telemetry = self._telemetry_for(frame)
                 cfg_text = self._config_text()
@@ -1110,6 +1251,7 @@ class LokaRuntime:
                         just_stood=just_stood,
                         max_turns=self.config.max_turns,
                         max_memory=self.config.max_memory,
+                        terrain=terrain_fault,
                     )
                 else:
                     user = self.failure_episode.build_user_turn(
@@ -1120,9 +1262,13 @@ class LokaRuntime:
                         just_stood=just_stood,
                         max_turns=self.config.max_turns,
                         max_memory=self.config.max_memory,
+                        terrain=terrain_fault,
                     )
-                if self._dispatch(self.failure_episode, user, reason="effort_bias"):
+                reason = "terrain" if terrain_fault else "effort_bias"
+                if self._dispatch(self.failure_episode, user, reason=reason):
                     self.failure_episode.turns_sent += 1
+                    # The event is in this turn's TERRAIN section; one turn per event.
+                    self._terrain_fault = None
         elif recovered and not self.belief_search.busy:
             if self.failure_episode is not None and not self.llm_busy:
                 print(f"[LOKA] failure episode closed at t={now:.2f}s")

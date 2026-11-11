@@ -351,6 +351,176 @@ The bands were measured on this plant with closed-loop 6 s straight walks at 0.2
 | Body | Centre of mass (3-vector in the body frame) | Composite CoM and inertia are recomputed; affects the centroidal state, the WBC dynamics and, once settled, the nominal stance. |
 | Surface (floor or sole) | Sliding friction | The friction coefficients of both QPs are capped at $\hat\mu / \sqrt{2}$, which keeps the square friction pyramid inside the believed friction cone. A belief at or above nominal restores the configured values. |
 | Actuator | Gear ratio (torque constant) | Command scaling and torque limits as in Section 4.6. Zero disables the actuator. |
+| Terrain volume, or a flight of stairs expanded into volumes | Centre, size, yaw, top height (stairs: start, heading, step count, riser, tread, width, landing) | Solid blocks on the floor, held outside the belief MJCF (the controller never runs collision on it). With none, the controller is the flat-floor controller exactly. With any, the planner switches to terrain mode (Section 4.9). |
+
+### 4.9 Terrain mode
+
+When the terrain belief (Table 3) holds at least one volume, the gait planner and the controller switch to terrain mode. On a flat belief none of it runs, and flat walking is bit-identical to the controller without it. `scripts/flat_regress.py` checks this against a trace recorded from the pre-terrain commit (`tests/data/flat_regress_reference.npz`).
+
+There are two terrain stacks, selected by `TERRAIN_STACK` in `loka/control/terrain.py` (`--terrain-stack classical|heuristic` on `run_loka` and on the bench scripts):
+- **`classical`** (the default) assembles the humanoid stair controllers of the literature: IHMC's Atlas [72], [73]; Englsberger's divergent-component-of-motion work [3], [71]; Caron's HRP-4 stair stabilizer [74]; and AIST's open BaselineWalkingController [76], [75].
+- **`heuristic`** is the stack tuned earlier in this project. It keeps the centroidal MPC as the force planner and adds empirically chosen terrain rules.
+
+Both build on the shared components in Section 4.9.1. (On `run_loka`, `--stack` is a separate flag that selects the flat-ground locomotion stack, `legacy_dcm` or `alip_footstep`.)
+
+#### 4.9.1 Shared components
+
+**Terrain belief and footholds.**
+- **Belief representation.** The belief is a list of solid boxes standing on the floor. A flight of stairs is expanded into one box per step, so the box for step \(k\) reaches from the floor to its tread height (`stairs_volumes`). The ground height at a point is the highest top among the boxes containing it, or the floor height.
+- **Footholds carry a height.** A planned foothold is moved along the travel direction until the whole sole sits on one surface (`snap_foothold`). The sole is 0.17 m long and 0.06 m wide, grown by an edge margin of 2 cm for an oracle volume or 5 cm beside an orchestrator-declared one, whose edges are an estimate. A step that changes height by more than 0.16 m is refused.
+- **Stair steps.** A footfall whose height differs from the same leg's previous footfall by 2 cm or more is a stair step.
+- **Frozen landings.** Once a foothold's swing has started, it is no longer re-planned; capture corrections can still move it.
+- **Measured tread heights.** At touchdown, the tread height the plan carries is replaced by the measured one. A touchdown that times out with the foot still in the air keeps the planned height and is not reported as a footfall, since that leg's ground estimate still belongs to the tread it left.
+
+**Swing arc.** A swing that changes height first rises to 7 cm above the higher tread, then moves horizontally, then descends (quintic segments; the lift-then-move order is reversed for a step down). The stair swing time is stack specific (Sections 4.9.2 and 4.9.3). The transfer keeps the cadence's own 0.23 s, close to IHMC's simulated 0.25 s [73].
+
+**CoM height.** It comes from the vertical channel of the 3D DCM [3]:
+- each step's virtual repellent point (VRP) sits at its foothold height plus the walking height;
+- the same backward recursion as in the horizontal plane, with per-step durations, gives the vertical DCM;
+- the CoM height follows it on plan state through \(\dot z = \omega(\xi_z - z)\), with \(\omega\) fixed at the walking height.
+
+While a height change is within 0.5 m ahead, or anywhere in the plan horizon, the walking height lowers to 0.68 m. A reach clamp then caps the height reference at what every planted leg can reach: 0.78 m from sole to CoM with toe-off, 0.72 m flat-footed. When the walk stops, the height reference rises back to the stand height at the walking slew rate instead of in one tick.
+
+**Contact sensing without foot sensors.** `FootLoadEstimator` (`loka/control/contact_estimate.py`) works from proprioception alone:
+- **What it solves.** The rows of the equation of motion that belong to one leg's six joints involve only that foot's contact. It therefore solves
+  \[ J_{\ell}^\top w_\ell = M_\ell(q)\,\ddot q + h_\ell(q,\dot q) + \operatorname{diag}(a)\,\ddot q - \tau_{\ell} - \tau_{\mathrm{passive},\ell} \]
+  for each foot's six-axis wrench \(w_\ell\), by least squares on the belief model. Here \(a\) is the rotor armature, which MuJoCo's recursive Newton-Euler leaves out; \(\tau_\ell\) is the motor-current torque; and \(\ddot q\) comes from differentiated encoder velocities. This is the residual-based contact estimation of [58]-[60].
+- **Joints on a stop.** Their rows are dropped from that leg's fit (minimum-norm solution), because the stop's reaction torque appears in neither the motor current nor the model.
+
+Contact is then decided per foot:
+- **Planted foot.** It is compared against the height its own sole last rested at, so a foot on a tread and a foot on the floor are both down.
+- **Swing foot.** It counts as down only while its leg carries more than 35 N. The runtime's slip signal uses the same rule (`planted_mask`).
+- **Early contact.** A swing foot that takes load more than 1.5 cm above its target after 30% of the swing has met ground early. Its landing is re-planned at the measured height.
+- **Blocked swing.** A swing foot carrying more than 40 N between 5% and 70% of the swing is blocked. This is only reported to the runtime.
+
+**Whole-body QP on terrain.** The WBC (Section 4.4) tracks the contact forces it is given 100 times harder than on flat ground (`TERRAIN_FORCE_WEIGHT_SCALE`), as whole-body impulse control does [43].
+- **Why.** At the flat weight the WBC re-solved the force distribution from its own base and posture tasks. On every step-up it unloaded the trailing foot the force planner was pushing with (4 N of a planned 257 N) and braked the CoM with a backward force under the upper foot. This one change took the oracle curb from 0/5 to 5/5.
+- **Trailing-foot toe-off.** In double support across treads, once the capture point is past the lower foot's toe line and inside the toe polygon, that foot's heel points leave the contact set and the foot pivots on its toes [71], [73].
+- **Joint limits.** The QP has no joint-range rows on flat ground. Inside 0.1 rad of a leg joint's stop, its posture target becomes a velocity damper [77], since the G1's ankle roll (±15°) and dorsiflexion (0.87 rad) stops otherwise block commanded motion silently. Hard joint-range rows in a separate terrain-mode QP instance (`JOINT_LIMIT_ROWS`) are implemented but off; see the table of tried changes below.
+- **Knee bias.** The stance-knee bias is geometric (law of cosines, placing each hip at the CoM reference) rather than read from the flat-ground height table.
+
+#### 4.9.2 Classical stack (default)
+
+**Footstep plan, one foot per tread** (`_terrain_place`, `TerrainBelief.next_tread_center`).
+- **Finding the next tread.** From the other foot's position, shifted sideways onto the swing foot's own line, the planner scans along the travel direction in 5 mm samples. The first sample whose believed height differs by 2 cm or more from the start of the scan is a riser; the next change in height ends that tread.
+- **Where the foot goes.** To the middle of that tread. On a deep surface such as a landing, it goes 0.15 m past the edge (half of a 0.30 m tread). A tread too short for the sole plus both margins is skipped.
+- **Reach limits.** Up to 0.32 m ahead of the other foot while on the floor, so the approach first closes on the riser, and up to 0.40 m once on a tread. The result has to pass the sole-on-one-surface test. Otherwise the ordinary snap applies.
+- **Gait.** This is a step-over gait: each swing crosses two treads and two risers, as on Atlas and HRP-4.
+- **When it is skipped.** The rule is skipped while the walk is stopping (`_stop_requested`) or no longer striding forward (nominal stride under 2 cm), so a goal on a tread is not overshot one tread per step.
+
+**Stair timing.** The swing time grows with the swing (IHMC's distance-scaled timing [73]):
+\[ T_{\mathrm{swing}} = 0.35\ \mathrm{s} + 0.6\ \mathrm{s/m}\cdot d_{xy} + 1.0\ \mathrm{s/m}\cdot |\Delta z| , \]
+never below the cadence's swing time. A 0.3 m, 0.1 m swing takes 0.63 s, and a two-tread, two-riser swing (0.6 m, 0.2 m) about 0.9 s. The transfer stays 0.23 s.
+
+**CoM plan (3D DCM with heel-to-toe VRP)** [3], [71]:
+- **Horizontal plan.** The horizontal DCM is planned backward from the end of the horizon over the footholds. On a step that lands on or lifts off a tread, the VRP moves linearly from 3 cm behind to 4 cm ahead of the sole centre across the step.
+- **Closed form.** For a VRP moving at constant rate \(v\) over a step of length \(T\),
+  \[ \xi(t) = p(t) + \frac{v}{\omega} + \Bigl(\xi_T - p_T - \frac{v}{\omega}\Bigr)e^{\omega (t - T)} , \]
+  which reduces to the usual fixed-VRP recursion on flat steps.
+- **Vertical channel.** As in Section 4.9.1.
+- **Trunk.** Upright. The lean of the heuristic stack is forced off.
+
+**DCM stabilizer and contact-wrench distribution** (`loka/control/stabilizer.py`). While walking on terrain, this replaces the centroidal MPC as the force planner; the MPC is not solved. Following [2], [3], [74], [75]:
+1. **DCM feedback.** With \(\xi = c + \dot c/\omega\), the plan's \(\xi_{\mathrm{ref}}\), and \(\dot\xi_{\mathrm{ref}} = \omega(\xi_{\mathrm{ref}} - p)\), the desired centroidal moment pivot is
+   \[ r_{\mathrm{cmp}} = \xi - \frac{\dot\xi_{\mathrm{ref}}}{\omega} + \frac{k_\xi}{\omega}(\xi - \xi_{\mathrm{ref}}), \qquad k_\xi = 3\ \mathrm{s^{-1}} , \]
+   so the DCM error decays at \(k_\xi\). Gains of 2 and 4.5 failed every run on the 0.08-0.10 m flights.
+2. **Net force.** \(f_{xy} = m\omega^2(c_{xy} - r_{\mathrm{cmp}})\), and \(f_z = m(g + 50(z_{\mathrm{ref}} - z) + 14(\dot z_{\mathrm{ref}} - \dot z))\), with \(f_z\) never below 0.2 mg.
+3. **Net moment about the CoM.** \(M = I_c \cdot 30\,e_R - 8\,L_c\). This holds the trunk at the commanded yaw and upright, and damps the centroidal angular momentum \(L_c\).
+4. **Wrench distribution.** A QP over the 24 force components of the eight sole corners minimises \(\|\sum f_i - f\|^2 + 4\|\sum (p_i - c)\times f_i - M\|^2 + 10^{-4}\|f\|^2\). It enforces a friction pyramid (μ from the WBC configuration), \(f_z \in [1, 500]\) N on planted corners, and zero force on lifted ones. Matching the moment about the CoM puts the centre of pressure at the CMP. When the CMP leaves the support polygon, the QP returns the closest wrench the soles can apply.
+
+The WBC tracks these forces at the terrain force weight. When the walk stops, the MPC is solved on the very next tick instead of waiting for its decimation slot. A change to the WBC configuration, such as a lower friction belief, rebuilds the distribution QP.
+
+**Step adjustment** (Griffin et al. [72]). The DCM capture law (Section 4.3) corrects the next foothold during the first 70% of the swing:
+- **Across the stairs**, the correction may reach 0.20 m to catch a DCM that a 0.9 s two-tread swing lets diverge off the 6 cm sole.
+- **Along the stairs**, it is clamped to 0.06 m and then projected back onto the tread the foothold was planned on.
+- **Known mismatch, kept on purpose.** The capture prediction holds the support VRP at the sole centre while the plan moves it heel to toe. Making the prediction consistent with the plan lowered the classical stairs from 21/30 to 6/30 successes over 0.06-0.10 m risers. The resulting forward correction is part of what the stack's other parameters were tuned with.
+
+**Left out.** Caron's foot damping (admittance) control [74]. It exists for position-controlled robots with ankle force-torque sensors. Here the WBC realises the wrench through joint torques, and the G1 has no foot sensors.
+
+#### 4.9.3 Heuristic stack
+
+- **Footholds.** The cruise stride (5.6 cm per step at 0.15 m/s) is snapped onto treads by `snap_foothold`. This alternates long step-ups with short joining steps; step-over and step-to tread planners are implemented but off (`STAIR_TREAD_STEPS`, `STAIR_GAIT`).
+- **Stair timing.** Every stair swing takes 0.5 s, and there is no extra transfer time.
+- **Forces.** The centroidal MPC (Section 4.2) plans the contact forces, using absolute contact heights in its preview. The WBC tracks them at the terrain force weight.
+- **Velocity reference.** On a step that changes tread, the MPC tracks the DCM plan's forward rate rather than the cruise speed. A step over a riser is at least a sole length plus two edge margins, several cruise strides, and the CoM covers it in one step period only at the plan's rate.
+- **Step adjustment.** The capture correction of a stair step is capped at 0.06 m in any direction.
+- **Torso lean.** A 0.15 rad waist-pitch lean, an empirical heuristic for this stack rather than a literature component (model-based stair controllers keep the trunk upright). `TERRAIN_LEAN_MODE` selects:
+  - `ramp` (default): fades in at 0.3 rad/s while a climb is in the plan horizon, and out after it;
+  - `step`: full lean only on a step that changes tread;
+  - `off`.
+
+  The lean helps the climb but leaves a sideways drift and yaw wind-up on the flat top of a curb:
+
+  | Lean mode | Mean highest tread, five-seed 0.10 m flight | Curb walk-across, runs stopping at (2.0, 0) |
+  |---|---|---|
+  | `ramp` | 0.46 m | 3 of 8 |
+  | `step` | 0.42 m | 0 of 8 |
+  | `off` | 0.37 m | 6 of 8 |
+
+#### 4.9.4 Orchestrator side
+
+- **Declaring terrain.** Model mutations of type `stairs` or `volume` write the terrain belief (Table 3).
+- **Height refinement.** Each footfall on a believed volume measures its tread by leg kinematics. The runtime moves that volume's top to the measurement, and moves every higher step of the same flight with it.
+- **Terrain faults.** These open a failure episode, with a terrain event and a TERRAIN telemetry section, when:
+  - a footfall lands where the belief has no explanation for it;
+  - a swing is blocked mid-air (joint-torque load on a swinging foot);
+  - a swing foot meets load above its target where the belief has only floor.
+
+#### 4.9.5 Oracle results
+
+November 2026. The controller is given the plant's own terrain (`scripts/riser_sweep.py`, `scripts/stairs_gate.py`). The four-step flight has 0.30 m treads, and success means standing on the top landing for 1 s. Classical runs use 10 seeds per cell and heuristic runs 5.
+
+| Scene | Stack | Riser 0.04 m | 0.06 m | 0.08 m | 0.10 m |
+|---|---|---|---|---|---|
+| Curb (one step, 1.5 m platform) | classical | 10/10 | 10/10 | 10/10 | 9/10 |
+| | heuristic | 5/5 | 5/5 | 5/5 | 5/5 |
+| Four-step flight | classical | 8/10 | **10/10** | 7/10 | 4/10 |
+| | heuristic | 0/5 | 0/5 | 0/5 | 0/5 |
+| Irregular flight (0.10, 0.10, 0.14, 0.10 m) | classical | | | | 0/5 |
+| | heuristic | | | | 0/5 |
+| Up and down (`stairs_up_down`: three steps each way, 0.9 m landing) | classical | | 0/5 | 0/5 | |
+
+Curb walk-across: a walk to (2.0, 0) on the curb platform, the walk that failed under LOKA. Over 8 runs (4 seeds with the oracle belief and 4 with the block a VLM declared), the classical stack stops at the goal in 8 of 8, within 8 cm. The heuristic stack with its lean ramp manages 3 of 8.
+
+**Remaining failures of the classical stack:**
+- **Irregular flight.** It climbs to about the top and falls on the swing that crosses the 0.14 m riser and its neighbour.
+- **Up and down.** It climbs and crosses the landing, then falls on the first step down. Descent has no dedicated timing, and the descending leg's height estimate lags the tread.
+- **Heuristic flights, for comparison.** They fail near the top. The snapped cruise stride alternates 0.3 m step-ups with near-zero joining steps, and the CoM reaches a tread with more momentum than the joining step can absorb.
+
+**Known limitations:**
+- **Ground-truth base pose.** The controller is given the simulator's floating-base pose. On hardware, base position comes from leg odometry and the IMU, which drift. Tread heights relative to the stance foot are proprioceptive; absolute positions are not.
+- **Terrain declared mid-walk.** Footfalls already frozen read their height as the floor. That is right when the robot starts on the floor, but wrong if it starts on a raised surface.
+- **Sensing timing.** \(\ddot q\) and the actuator torque used by the contact estimate belong to the start of the last physics substep, 1 ms before the pose they are paired with.
+- **Earlier figure was wrong.** An "irregular 1/5" figure reported earlier came from a three-step 0.10 m flight: `--risers` replaced the riser list, and the scene file has no step count.
+
+#### 4.9.6 Diagnosis and history
+
+**Diagnosis tools.** `scripts/stairs_trace.py` labels each fall by the first constraint broken before it (torque saturation, joint limit, CoP at the sole edge, DCM error, MPC/WBC force gap, tilt, sideways foothold error, QP failure). `scripts/stair_feasibility.py` solves the step-up pose statically (leg IK plus a linear program over the sole-corner forces). At 0.10 m every phase has a feasible pose, with peak torque at most 0.47 of a limit. Reach binds, not torque: holding the CoM over the upper foot with the trailing foot down needs the CoM at most 0.62 m above the upper tread and the trailing foot toed off. At 0.15 m no such static pose exists, so the transfer has to be dynamic. `scripts/terrain_ablate.py` turns components off one at a time.
+
+**Tried on the heuristic stack one at a time and turned off there**, each measured on the five-seed 0.10 m flight against a 0.42 m baseline. The classical stack uses the step-over plan and the heel-to-toe VRP together with its DCM stabilizer and lateral step adjustment, and with them it climbs; each alone made the heuristic stack worse.
+
+| Change | Mean highest (m) |
+|---|---|
+| Tread-by-tread step-over | 0.21 |
+| Tread-by-tread step-to | 0.13 |
+| Hard joint-range rows in a terrain-only WBC | 0.36 |
+| Heel-to-toe VRP [71] | 0.26 to 0.37 |
+| Larger capture correction | 0.29 |
+| Speed cap on the stair velocity | 0.10 to 0.24 |
+| Lower walking height (0.62 to 0.64 m) | no gain |
+| 0.6 s swing | no gain |
+
+On the heuristic stack, four fixes in a row without a 2 cm gain triggered the stair plan's no-progress rule. The classical stack, which integrates the literature components instead of adding them one at a time, then met the stairs checkpoint.
+
+**Tried on the classical stack and reverted** (10 seeds per riser over 0.06-0.10 m):
+
+| Change | Result |
+|---|---|
+| Fix the stair swing time and arc type at lift-off, so capture and measured landings cannot change them mid-swing | 21/30 to 16/30 successes |
+| Make the capture prediction use the moving VRP | 21/30 to 6/30 successes |
+| Shorter distance-scaled swings | 0/20 successes |
+
+In one earlier run, a vision-language orchestrator declared a curb from the camera image and the first footfall corrected its height, but the declared edges were 5 to 18 cm off. Bench scripts: `scripts/stairs_gate.py`, `scripts/riser_sweep.py`, `scripts/terrain_ablate.py`; suite: `loka/config/eval_stairs.yaml`.
 
 ---
 
@@ -631,7 +801,7 @@ The orchestrator's reply is a YAML document with the sections in Table 5. Every 
 
 ### 8.2 Capabilities
 
-**Edit task targets and the gait policy.** The orchestrator can change the CoM height, lean and standing yaw, switch between stand, walk, tread and limp, set speed, heading and cadence, swing clearance, stance width, capture gain and turn rate, and hand the planner a world-frame goal (Section 4.3). A goal turns walking into a closed-loop behaviour of the plant: once set, the robot walks there, slows, stops inside the tolerance and walks back if pushed away, without further orchestrator calls. Turning on the spot is a walk with zero speed and a new heading. The gait parameters are also the orchestrator's means of adapting the walk to the environment and to an identified fault: the prompt suggests raising the swing clearance and slowing down to step over a low obstacle, and walking more slowly with longer double support after a friction search has lowered the believed friction. Footholds remain on the floor plane, so stepping onto a raised surface is outside the interface.
+**Edit task targets and the gait policy.** The orchestrator can change the CoM height, lean and standing yaw, switch between stand, walk, tread and limp, set speed, heading and cadence, swing clearance, stance width, capture gain and turn rate, and hand the planner a world-frame goal (Section 4.3). A goal turns walking into a closed-loop behaviour of the plant: once set, the robot walks there, slows, stops inside the tolerance and walks back if pushed away, without further orchestrator calls. Turning on the spot is a walk with zero speed and a new heading. The gait parameters are also the orchestrator's means of adapting the walk to the environment and to an identified fault: the prompt suggests raising the swing clearance and slowing down to step over a low obstacle, and walking more slowly with longer double support after a friction search has lowered the believed friction. Raised ground is declared through the terrain belief (Table 3, Section 4.9); on a flat belief, footholds remain on the floor plane.
 
 **Start belief searches.** The orchestrator names *which* parameter it believes is wrong (for example, the mass of the torso, the lateral CoM of the left shoulder, the floor friction or the gear of the right knee), in priority order. It does not supply the value; the executor of Section 9 identifies it. The system prompt instructs the model not to write a model mutation for a parameter it has queued, and to search a body's mass before its CoM coordinates.
 
@@ -803,7 +973,7 @@ For Experiment 2 the metric is the largest survived push force. Continuous metri
 
 **Benchmark navigation tasks.** The current experiments use one goal on a flat, empty floor. The next step is to evaluate on HumanoidBench [66], a MuJoCo benchmark of whole-body humanoid tasks, so that results are comparable with other methods. The first target is a goal-reaching navigation task in which the direct line to the goal is blocked, such as the benchmark's maze task. It exercises the parts of LOKA that the current experiments do not: the camera image of Section 7.3, waypoint planning in the self-assigned plan, and proximity listeners. As the scope widens, tasks with uneven ground, such as stairs and hurdles, would follow. These require footholds off the floor plane, which the current gait planner does not produce (Section 8.2), so they also depend on an extension of the low-level controller. HumanoidBench is built around the Unitree H1 by default, whereas the controller here is tuned for the G1. The evaluation will therefore either use a G1 version of the benchmark scenes, or port the task geometry and success criteria into the G1 scene.
 
-**Vision-language-action baselines.** To compare LOKA with methods that obtain generality from large-scale training, the planned evaluation adds a humanoid vision-language-action (VLA) model that can be run in the same MuJoCo environment. Candidates include GR00T N1 [23], an open humanoid foundation model with a slow vision-language module and a fast learned action module, and LeVERB [69], which conditions a learned whole-body humanoid controller on vision and language. RT-2 [20] is a natural reference, but its weights are not public, so it can only be discussed rather than run. Most other VLAs, such as OpenVLA [21] and π0 [22], target arm manipulation and do not control humanoid balance. Each VLA will be given the same instruction and observations as LOKA, plus whatever robot-specific fine-tuning it requires, and the amount of data and training this involves will be reported as part of the comparison. The reinforcement-learning policy and the low-level controller of Section 11.1 will be retained.
+**Vision-language-action baselines.** To compare LOKA with methods that obtain generality from large-scale training, the planned evaluation adds a humanoid vision-language-action (VLA) model that can be run in the same MuJoCo environment. Candidates include GR00T N1 [23], an open humanoid foundation model with a slow vision-language module and a fast learned action module, and LeVERB [69], which conditions a learned whole-body humanoid controller on vision and language. RT-2 [20] is a natural reference, but its weights are not public, so it can only be discussed rather than run. Most other VLAs, such as OpenVLA [21] and π0 [22], target arm manipulation and do not control humanoid balance. A navigation VLA, NaVILA [70], is already integrated (`loka/vla/navila.py`). It emits mid-level language actions (move forward, turn, stop), which are translated into the same gait targets the orchestrator writes. Its original low-level controller is a reinforcement-learning locomotion policy trained in Isaac Lab with a terrain height scan, and released checkpoints exist only for the Unitree Go2 and H1. Our integration therefore does not use that policy: NaVILA drives either our own low-level controller of Section 4 or the Unitree velocity policy [42], neither of which perceives terrain. Results for this baseline measure NaVILA's high-level navigation on our locomotion stack, not the full NaVILA system, and the paper must say so. Each VLA will be given the same instruction and observations as LOKA, plus whatever robot-specific fine-tuning it requires, and the amount of data and training this involves will be reported as part of the comparison. The reinforcement-learning policy and the low-level controller of Section 11.1 will be retained.
 
 **Planned metrics.**
 
@@ -970,3 +1140,19 @@ These points are for the authors and should not appear in the paper.
 [68] E. B. Wilson, "Probable inference, the law of succession, and statistical inference," *J. Amer. Statist. Assoc.*, vol. 22, no. 158, pp. 209–212, 1927.
 
 [69] H. Xue et al., "LeVERB: Humanoid whole-body control with latent vision-language instruction," arXiv:2506.13751, 2025.
+
+[70] A.-C. Cheng et al., "NaVILA: Legged robot vision-language-action model for navigation," arXiv:2412.04453, 2024.
+
+[71] J. Englsberger, T. Koolen, S. Bertrand, J. Pratt, C. Ott, and A. Albu-Schäffer, "Trajectory generation for continuous leg forces during double support and heel-to-toe shift based on divergent component of motion," in *Proc. IEEE/RSJ Int. Conf. Intell. Robots Syst. (IROS)*, 2014, pp. 4022–4029.
+
+[72] R. J. Griffin, G. Wiedebach, S. Bertrand, A. Leonessa, and J. Pratt, "Walking stabilization using step timing and location adjustment on the humanoid robot, Atlas," in *Proc. IEEE/RSJ Int. Conf. Intell. Robots Syst. (IROS)*, 2017, pp. 667–673.
+
+[73] R. J. Griffin, G. Wiedebach, S. Bertrand, A. Leonessa, and J. Pratt, "Straight-leg walking through underconstrained whole-body control," in *Proc. IEEE Int. Conf. Robot. Autom. (ICRA)*, 2018.
+
+[74] S. Caron, A. Kheddar, and O. Tempier, "Stair climbing stabilization of the HRP-4 humanoid robot using whole-body admittance control," in *Proc. IEEE Int. Conf. Robot. Autom. (ICRA)*, 2019, pp. 277–283.
+
+[75] S. Kajita, M. Morisawa, K. Miura, S. Nakaoka, K. Harada, K. Kaneko, F. Kanehiro, and K. Yokoi, "Biped walking stabilization based on linear inverted pendulum tracking," in *Proc. IEEE/RSJ Int. Conf. Intell. Robots Syst. (IROS)*, 2010, pp. 4489–4496.
+
+[76] M. Murooka et al., "BaselineWalkingController: Humanoid walking controller with various baseline methods," GitHub repository (isri-aist). [Online]. Available: https://github.com/isri-aist/BaselineWalkingController (accessed Nov. 2026).
+
+[77] B. Faverjon and P. Tournassoud, "A local based approach for path planning of manipulators with a high number of degrees of freedom," in *Proc. IEEE Int. Conf. Robot. Autom. (ICRA)*, 1987, pp. 1152–1159.

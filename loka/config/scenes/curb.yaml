@@ -1,0 +1,5 @@
+# A single 0.10 m curb 1.0 m ahead, with a 1.5 m deep platform on top.
+description: "One 0.10 m curb ahead"
+props: []
+terrain:
+  - {kind: stairs, name: curb_0, x: 1.0, y: 0.0, yaw: 0.0, steps: 1, riser: 0.10, tread: 0.30, width: 1.5, landing: 1.5}

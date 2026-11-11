@@ -25,6 +25,7 @@ hardware bridge later.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -61,7 +62,9 @@ from loka.control.robot import (
     quat_to_rpy,
 )
 from loka.control.wbc import WBCConfig, WholeBodyController, WBCTargets
-from loka.control.contact_estimate import FootLoadEstimator
+from loka.control.contact_estimate import SWING_CONTACT_N, FootLoadEstimator
+from loka.control.stabilizer import DCMStabilizer
+from loka.control.terrain import STAIR_STEP_DZ, TerrainBelief, classical_stack
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = REPO_ROOT / "models" / "g1" / "scene.xml"
@@ -214,6 +217,74 @@ MAX_YAW = 0.5
 HEIGHT_SLEW_WALK = 0.05
 #: Lowest CoM height a walk will chase. Deeper crouches are a stand.
 WALK_HEIGHT_MIN = 0.60
+#: CoM height above the support while a height change is in the plan
+#: horizon, and the lowest the reach clamp may take it [m]. The trailing leg
+#: has to reach the lower tread while the CoM moves over the upper one. At
+#: 0.60 the stance ankle hits its 0.87 rad dorsiflexion stop in a stair swing.
+TERRAIN_WALK_HEIGHT = 0.68
+TERRAIN_HEIGHT_MIN = 0.52
+#: How far ahead of the pelvis a height change starts the stair crouch [m].
+#: The height reference slews at 0.05 m/s, so a 0.1 m crouch needs 2 s.
+TERRAIN_LOOKAHEAD = 0.5
+#: On a step that changes tread, track the DCM plan's forward rate rather
+#: than the cruise speed.
+STAIR_PLAN_VELOCITY = True
+#: Ceiling on that forward rate [m/s].
+STAIR_SPEED_CAP = float("inf")
+#: WBC pull toward the MPC contact forces on terrain, relative to the flat
+#: weight. At the flat weight the WBC re-solves the distribution from its
+#: own base and posture tasks, and across a riser it unloads the trailing
+#: foot the MPC is pushing with, braking the CoM short of the upper tread.
+TERRAIN_FORCE_WEIGHT_SCALE = 100.0
+#: Waist-pitch lean on a step that changes tread [rad]; 0 is upright.
+#: Forward lean keeps the hips over the upper tread (stair_feasibility.py).
+#: An empirical heuristic for this stack: model-based stair controllers in
+#: the literature keep the torso upright.
+TERRAIN_TORSO_LEAN = 0.15
+#: ``step``: full lean exactly while a step changes tread, none otherwise.
+#: ``ramp``: fade in while a climb is in the plan horizon and out after it,
+#: at TORSO_LEAN_RATE. ``off``: upright.
+TERRAIN_LEAN_MODE = "ramp"
+TORSO_LEAN_RATE = 0.3  # rad/s
+WAIST_PITCH = 14
+TORSO_LEAN_KP = 100.0
+TORSO_LEAN_KD = 20.0
+#: Largest CoM-to-sole distance a planted leg can hold [m]. The nominal
+#: stance is 0.70 m tall with each sole 0.12 m to the side.
+LEG_REACH = 0.78  # with trailing-foot toe-off; 0.72 flat-footed
+#: Soft leg joint limits on terrain: margin from each stop [rad], the
+#: approach-speed gain [1/s], damping [1/s] and task weight.
+JOINT_LIMIT_MARGIN = 0.10
+JOINT_LIMIT_GAIN = 5.0
+JOINT_LIMIT_DAMPING = 20.0
+JOINT_LIMIT_WEIGHT = 50.0
+#: Hard joint-range rows in the terrain-mode WBC (see _joint_acc_bounds).
+#: Off: on 0.10 m stairs they lowered the mean highest tread from 0.42 m to
+#: 0.36 m and left the curb at 5/5; the soft dampers stay.
+JOINT_LIMIT_ROWS = False
+JOINT_LIMIT_ROW_MARGIN = 0.01  # rad
+JOINT_LIMIT_HORIZON = 0.05  # s
+#: A swing foot this far above its target that already carries load met
+#: ground early [m].
+EARLY_CONTACT_HEIGHT = 0.015
+#: Swing phase before which load on the foot is a scuff, not a landing.
+EARLY_CONTACT_MIN_S = 0.30
+#: Load on a swinging foot, in the middle of its swing, that means it hit
+#: something [N]. A free swing reads under 10 N on the flat walk.
+OBSTRUCTION_N = 40.0
+OBSTRUCTION_MIN_S = 0.05
+OBSTRUCTION_MAX_S = 0.70
+#: Position feedback folded into the CoM velocity reference of a
+#: quasi-static stair step [1/s], and its cap [m/s].
+QS_POSITION_GAIN = 3.0
+QS_PULL_SPEED = 0.25
+#: Base task weight scale through a quasi-static stair step. The swing foot
+#: travels a whole tread, and at the walking weights its task (500) dragged
+#: the pelvis after it and pitched the torso over the stance toe.
+QS_BASE_WEIGHT_SCALE = 4.0
+#: Stance-knee bias weight on terrain. Without a bias a crouched walk falls
+#: within two seconds; the target is geometric, so it agrees with the CoM task.
+TERRAIN_KNEE_W = 12.0
 
 
 TASK_PARAMETER_NAMES = frozenset({
@@ -275,6 +346,22 @@ class LocomotionController:
             num_contacts=self.robot.num_contacts,
             torque_limit=self.robot.torque_limit,
         )
+        #: Terrain-mode QP: the same problem plus hard joint-range rows on the
+        #: legs. A separate instance, so the flat QP's structure is untouched.
+        self._wbc_terrain: WholeBodyController | None = None
+        #: Classical terrain stack's DCM stabilizer (terrain.TERRAIN_STACK).
+        self._stabilizer: DCMStabilizer | None = None
+        #: Terrain the controller believes in. Empty is the flat-floor controller.
+        self.terrain = TerrainBelief()
+        import mujoco
+
+        self._leg_body_ids = {
+            side: tuple(
+                mujoco.mj_name2id(self.robot.model, mujoco.mjtObj.mjOBJ_BODY, f"{side}_{link}")
+                for link in ("hip_pitch_link", "knee_link", "ankle_pitch_link")
+            )
+            for side in ("left", "right")
+        }
         self._load_estimator = FootLoadEstimator(self.robot)
         #: World force on each foot, from joint torques (see contact_estimate).
         self.foot_load = np.zeros((2, 3))
@@ -373,28 +460,6 @@ class LocomotionController:
             for leg in (0, 1)
         ])
 
-    def planted_mask(self) -> np.ndarray:
-        """Sole points on the ground at the belief's current kinematics.
-
-        Same rule as the controller's own contact set, without updating any
-        estimate.
-        """
-        heights = self.robot.data.site_xpos[self.robot.contact_site_ids][:, 2]
-        return heights < self._ground_height + CONTACT_HEIGHT_TOLERANCE
-
-    @property
-    def load_estimator(self) -> FootLoadEstimator:
-        """Leg-torque contact estimate from the last :meth:`sense_proprioception`."""
-        return self._load_estimator
-
-    def sense_proprioception(self, qpos, qvel, qacc, joint_torque) -> None:
-        """Encoder state, its derivative and motor torque after a plant step.
-
-        Feeds the foot-load estimate. Nothing here is a contact or force
-        reading from the simulator.
-        """
-        self.foot_load = self._load_estimator.update(qpos, qvel, qacc, joint_torque)
-
     def _leg_states(self, contact_mask: np.ndarray) -> np.ndarray:
         """Index into the gain tables: 0 where planted, 1 where airborne.
 
@@ -421,7 +486,16 @@ class LocomotionController:
             policy=self._foothold_policy,
             stack_name=getattr(self.config, "stack", "legacy_dcm"),
         )
+        self.gait.terrain = self.terrain
+        #: Ground height under each foot, from where its sole last rested.
+        self._leg_z = np.full(2, self._ground_height)
         self.foot_load = np.zeros((2, 3))
+        #: Footfalls, early contacts and swing obstructions, for the runtime to
+        #: drain. Bounded, so a plant with no runtime does not accumulate them.
+        self.terrain_events: deque = deque(maxlen=200)
+        self._obstruction_key = None
+        self._lean = 0.0
+        self._was_classical = False
         self._last_gait = None
         self._last_joint_weights = np.zeros(self.robot.nu)
         self._last_swing_orient_active = False
@@ -442,10 +516,344 @@ class LocomotionController:
         compute torques bracing against support that is not there.
         """
         heights = self.robot.data.site_xpos[self.robot.contact_site_ids][:, 2]
+        if self.terrain.active:
+            return self._terrain_contact_mask(heights)
         mask = heights < self._ground_height + CONTACT_HEIGHT_TOLERANCE
         if mask.any():
             self._ground_height = float(heights[mask].min())
+        # Kept current so a terrain belief that arrives mid-run starts from
+        # where the soles are.
+        per = self.robot.num_contacts // 2
+        for leg in (0, 1):
+            rows = slice(leg * per, (leg + 1) * per)
+            if mask[rows].any():
+                self._leg_z[leg] = float(heights[rows][mask[rows]].min())
         return mask
+
+    def _terrain_contact_mask(self, heights: np.ndarray) -> np.ndarray:
+        """Per-foot contact on terrain, from kinematics and leg-torque load.
+
+        A planted foot is compared against the height its own sole last
+        rested at, so a foot on a tread and a foot on the floor are both
+        down. A swinging foot counts only once its leg carries load: the
+        arc ends at the believed tread, and a tread that is lower than
+        believed would otherwise be "touched" in mid-air.
+        """
+        per = self.robot.num_contacts // 2
+        mask = np.zeros(self.robot.num_contacts, dtype=bool)
+        last = self._last_gait
+        swing = last.swing if last is not None and last.walking else None
+        for leg in (0, 1):
+            rows = slice(leg * per, (leg + 1) * per)
+            h = heights[rows]
+            loaded = float(self.foot_load[leg, 2]) > SWING_CONTACT_N
+            if swing is not None and swing.active and int(swing.leg) == leg:
+                if not loaded:
+                    continue
+                m = h < float(h.min()) + CONTACT_HEIGHT_TOLERANCE
+            else:
+                m = h < self._leg_z[leg] + CONTACT_HEIGHT_TOLERANCE
+                if not m.any() and loaded:
+                    m = h < float(h.min()) + CONTACT_HEIGHT_TOLERANCE
+            if m.any():
+                self._leg_z[leg] = float(h[m].min())
+            mask[rows] = m
+        floor = heights < self._ground_height + CONTACT_HEIGHT_TOLERANCE
+        if floor.any():
+            self._ground_height = float(heights[floor].min())
+        return mask
+
+    def _geometric_knees(self, com_error: np.ndarray) -> np.ndarray:
+        """Knee angles that place each hip at its current position plus the CoM error.
+
+        Two-link leg: hip-pitch joint to knee to ankle-pitch joint, lengths
+        read off the belief kinematics. On stairs the two knees differ, and a
+        table indexed by one CoM height pulls both toward a symmetric stance.
+        """
+        data = self.robot.data
+        knees = np.zeros(2)
+        shift = np.asarray(com_error, dtype=float).reshape(3)
+        for leg, side in enumerate(("left", "right")):
+            hip = data.xpos[self._leg_body_ids[side][0]]
+            knee = data.xpos[self._leg_body_ids[side][1]]
+            ankle = data.xpos[self._leg_body_ids[side][2]]
+            l1 = float(np.linalg.norm(knee - hip))
+            l2 = float(np.linalg.norm(ankle - knee))
+            reach = float(np.linalg.norm(hip + shift - ankle))
+            cos_inner = (l1 * l1 + l2 * l2 - reach * reach) / (2.0 * l1 * l2)
+            knees[leg] = float(np.pi - np.arccos(np.clip(cos_inner, -1.0, 1.0)))
+        return np.clip(knees, STANCE_KNEE_MIN, 2.2)
+
+    def _terrain_near(self, xy: np.ndarray, yaw: float) -> bool:
+        """A height change in the belief within :data:`TERRAIN_LOOKAHEAD` ahead or under the feet."""
+        forward = np.array([np.cos(yaw), np.sin(yaw)])
+        dist = np.linspace(-0.3, TERRAIN_LOOKAHEAD, 19)
+        points = xy[None, :] + dist[:, None] * forward[None, :]
+        heights = self.terrain.heights_at(points, self._ground_height)
+        return float(heights.max() - heights.min()) >= STAIR_STEP_DZ
+
+    def _toe_off(self, contact_mask, feet, com, yaw: float, com_vel=None) -> np.ndarray:
+        """Trailing-foot toe-off between treads (Englsberger 2014; Griffin 2017).
+
+        In double support with the feet on different treads, once the CoM is
+        past the lower foot's toes its heel can carry no load and holding it
+        flat forces the deep crouch that drives the stance ankle into its
+        stop. The heel points leave the contact set; the foot then pivots on
+        its toes, with pitch left free.
+        """
+        per = self.robot.num_contacts // 2
+        if not np.all(contact_mask) or abs(float(self._leg_z[0] - self._leg_z[1])) < STAIR_STEP_DZ:
+            return contact_mask
+        lower = int(np.argmin(self._leg_z))
+        upper = 1 - lower
+        sites = self.robot.data.site_xpos[self.robot.contact_site_ids][:, :2]
+        toes = sites[lower * per + 2 : lower * per + 4]
+        polygon = np.vstack([toes, sites[upper * per : (upper + 1) * per]])
+        forward = np.array([np.cos(yaw), np.sin(yaw)])
+        left = np.array([-forward[1], forward[0]])
+        # Capture point, as in IHMC's toe-off gate: it must lie in the toe-off
+        # support polygon (trailing toes plus the leading foot), here its
+        # bounding box in the travel frame, and past the trailing toes.
+        omega = float(np.sqrt(9.81 / max(float(com[2] - self._leg_z.min()), 0.3)))
+        dcm = np.asarray(com[:2]) + np.asarray(com_vel[:2]) / omega
+        along = polygon @ forward
+        across = polygon @ left
+        d_along, d_across = float(dcm @ forward), float(dcm @ left)
+        inside = (
+            float((toes @ forward).max()) < d_along <= float(along.max())
+            and float(across.min()) <= d_across <= float(across.max())
+        )
+        if not inside:
+            return contact_mask
+        mask = contact_mask.copy()
+        mask[lower * per : lower * per + 2] = False  # heel points c0, c1
+        return mask
+
+    def _joint_limit_dampers(self, q, dq, joint_acc, joint_weights, acc_cap) -> None:
+        """Soft joint-position limits on the legs: a damper inside a margin of each stop.
+
+        The QP has no joint-range rows; on terrain the ankles reach their
+        ±15° roll and 0.87 rad dorsiflexion stops, where the plant silently
+        blocks commanded motion. Inside JOINT_LIMIT_MARGIN the joint's target
+        acceleration brakes motion toward the stop (velocity damper, as in
+        Faverjon and Tournassoud; Celerier et al. 2025).
+        """
+        ranges = self.robot.model.jnt_range[1 : 1 + NUM_LEG_JOINTS]
+        for i in range(NUM_LEG_JOINTS):
+            lo, hi = float(ranges[i, 0]), float(ranges[i, 1])
+            if hi - lo <= 1e-6:
+                continue
+            d_hi, d_lo = hi - float(q[i]), float(q[i]) - lo
+            if d_hi < JOINT_LIMIT_MARGIN and dq[i] > -0.05:
+                vel = -JOINT_LIMIT_GAIN * (JOINT_LIMIT_MARGIN - d_hi)
+            elif d_lo < JOINT_LIMIT_MARGIN and dq[i] < 0.05:
+                vel = JOINT_LIMIT_GAIN * (JOINT_LIMIT_MARGIN - d_lo)
+            else:
+                continue
+            joint_acc[i] = float(np.clip(JOINT_LIMIT_DAMPING * (vel - dq[i]), -acc_cap, acc_cap))
+            joint_weights[i] = max(float(joint_weights[i]), JOINT_LIMIT_WEIGHT)
+
+    def _stabilizer_forces(self, dynamics, gait_out, com_ref, com_vel_ref, contact_mask,
+                           base_quat, rot, face_yaw) -> np.ndarray:
+        """Classical stack: DCM feedback to a CMP, distributed over the soles."""
+        if self._stabilizer is None:
+            wbc_cfg = self.config.wbc
+            self._stabilizer = DCMStabilizer(
+                self.robot.num_contacts, self.robot.total_mass,
+                mu=float(wbc_cfg.friction_mu), fz_min=float(wbc_cfg.fz_min),
+                fz_max=float(wbc_cfg.fz_max),
+            )
+        omega = self.gait.omega
+        dcm_ref = np.asarray(gait_out.dcm_ref, dtype=float).reshape(2)
+        dcm_rate_ref = omega * (dcm_ref - np.asarray(self.gait.vrp_now(), dtype=float).reshape(2))
+        yaw_quat = np.array([np.cos(0.5 * face_yaw), 0.0, 0.0, np.sin(0.5 * face_yaw)])
+        force, moment = self._stabilizer.desired_wrench(
+            com=dynamics.com,
+            com_vel=dynamics.com_vel,
+            com_z_ref=float(com_ref[2]),
+            com_vz_ref=float(com_vel_ref[2]),
+            dcm_ref=dcm_ref,
+            dcm_rate_ref=dcm_rate_ref,
+            omega=omega,
+            orientation_error=rot @ orientation_error(base_quat, yaw_quat),
+            angular_momentum=self.robot.angular_momentum_about(dynamics.com),
+            inertia=self.robot.com_inertia(),
+        )
+        return self._stabilizer.distribute(force, moment, dynamics.com, dynamics.contact_pos, contact_mask)
+
+    def _torso_lean(self, active: bool, gait_out, dt: float) -> float:
+        """Waist-pitch lean for this tick [rad], per TERRAIN_LEAN_MODE."""
+        if classical_stack():
+            # The classical stack keeps the trunk upright.
+            self._lean = 0.0
+            return 0.0
+        if TERRAIN_LEAN_MODE == "off" or TERRAIN_TORSO_LEAN <= 0.0:
+            self._lean = 0.0
+            return 0.0
+        if TERRAIN_LEAN_MODE == "step":
+            self._lean = TERRAIN_TORSO_LEAN if active and gait_out.stair_transfer else 0.0
+            return self._lean
+        target = TERRAIN_TORSO_LEAN if active and (gait_out.ascent_ahead or gait_out.stair_transfer) else 0.0
+        step = TORSO_LEAN_RATE * dt
+        self._lean += float(np.clip(target - self._lean, -step, step))
+        if self._lean < 1e-4:
+            self._lean = 0.0
+        return self._lean
+
+    def _terrain_wbc(self) -> WholeBodyController:
+        if self._wbc_terrain is None:
+            self._wbc_terrain = WholeBodyController(
+                self.config.wbc,
+                nv=self.robot.nv,
+                num_joints=self.robot.nu,
+                num_contacts=self.robot.num_contacts,
+                torque_limit=self.robot.torque_limit,
+                limited_joints=np.arange(NUM_LEG_JOINTS),
+            )
+        return self._wbc_terrain
+
+    def _joint_acc_bounds(self, q, dq, acc_cap: float) -> tuple[np.ndarray, np.ndarray]:
+        """Hard leg joint-range rows: no stop reached within one preview horizon.
+
+        ``q + q̇T + ½q̈T² ∈ [lo + m, hi − m]`` gives a bound on q̈ (the
+        discrete velocity-damper form of Faverjon and Tournassoud; Celerier
+        et al. 2025). Capped at the joint acceleration limit and kept
+        ordered, so a joint already past the margin is pushed back rather
+        than making the QP infeasible.
+        """
+        ranges = self.robot.model.jnt_range[1 : 1 + NUM_LEG_JOINTS]
+        qi = np.asarray(q[:NUM_LEG_JOINTS], dtype=float)
+        dqi = np.asarray(dq[:NUM_LEG_JOINTS], dtype=float)
+        t = JOINT_LIMIT_HORIZON
+        lo = 2.0 * (ranges[:, 0] + JOINT_LIMIT_ROW_MARGIN - qi - dqi * t) / (t * t)
+        hi = 2.0 * (ranges[:, 1] - JOINT_LIMIT_ROW_MARGIN - qi - dqi * t) / (t * t)
+        lo = np.clip(lo, -acc_cap, acc_cap)
+        hi = np.clip(hi, -acc_cap, acc_cap)
+        mid = 0.5 * (lo + hi)
+        swap = lo > hi
+        lo[swap] = mid[swap]
+        hi[swap] = mid[swap]
+        return lo, hi
+
+    def planted_mask(self) -> np.ndarray:
+        """Sole points on the ground at the belief's current kinematics.
+
+        Same rule as the controller's own contact set, without updating any
+        estimate. On terrain each foot is compared with its own ground.
+        """
+        heights = self.robot.data.site_xpos[self.robot.contact_site_ids][:, 2]
+        if not self.terrain.active:
+            return heights < self._ground_height + CONTACT_HEIGHT_TOLERANCE
+        per = self.robot.num_contacts // 2
+        ref = np.repeat(self._leg_z, per)
+        mask = heights < ref + CONTACT_HEIGHT_TOLERANCE
+        last = self._last_gait
+        swing = last.swing if last is not None and last.walking else None
+        if swing is not None and swing.active:
+            # As in _terrain_contact_mask: a swinging foot is down only once
+            # its leg carries load; stepping down, its sole passes below the
+            # tread it left while still in the air.
+            leg = int(swing.leg)
+            if float(self.foot_load[leg, 2]) <= SWING_CONTACT_N:
+                mask[leg * per : (leg + 1) * per] = False
+        return mask
+
+    def _reach_clamp(self, com_ref, com_vel_ref, feet, contact_mask):
+        """Keep the CoM height reference within reach of every planted foot.
+
+        Only binds while the feet are on different treads: the trailing leg
+        cannot hold the CoM at stance height above the upper tread.
+        """
+        if abs(float(self._leg_z[0] - self._leg_z[1])) < STAIR_STEP_DZ:
+            return com_ref, com_vel_ref
+        per = self.robot.num_contacts // 2
+        ceiling = np.inf
+        for leg in (0, 1):
+            if not np.asarray(contact_mask[leg * per : (leg + 1) * per]).any():
+                continue
+            dxy = float(np.linalg.norm(com_ref[:2] - feet[leg, :2]))
+            reach = float(np.sqrt(max(LEG_REACH * LEG_REACH - dxy * dxy, 0.0)))
+            ceiling = min(ceiling, float(self._leg_z[leg]) + reach)
+        floor = float(self._leg_z.max()) + TERRAIN_HEIGHT_MIN
+        ceiling = max(ceiling, floor)
+        if com_ref[2] > ceiling:
+            com_ref = com_ref.copy()
+            com_ref[2] = ceiling
+            com_vel_ref = com_vel_ref.copy()
+            com_vel_ref[2] = min(float(com_vel_ref[2]), 0.0)
+        return com_ref, com_vel_ref
+
+    @property
+    def load_estimator(self) -> FootLoadEstimator:
+        """Leg-torque contact estimate from the last :meth:`sense_proprioception`."""
+        return self._load_estimator
+
+    def sense_proprioception(self, qpos, qvel, qacc, joint_torque) -> None:
+        """Encoder state, its derivative and motor torque after a plant step.
+
+        Feeds the foot-load estimate. Nothing here is a contact or force
+        reading from the simulator.
+        """
+        self.foot_load = self._load_estimator.update(qpos, qvel, qacc, joint_torque)
+
+    def _check_obstruction(self, feet: np.ndarray) -> None:
+        """A swing foot carrying load mid-swing hit something: a riser or a curb.
+
+        Read from the leg's joint torques (see contact_estimate), on any
+        belief, flat or not. One event per swing. Late swing is left to the
+        touchdown logic, where load is the landing itself.
+        """
+        last = self._last_gait
+        if last is None or not last.walking or not last.swing.active:
+            return
+        swing = last.swing
+        leg = int(swing.leg)
+        if not (OBSTRUCTION_MIN_S <= swing.s <= OBSTRUCTION_MAX_S):
+            return
+        load = self.foot_load[leg]
+        if float(np.linalg.norm(load)) <= OBSTRUCTION_N:
+            return
+        key = (int(self.gait.step_index), leg)
+        if key == self._obstruction_key:
+            return
+        self._obstruction_key = key
+        self.terrain_events.append({
+            "kind": "swing_obstructed",
+            "t": self._tick * self.config.control_dt,
+            "leg": leg,
+            "s": float(swing.s),
+            "xy": [float(v) for v in feet[leg, :2]],
+            "foot_z": float(feet[leg, 2]),
+            "target_z": float(swing.foothold[2]),
+            "load_n": [float(v) for v in load],
+        })
+
+    def _check_early_contact(self, feet: np.ndarray) -> None:
+        """A swing foot carrying load above its target met a higher tread."""
+        last = self._last_gait
+        if last is None or not last.walking or not last.swing.active:
+            return
+        swing = last.swing
+        leg = int(swing.leg)
+        if swing.s < EARLY_CONTACT_MIN_S or float(self.foot_load[leg, 2]) <= SWING_CONTACT_N:
+            return
+        target = float(self.gait._landing_z(self._ground_height))
+        sole = self.robot.data.site_xpos[self.robot.contact_site_ids][
+            leg * 4 : (leg + 1) * 4, 2
+        ]
+        measured = float(sole.min())
+        if measured <= target + EARLY_CONTACT_HEIGHT:
+            return
+        self.gait.note_measured_landing(measured)
+        self.terrain_events.append({
+            "kind": "early_contact",
+            "t": self._tick * self.config.control_dt,
+            "leg": leg,
+            "xy": [float(v) for v in feet[leg, :2]],
+            "believed_z": target,
+            "measured_z": measured,
+            "load_n": [float(v) for v in self.foot_load[leg]],
+        })
 
     # -- main entry point -------------------------------------------------
 
@@ -458,6 +866,7 @@ class LocomotionController:
         ground_z: float,
         foot_yaw: np.ndarray | None = None,
         measured_yaw: np.ndarray | None = None,
+        absolute: bool = False,
     ) -> np.ndarray:
         """Sole-point positions over the MPC horizon, ``(horizon, nc, 3)``.
 
@@ -490,7 +899,15 @@ class LocomotionController:
                     seq[k, rows, :2] = pose[k, leg, :2] + local @ rot.T
             else:
                 seq[:, rows, :2] = pose[:, leg, None, :2] + local
-            seq[:, rows, 2] = ground_z + pose[:, leg, 2, None]
+            if not absolute:
+                seq[:, rows, 2] = ground_z + pose[:, leg, 2, None]
+                continue
+            # Terrain: heights are world z. A foot planned to stay where it
+            # stands uses its measured sites.
+            here = np.linalg.norm(pose[:, leg, :2] - feet[leg, :2], axis=1) < 0.01
+            seq[:, rows, 2] = pose[:, leg, 2, None] + offsets[rows, 2][None, :]
+            if here.any():
+                seq[here, rows, 2] = contact_pos[rows, 2][None, :]
         return seq
 
     def compute_torque(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
@@ -505,10 +922,14 @@ class LocomotionController:
         base_quat = np.asarray(qpos[3:7], dtype=float)
         rot = quat_to_mat(base_quat)
         rpy = quat_to_rpy(base_quat)
+        terrain = self.terrain.active
         measured_mask = self._contact_mask()
         feet = robot.foot_center_positions()
         foot_mid = feet.mean(axis=0)
         ground_z = self._ground_height
+        self._check_obstruction(feet)
+        if terrain:
+            self._check_early_contact(feet)
 
         height_cmd = (
             self.nominal_height if self.command.height is None else float(self.command.height)
@@ -520,13 +941,27 @@ class LocomotionController:
         was_walking = self.gait.walking
         if was_walking:
             goal_h = max(height_cmd, WALK_HEIGHT_MIN)
+            last = self._last_gait
+            if terrain and (
+                (last is not None and last.terrain_ahead)
+                or self._terrain_near(np.asarray(qpos[:2], dtype=float), float(rpy[2]))
+            ):
+                goal_h = min(max(height_cmd, TERRAIN_HEIGHT_MIN), TERRAIN_WALK_HEIGHT)
             step_h = HEIGHT_SLEW_WALK * cfg.control_dt
             self._height_ref += float(np.clip(goal_h - self._height_ref, -step_h, step_h))
+        elif terrain:
+            # Terrain walking may have lowered the CoM; rise back to the stand
+            # height at the walking slew rather than in one tick.
+            step_h = HEIGHT_SLEW_WALK * cfg.control_dt
+            self._height_ref += float(np.clip(height_cmd - self._height_ref, -step_h, step_h))
         else:
             self._height_ref = height_cmd
         height = float(self._height_ref)
 
         stance_i = int(np.argmin(feet[:, 2]))
+        if terrain and self._last_gait is not None and self._last_gait.support_leg >= 0:
+            # On stairs the stance foot is often the higher one.
+            stance_i = int(self._last_gait.support_leg)
         self.gait.mass = float(robot.total_mass)
         gait_out = self.gait.step(
             dt=cfg.control_dt,
@@ -539,9 +974,18 @@ class LocomotionController:
             foot_yaws=robot.foot_yaws(),
             L_meas=robot.angular_momentum_about(feet[stance_i]),
             pelvis_xy=np.asarray(qpos[:2], dtype=float),
+            support_z=self._leg_z.copy() if terrain else None,
         )
         self._last_gait = gait_out
         walking = gait_out.walking
+        if self.gait.touchdowns:
+            for record in self.gait.touchdowns:
+                self.terrain_events.append({
+                    "kind": "touchdown",
+                    "t": self._tick * cfg.control_dt,
+                    **record,
+                })
+            self.gait.touchdowns.clear()
 
         swing_accepted = False
         if walking:
@@ -555,7 +999,7 @@ class LocomotionController:
                 # back onto a short foot and capture saturated.
                 rows = slice(0, 4) if swing.leg == 0 else slice(4, 8)
                 near = float(np.linalg.norm(feet[swing.leg, :2] - swing.foothold[:2]))
-                seated = float(feet[swing.leg, 2] - ground_z) <= TOUCHDOWN_HEIGHT
+                seated = float(feet[swing.leg, 2] - self.gait._landing_z(ground_z)) <= TOUCHDOWN_HEIGHT
                 if (
                     seated
                     and measured_mask[rows].any()
@@ -580,15 +1024,37 @@ class LocomotionController:
             if self.gait.step_index < 3:
                 lateral = 0.0
                 com_xy = com_xy + float(np.dot(dynamics.com[:2] - com_xy, left)) * left
+            base_z, base_vz = ground_z, 0.0
+            if terrain and gait_out.support_z is not None:
+                base_z, base_vz = float(gait_out.support_z), float(gait_out.support_vz)
             com_ref = np.array(
                 [
                     com_xy[0] + lean[0],
                     com_xy[1] + lean[1],
-                    ground_z + height,
+                    base_z + height,
                 ]
             )
             travel = float(self.gait.cmd_speed) * forward + lateral * left
-            com_vel_ref = np.array([travel[0], travel[1], 0.0])
+            if STAIR_PLAN_VELOCITY and terrain and gait_out.stair_transfer and not gait_out.stair_step:
+                # A step over a riser is at least a sole length plus two edge
+                # margins, several cruise strides; the CoM covers it in one
+                # step period only if it tracks the plan's own rate.
+                plan_speed = float(np.dot(np.asarray(gait_out.com_vel_ref, dtype=float), forward))
+                speed = min(max(plan_speed, float(self.gait.cmd_speed)), STAIR_SPEED_CAP)
+                travel = speed * forward + lateral * left
+            if terrain and gait_out.stair_step:
+                # Quasi-static stair step: the gait's own profile, not the
+                # cruise speed, plus position feedback. The MPC may weight
+                # horizontal position at zero (velocity tracking only), and
+                # then nothing but this term moves the CoM onto the sole.
+                com_xy = np.asarray(gait_out.com_ref_xy, dtype=float).copy()
+                com_ref[:2] = com_xy + lean
+                pull = QS_POSITION_GAIN * (com_ref[:2] - dynamics.com[:2])
+                norm = float(np.linalg.norm(pull))
+                if norm > QS_PULL_SPEED:
+                    pull *= QS_PULL_SPEED / norm
+                travel = np.asarray(gait_out.com_vel_ref, dtype=float).reshape(2) + pull
+            com_vel_ref = np.array([travel[0], travel[1], base_vz])
             face_yaw = float(gait_out.yaw_ref)
             yaw_rate_ref = float(gait_out.yaw_rate_ref)
         else:
@@ -598,15 +1064,23 @@ class LocomotionController:
             forward, left = heading_frame(stance_yaw)
             offset = self.nominal_com_offset[:2] + self.command.com_offset_xy
             lean = offset[0] * forward + offset[1] * left
+            base_z = float(self._leg_z.mean()) if terrain else ground_z
             com_ref = np.array(
-                [foot_mid[0] + lean[0], foot_mid[1] + lean[1], ground_z + height]
+                [foot_mid[0] + lean[0], foot_mid[1] + lean[1], base_z + height]
             )
             com_vel_ref = np.zeros(3)
             face_yaw = stance_yaw + float(self.command.yaw)
             yaw_rate_ref = 0.0
+        if terrain:
+            com_ref, com_vel_ref = self._reach_clamp(com_ref, com_vel_ref, feet, contact_mask)
 
+        classical = bool(terrain and walking and classical_stack())
         # --- centroidal MPC (decimated) ---
-        if self._tick % cfg.mpc_decimation == 0:
+        # The first tick after a classical walk solves at once: the stored
+        # forces are the stabilizer's, for the walking contact set.
+        mpc_due = self._tick % cfg.mpc_decimation == 0 or self._was_classical
+        self._was_classical = classical
+        if mpc_due and not classical:
             schedule = None
             contact_pos_seq = None
             if walking:
@@ -621,6 +1095,7 @@ class LocomotionController:
                     ground_z=ground_z,
                     foot_yaw=foot_yaw,
                     measured_yaw=robot.foot_yaws(),
+                    absolute=terrain,
                 )
             state = CentroidalState(
                 rpy=rpy,
@@ -646,6 +1121,14 @@ class LocomotionController:
             )
         self._tick += 1
 
+        if terrain and walking:
+            contact_mask = self._toe_off(
+                contact_mask, feet, dynamics.com, float(rpy[2]), com_vel=dynamics.com_vel
+            )
+        if classical:
+            self._desired_forces = self._stabilizer_forces(
+                dynamics, gait_out, com_ref, com_vel_ref, contact_mask, base_quat, rot, face_yaw
+            )
         forces = self._desired_forces.copy()
         if not contact_mask.all():
             forces[~contact_mask] = 0.0
@@ -660,6 +1143,10 @@ class LocomotionController:
         # walking so the QP does not spend the whole sole on an unachievable
         # vref (see WALK_KP_XY_SCALE).
         kp_xy = wbc_cfg.kp_base_position * (WALK_KP_XY_SCALE if walking else 1.0)
+        if terrain and walking and gait_out.stair_step:
+            # A stair step dwells in single support; the CoM has to be where
+            # the plan put it before the foot lifts, not 3 cm off.
+            kp_xy = wbc_cfg.kp_base_position
         kp_com = np.array(
             [
                 kp_xy,
@@ -713,10 +1200,13 @@ class LocomotionController:
         per_leg = NUM_LEG_JOINTS // 2
         foot_yaws_now = robot.foot_yaws()
         pelvis_yaw = float(rpy[2])
-        if walking:
+        qs_planted = bool(terrain and walking and gait_out.stair_step and np.all(contact_mask))
+        if walking and not qs_planted:
             # Hip yaw holds the foot square to the pelvis yaw the base task
             # is tracking, not to the standing keyframe. A turn otherwise
             # asks the torso to yaw while the hip pins the foot to yaw 0.
+            # Two planted feet in a quasi-static stair step pin the feet
+            # already, and the hold then blocks the sideways weight shift.
             for leg_i in (0, 1):
                 yaw_joint = leg_i * per_leg + HIP_YAW
                 target = self.nominal_joint_pos[yaw_joint] + wrap_angle(
@@ -843,21 +1333,43 @@ class LocomotionController:
                         STANCE_KNEE_STOP_W,
                     )
                 else:
-                    knees = self._knee_bias(height)
-                    hold_joint(
-                        knee,
-                        STANCE_KNEE_KP,
-                        STANCE_KNEE_KD,
-                        STANCE_KNEE_W,
-                        float(knees[leg_i]),
-                    )
+                    knee_w = STANCE_KNEE_W
+                    if terrain:
+                        # Each knee bends to put its hip where the CoM
+                        # reference wants it, whatever the other leg does.
+                        knees = self._geometric_knees(com_ref - dynamics.com)
+                        knee_w = TERRAIN_KNEE_W
+                        if gait_out.stair_step and bool(np.all(contact_mask)):
+                            # Two planted feet hold the knees, as in a stand.
+                            knee_w = 0.0
+                    else:
+                        knees = self._knee_bias(height)
+                    if knee_w > 0.0:
+                        hold_joint(
+                            knee,
+                            STANCE_KNEE_KP,
+                            STANCE_KNEE_KD,
+                            knee_w,
+                            float(knees[leg_i]),
+                        )
                 knee_guard[leg_i] = True
+
+        lean = self._torso_lean(terrain and walking, gait_out, cfg.control_dt)
+        if lean > 0.0:
+            # Forward torso lean over the upper tread (stair_feasibility.py).
+            hold_joint(WAIST_PITCH, TORSO_LEAN_KP, TORSO_LEAN_KD,
+                       float(cfg.wbc.weight_posture_upper),
+                       float(self.nominal_joint_pos[WAIST_PITCH]) + lean)
+
+        if terrain:
+            self._joint_limit_dampers(qj, dqj, joint_acc, joint_weights, cfg.max_joint_acc)
 
         self._last_joint_weights = joint_weights
         self._last_swing_orient_active = swing_orient_jacobian is not None
         self._last_knee_guard = knee_guard
 
-        solution = self.wbc.solve(
+        wbc = self._terrain_wbc() if terrain and JOINT_LIMIT_ROWS else self.wbc
+        solution = wbc.solve(
             dynamics,
             WBCTargets(
                 base_linear_acc=base_linear_acc,
@@ -869,11 +1381,21 @@ class LocomotionController:
                 # base tasks stand down rather than demand what the soles
                 # cannot deliver. Single support is half the contacts, and the
                 # floor keeps the task from vanishing there.
-                base_weight_scale=max(support, MIN_BASE_WEIGHT_SCALE),
+                base_weight_scale=(
+                    QS_BASE_WEIGHT_SCALE
+                    if terrain and walking and gait_out.stair_step
+                    else max(support, MIN_BASE_WEIGHT_SCALE)
+                ),
                 swing_jacobian=swing_jacobian,
                 swing_acc=swing_acc,
                 swing_orient_jacobian=swing_orient_jacobian,
                 swing_orient_acc=swing_orient_acc,
+                force_weight_scale=TERRAIN_FORCE_WEIGHT_SCALE if terrain else 1.0,
+                joint_acc_bounds=(
+                    self._joint_acc_bounds(qj, dqj, cfg.max_joint_acc)
+                    if terrain and JOINT_LIMIT_ROWS
+                    else None
+                ),
             ),
             contact_mask=contact_mask,
         )
@@ -895,7 +1417,7 @@ class LocomotionController:
             walking=walking,
             gait_phase=float(gait_out.phase),
             swing_clearance=(
-                float(feet[swing.leg, 2] - ground_z) if swing.active else 0.0
+                float(feet[swing.leg, 2] - self.gait._landing_z(ground_z)) if swing.active else 0.0
             ),
             swing_error=(
                 float(np.linalg.norm(swing.des_pos - feet[swing.leg]))
@@ -1023,8 +1545,14 @@ class LocomotionController:
         mpc = getattr(self, "mpc", None)
         if wbc is not None:
             out["wbc"] = int(wbc._qp.failures)
+            terrain_wbc = getattr(self, "_wbc_terrain", None)
+            if terrain_wbc is not None:
+                out["wbc"] += int(terrain_wbc._qp.failures)
         if mpc is not None:
             out["mpc"] = int(mpc._qp.failures)
+        stabilizer = getattr(self, "_stabilizer", None)
+        if stabilizer is not None:
+            out["stabilizer"] = int(stabilizer._qp.failures)
         return out
 
     @property
@@ -1060,5 +1588,10 @@ class LocomotionController:
             self.mpc.refresh()
         if "wbc" in groups:
             self.wbc.refresh()
+            if self._wbc_terrain is not None:
+                self._wbc_terrain.refresh()
+            # The stabilizer bakes friction and force bounds into its QP; it is
+            # rebuilt from the patched config on the next classical tick.
+            self._stabilizer = None
             self._refresh_posture_gains()
         return applied
