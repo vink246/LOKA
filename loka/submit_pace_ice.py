@@ -642,9 +642,13 @@ def _require_vision_env(suite: SuiteConfig) -> None:
         import PIL  # noqa: F401
     except ImportError:
         problems.append("Pillow is not installed (pip install Pillow)")
+    try:
+        import OpenGL  # noqa: F401
+    except ImportError:
+        problems.append("PyOpenGL is not installed (pip install PyOpenGL); MuJoCo's osmesa backend needs it")
     lib = Path(os.environ.get("CONDA_PREFIX", "")) / "lib"
     if not any(lib.glob("libOSMesa*")):
-        problems.append(f"no libOSMesa in {lib} (conda install -c conda-forge mesalib)")
+        problems.append(f"no libOSMesa in {lib} (conda install -c conda-forge libosmesa)")
     if problems:
         raise RuntimeError(
             f"baselines {', '.join(vision)} use the head camera on CPU jobs, but " + "; ".join(problems)

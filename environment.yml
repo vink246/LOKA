@@ -6,10 +6,13 @@ dependencies:
   - python=3.10
   - pip
   # OSMesa for offscreen rendering on CPU nodes (LOKA's head camera, videos).
-  - mesalib
+  # Recent conda-forge ships libOSMesa in libosmesa, not mesalib.
+  - libosmesa
   - pip:
       # Encodes head-camera frames (LOKA vision) and plots.
       - Pillow
+      # MuJoCo's osmesa backend.
+      - PyOpenGL
       - mujoco>=3.2
       - numpy>=1.24
       - scipy>=1.10
