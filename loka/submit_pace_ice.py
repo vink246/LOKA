@@ -487,14 +487,24 @@ def _sbatch(script: Path, extra: list[str] | None = None) -> str:
 
 
 #: NaVILA units run as GPU jobs in their own env (scripts/setup_navila_env.sh)
-#: with no model server: the policy loads inside the unit. ``--navila-prefix``
-#: and the ``--gpu-*`` flags override these.
+#: with no model server: the policy loads inside the unit, so bundling saves
+#: nothing and each job is one unit (checkpoint load plus at most 120 s of sim,
+#: well under 45 min). Any one GPU of the listed types: Slurm cannot OR gres
+#: types, so the type is a node constraint; check the feature names with
+#: ``sinfo -o "%G %f"``. ``--navila-prefix`` and the ``--gpu-*`` flags override.
 NAVILA_GPU_ENTRY = {
     "key": "navila",
     "provider": "local",
     "engine": "none",
     "server_env": "~/scratch/envs/loka-navila",
-    "slurm": {"gres": "gpu:A100:1", "mem": "64G", "cpus": 4, "time": "04:00:00"},
+    "units_per_job": 1,
+    "slurm": {
+        "gres": "gpu:1",
+        "constraint": "A100|H100|H200",
+        "mem": "48G",
+        "cpus": 4,
+        "time": "00:45:00",
+    },
 }
 
 
@@ -565,6 +575,7 @@ def _gpu_resources(entry: dict, args) -> dict:
         "cpus": int(args.gpu_cpus or slurm.get("cpus") or 4),
         "mem": args.gpu_mem or slurm.get("mem") or "64G",
         "time_limit": args.gpu_time or slurm.get("time") or "04:00:00",
+        "constraint": slurm.get("constraint"),
     }
 
 
@@ -868,7 +879,7 @@ def _gpu_chain_payload(args, repo: Path, entry: dict, jobs_name: str, max_submit
         "partition": args.gpu_partition or args.partition,
         "account": args.gpu_account or args.account,
         "qos": args.gpu_qos or args.qos,
-        "constraint": args.gpu_constraint or args.constraint,
+        "constraint": args.gpu_constraint or resources["constraint"] or args.constraint,
         "conda_env": args.conda_env,
         "conda_prefix": args.conda_prefix,
     }
@@ -1079,7 +1090,8 @@ def _queue_gpu_models(
     for key, units in gpu_units.items():
         entry = _with_server_env(entries[key], args)
         tag = "_resubmit" if resubmit else ""
-        bundles = bundle_units(key, units, int(args.gpu_units_per_job), tag=tag)
+        per_job = int(entry.get("units_per_job") or args.gpu_units_per_job)
+        bundles = bundle_units(key, units, per_job, tag=tag)
         jobs_name = _gpu_jobs_name(key, resubmit=resubmit)
         _write_manifest(run_dir / "slurm" / jobs_name, bundles, suite.num_trials)
         payload = _gpu_chain_payload(args, repo, entry, jobs_name, per_model_cap)
