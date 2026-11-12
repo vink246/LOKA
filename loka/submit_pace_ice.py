@@ -490,8 +490,9 @@ def _sbatch(script: Path, extra: list[str] | None = None) -> str:
 #: with no model server: the policy loads inside the unit, so bundling saves
 #: nothing and each job is one unit (checkpoint load plus at most 120 s of sim,
 #: well under 45 min). Any one GPU of the listed types: Slurm cannot OR gres
-#: types, so the type is a node constraint; check the feature names with
-#: ``sinfo -o "%G %f"``. ``--navila-prefix`` and the ``--gpu-*`` flags override.
+#: types, so the type is a node constraint on PACE-ICE's ``gpu-<type>`` node
+#: features (``sinfo -o "%G %f"``; A100s are 40 or 80 GB, both enough).
+#: ``--navila-prefix`` and the ``--gpu-*`` flags override.
 NAVILA_GPU_ENTRY = {
     "key": "navila",
     "provider": "local",
@@ -500,7 +501,7 @@ NAVILA_GPU_ENTRY = {
     "units_per_job": 1,
     "slurm": {
         "gres": "gpu:1",
-        "constraint": "A100|H100|H200",
+        "constraint": "gpu-a100|gpu-h100|gpu-h200",
         "mem": "48G",
         "cpus": 4,
         "time": "00:45:00",
