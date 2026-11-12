@@ -1,0 +1,128 @@
+# Stair climbing with terrain-belief mutations. CLI flags override these values.
+#   python -m loka.run_eval --config loka/config/eval_stairs.yaml
+# On PACE-ICE (one CPU job per work unit, as for the main suite):
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_stairs.yaml
+#   python -m loka.submit_pace_ice --config loka/config/eval_stairs.yaml
+#
+# The plant always has the stairs. What the controller believes about them is
+# the baseline's terrain_belief:
+#   low_level          flat belief, no orchestrator: walks into the first riser
+#   low_level_oracle   the plant's own stairs, no orchestrator: the controller's bound
+#   loka_text          LOKA, flat belief, no camera: finds the stairs by touch
+#   loka_vlm           LOKA, flat belief, head camera on every turn
+#   loka_no_refine     loka_vlm without folding measured footfalls into the belief
+# External baselines (unitree_rl, navila, stair-trained policies) are out of scope here.
+#
+# Status (oracle, classical terrain stack, 10 seeds; docs/LOKA.md Section 4.9):
+# curb 10/10 at 0.10 m; the stair scenes use 0.07 m risers, where the
+# four-step flight is 9/10 (2/10 at 0.10 m), the irregular flight
+# (0.07/0.07/0.10/0.07) 9/10 and stairs_up_down 7/10.
+
+output_dir: results/g1_stairs
+seed: 0
+num_trials: 5
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: wall
+    seconds: 2.0
+  request_timeout_s: 120.0
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+ablation_config: loka/config/loka_ablations.yaml
+
+baselines:
+  - {name: low_level, type: low_level, options: {terrain_belief: empty}}
+  - {name: low_level_oracle, type: low_level, options: {terrain_belief: oracle}}
+  - {name: loka_text, type: loka, options: {terrain_belief: empty, vision: false}}
+  - {name: loka_vlm, type: loka, options: {terrain_belief: empty, vision: true}}
+  - {name: loka_no_refine, type: loka, options: {terrain_belief: empty, vision: true, terrain_refine: false}}
+
+tasks:
+  # Four 0.07 m steps from x = 1.0; the landing's middle is (2.4, 0) at z = 0.28.
+  - name: stairs_regular
+    type: stairs
+    scene: stairs_regular
+    goal:
+      xy: [2.4, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Climb the stairs ahead and stop on the landing at the world coordinate (2.4, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+
+  # Same flight with 0.15 m risers (top at 0.60).
+  - name: stairs_riser_015
+    type: stairs
+    scene: stairs_regular
+    riser: 0.15
+    goal:
+      xy: [2.4, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Climb the stairs ahead and stop on the landing at the world coordinate (2.4, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+
+  # Third riser 3 cm taller than the rest: the belief has to be refined in flight.
+  - name: stairs_irregular
+    type: stairs
+    scene: stairs_irregular
+    goal:
+      xy: [2.4, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Climb the stairs ahead and stop on the landing at the world coordinate (2.4, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+
+  # One 0.10 m curb with a 1.5 m platform; the goal is its middle.
+  - name: curb
+    type: stairs
+    scene: curb
+    goal:
+      xy: [1.75, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Step up onto the platform ahead and stop at the world coordinate (1.75, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 60.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]

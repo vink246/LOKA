@@ -44,8 +44,10 @@ _GROUP_DESCRIPTIONS = {
         "c_<channel> MPC weighted state residual for "
         + " ".join(COST_CHANNEL_NAMES)
     ),
-    "contact_fz": "fz_l0..fz_l3 and fz_r0..fz_r3 normal force at the left and right sole corners [N]",
-    "prop_force": "prop_n total contact force from objects [N]",
+    "contact_fz": (
+        "fz_l0..fz_l3 and fz_r0..fz_r3 normal force the controller plans at the left and right "
+        "sole corners [N]; a plan, not a measurement"
+    ),
 }
 
 
@@ -106,8 +108,6 @@ def group_columns(group: str, actuator_names: Sequence[str]) -> tuple[str, ...]:
         return tuple(f"c_{n}" for n in COST_CHANNEL_NAMES)
     if group == "contact_fz":
         return _CONTACT_COLUMNS
-    if group == "prop_force":
-        return ("prop_n",)
     raise ValueError(f"unknown raw channel group {group!r}")
 
 
@@ -149,8 +149,6 @@ def group_values(frame: dict, group: str, n_actuators: int) -> list[float]:
         forces = np.asarray(frame.get("contact_forces", np.zeros((8, 3))), dtype=float).reshape(-1, 3)
         fz = forces[:, 2] if forces.size else np.zeros(0)
         return list(np.concatenate([fz, np.zeros(max(0, 8 - fz.size))])[:8])
-    if group == "prop_force":
-        return [float(sum(float(e.get("force_n", 0.0)) for e in frame.get("prop_contacts") or ()))]
     raise ValueError(f"unknown raw channel group {group!r}")
 
 

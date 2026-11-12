@@ -63,6 +63,12 @@ def final_goal_error_m(episode: EpisodeData):
     return float(distances[-1])
 
 
+@register_metric("highest_step_m", scope="episode")
+def highest_step_m(episode: EpisodeData):
+    """Highest ground both soles stood on at once [m], stairs tasks only."""
+    return _finite(episode.metadata.get("highest_step_m"))
+
+
 @register_metric("fell", scope="episode")
 def fell(episode: EpisodeData) -> float:
     return 1.0 if episode.metadata.get("fell") else 0.0

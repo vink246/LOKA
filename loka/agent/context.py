@@ -96,7 +96,8 @@ def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) ->
             f"{spec.pitch_down_deg:.0f} deg down, horizontal FOV {spec.fovx_deg:.0f} deg, "
             f"about {h:.2f} m above the floor. The image's left is the robot's left. Horizon "
             f"near row {horizon:.0f}; floor distance ahead by image row: {', '.join(ranges)}.{floor}",
-            "The plant does not see obstacles: route around them with waypoints.",
+            "The plant does not see obstacles: route around them with waypoints. Stairs and "
+            "curbs are terrain: declare them with a stairs Model_Mutation and set the goal on top.",
         ]
     )
 
@@ -185,10 +186,35 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "after_s listener (2 to 4 s) or a near_xy listener short of them to look again.",
         "- The frame was taken when the message was sent; the robot keeps moving during your "
         "reply, so allow for the distance covered at the current speed.",
-        "- Do not plan to step onto any object: the footstep planner assumes flat ground.",
-        "- An OBJECT CONTACT section in the telemetry means the robot is touching an object. The "
-        "contact force raises |bias|; that is an external load, not a model error. Back off "
-        "or steer around before queueing any belief search.",
+        "- Stairs, curbs and platforms are terrain, not obstacles: declare them with a stairs "
+        "or volume Model_Mutation before the walk reaches them, and put the goal on top. The "
+        "foot of the first riser is where the bottom step meets the floor: use the floor "
+        "formulas above on its lowest visible row. Count the treads.",
+        "- Measure the riser height; do not guess it. A riser is a vertical face, so its bottom "
+        "edge (where it meets the floor or the tread below) and its top edge (the nosing, where "
+        "it meets the tread above) are the same distance ahead. In one column through the "
+        "middle of the riser, read the bottom-edge row v_b and the top-edge row v_t (v_t < v_b). "
+        "For a row v: yn = (v - cy) / fy and r(v) = (sin(p) + yn cos(p)) / (cos(p) - yn sin(p)), "
+        "the tangent of that ray's angle below horizontal. Then",
+        "  riser = h (1 - r(v_t) / r(v_b))",
+        "  with h and p from CAMERA FRAME. For step k, use its own bottom and top edges and h minus "
+        "the height of the tread its bottom edge stands on.",
+        "  The floor formulas assume the point is on the floor. For a point on a raised surface of "
+        "height t (a tread's far edge, the back edge of a platform), use h - t in place of h: "
+        "ahead X = (h - t)(cos(p) - yn sin(p)) / d, and likewise for Y. Measure the riser first, "
+        "then place the raised edges with it.",
+        "  Scale: with this camera one image row is about 0.6 cm of riser 0.7 to 1.6 m ahead, so a "
+        "0.10 m riser spans about 15 to 17 rows. Read the edges to the pixel; a 3-row misread is a "
+        "2 cm error. Measure from a frame with the first riser 0.7 to 1.6 m ahead (closer, its "
+        "bottom edge leaves the image) and re-measure from the staging point. Write v_b, v_t and "
+        "the resulting riser in Analysis.",
+        "  The robot measures every tread it steps on and corrects the belief. When the edges are "
+        "unclear, round the riser down rather than up: a riser declared too high can make the "
+        "robot fall.",
+        "- Do not plan to step onto movable objects: route around them.",
+        "- The robot has no touch sensing. Pressing on an object also raises |bias|; that is an "
+        "external load, not a model error. If |bias| rises while the frame shows the robot "
+        "against an object, back off or steer around before queueing any belief search.",
         "- Objects beyond about 6 m are a few pixels wide. Do not infer free space far away "
         "from an empty-looking image.",
     ]

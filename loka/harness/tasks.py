@@ -112,6 +112,132 @@ class GotoGoalTask:
         return meta
 
 
+def task_terrain(raw: dict) -> list[dict]:
+    """The stairs a task builds into the plant: a scene's ``terrain:`` list, or inline."""
+    from loka.scene_props import load_scene_terrain, normalize_terrain
+
+    if raw.get("terrain"):
+        terrain = normalize_terrain(raw["terrain"])
+    else:
+        terrain = load_scene_terrain(str(raw["scene"]))
+    riser = raw.get("riser")
+    if riser is not None:
+        for flight in terrain:
+            flight["riser"] = riser
+    return terrain
+
+
+@register_task("stairs")
+class StairsTask:
+    """Climb a flight of stairs to a goal on its landing.
+
+    Success is the pelvis inside the goal radius with both soles at the
+    landing height (within 2 cm), held for ``goal.hold_s``. The plant gets the
+    stairs; what the controller believes about them is the baseline's
+    ``terrain_belief`` option (LOKA starts flat and has to declare them).
+    """
+
+    def __init__(self, spec) -> None:
+        self.spec = spec
+
+    def run(self, suite, unit, unit_dir: Path) -> dict:
+        from loka.control.terrain import stairs_volumes
+
+        raw = self.spec.raw
+        terrain = task_terrain(raw)
+        top = stairs_volumes(terrain[0])[-1]
+        goal = raw["goal"]
+        xy = (float(goal["xy"][0]), float(goal["xy"][1]))
+        speed = float(goal.get("speed", 0.15))
+        radius = float(goal.get("radius", 0.2))
+        hold_s = float(goal.get("hold_s", 1.0))
+        landing_z = float(goal.get("landing_z", top.top))
+        command_at = float(raw.get("command_time_s", 0.5))
+        perturb_at = float(raw.get("perturbation_time_s", command_at))
+        timeout_s = float(raw["timeout_s"])
+        goal_via = str(raw.get("goal_via", "directive"))
+        perturbation = make_perturbation(self.spec.perturbation(unit.perturbation))
+        log_path = unit_dir / "session.log"
+        agent = build_baseline(
+            suite.baseline(unit.baseline), suite, log_path=log_path, terrain=terrain
+        )
+        agent.reset(unit.seed, suite.init_noise)
+        if goal_via == "directive" and agent.supports_directive:
+            text = str(raw.get("directive") or (
+                f"Walk to the world coordinate ({xy[0]:g}, {xy[1]:g}) at {speed:g} m/s "
+                f"and stop within {radius:g} m."
+            ))
+            goal_event = Event(command_at, "directive", (text, xy, speed, radius))
+            used_via = "directive"
+        else:
+            goal_event = Event(command_at, "goal", (xy, speed, radius))
+            used_via = "task_targets"
+        held = {"since": None}
+        reached = {"z": 0.0}
+        sites = None
+
+        def feet_z(agent) -> np.ndarray:
+            nonlocal sites
+            import mujoco
+
+            model = agent.sim.model
+            if sites is None:
+                sites = [
+                    mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
+                    for name in ("left_foot_center", "right_foot_center")
+                ]
+            return np.array([agent.sim.data.site_xpos[s][2] for s in sites])
+
+        def arrived(agent) -> bool:
+            soles = feet_z(agent)
+            reached["z"] = max(reached["z"], float(soles.min()))
+            if agent.goal_xy is None:
+                return False
+            dist = float(np.linalg.norm(agent.sim.data.qpos[:2] - agent.goal_xy))
+            now = float(agent.sim.data.time)
+            if dist <= radius and float(soles.min()) >= landing_z - 0.02:
+                if held["since"] is None:
+                    held["since"] = now
+                return now - held["since"] + 1e-9 >= hold_s
+            held["since"] = None
+            return False
+
+        meta = _run(
+            agent,
+            suite,
+            unit_dir,
+            [goal_event, Event(perturb_at, "perturbation", perturbation)],
+            timeout_s,
+            {
+                "task": unit.task,
+                "perturbation": unit.perturbation,
+                "baseline": unit.baseline,
+                "trial": unit.trial,
+                "seed": unit.seed,
+                "init_noise": suite.init_noise,
+                "goal_xy": [xy[0], xy[1]],
+                "goal_speed": speed,
+                "goal_radius": radius,
+                "goal_via": used_via,
+                "terrain": terrain,
+                "landing_z": landing_z,
+            },
+            arrived,
+            encode=bool(suite.recording.enabled),
+        )
+        meta["highest_step_m"] = float(reached["z"])
+        meta["time_to_goal_s"] = meta["t_end"] if meta.get("outcome") == "success" else None
+        runtime = getattr(agent, "runtime", None)
+        if runtime is not None:
+            meta["terrain_events"] = [
+                {k: v for k, v in event.items() if k in ("kind", "sim_t", "leg", "xy", "believed_z", "measured_z", "refine", "note")}
+                for event in runtime.terrain_log
+            ]
+            meta["terrain_volumes"] = list((runtime.loka_state.get("volumes") or {}).values())
+        _rewrite(unit_dir, meta)
+        return meta
+
+
 @register_task("stand_push")
 class StandPushTask:
     """Asymmetric mass, then the largest push the robot survives.

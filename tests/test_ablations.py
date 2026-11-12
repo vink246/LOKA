@@ -228,7 +228,6 @@ def _frames(n: int = 1000, dt: float = 0.002) -> list[dict]:
                 "slip": 0.05,
                 "mpc_cost": np.abs(rng.normal(size=12)),
                 "contact_forces": np.abs(rng.normal(scale=50, size=(8, 3))),
-                "prop_contacts": [],
             }
         )
     return frames
@@ -261,11 +260,19 @@ def test_raw_table_fits_the_budget_and_drops_in_order():
 
 def test_hidden_residual_channels_and_legend():
     hidden = _ablations("raw_and_cost")
-    assert hidden.raw_channels() == ("base", "command", "mpc_cost", "contact_fz", "prop_force")
+    assert hidden.raw_channels() == ("base", "command", "mpc_cost", "contact_fz")
     shown = _ablations("raw_and_cost", hide_residual_telemetry=False)
     assert "effort_dev" in shown.raw_channels()
     legend = describe_columns(hidden.raw_channels())
     assert "e_<actuator>" not in legend and "c_<channel>" in legend
+
+
+def test_a_stored_config_with_the_retired_prop_channel_still_loads_without_it():
+    spec = RawTelemetrySpec.from_dict(
+        {"channels": ["base", "slip", "prop_force"], "drop_order": ["prop_force", "slip"]}
+    )
+    assert spec.channels == ("base", "slip")
+    assert spec.drop_order == ("slip",)
 
 
 def test_sample_indices_keep_the_newest_frame():

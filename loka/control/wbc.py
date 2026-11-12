@@ -130,6 +130,13 @@ class WBCTargets:
     #: 0 drops the horizontal CoM task (Xiong & Ames: horizontal CoM is not an
     #: output). Vertical height and orientation keep ``base_weight_scale``.
     base_xy_scale: float = 1.0
+    #: Scales the pull toward the MPC contact forces. Above 1 the MPC owns
+    #: the force distribution and the WBC only maps it to torques, as in
+    #: whole-body impulse control (Kim et al. 2019).
+    force_weight_scale: float = 1.0
+    #: ``(lower, upper)`` joint-acceleration bounds for the controller's
+    #: joint-limit rows, one entry per limited joint; None leaves them open.
+    joint_acc_bounds: tuple[np.ndarray, np.ndarray] | None = None
 
 
 @dataclass
@@ -141,7 +148,7 @@ class WBCSolution:
 
 class WholeBodyController:
     def __init__(self, config: WBCConfig, nv: int, num_joints: int, num_contacts: int,
-                 torque_limit: np.ndarray) -> None:
+                 torque_limit: np.ndarray, limited_joints=None) -> None:
         self.config = config
         self.nv = nv
         self.num_joints = num_joints
@@ -149,12 +156,17 @@ class WholeBodyController:
         self.force_dim = 3 * num_contacts
         self.num_vars = nv + self.force_dim
         self.torque_limit = np.asarray(torque_limit, dtype=float)
+        #: Joints (actuated index) with a hard acceleration-bound row each.
+        self.limited_joints = np.asarray(
+            [] if limited_joints is None else limited_joints, dtype=int
+        )
 
         self.n_base_rows = QVEL_JOINT0
         self.n_friction_rows = 5 * num_contacts
         self.n_torque_rows = num_joints
+        self.n_limit_rows = int(self.limited_joints.size)
         self.num_constraints = (
-            self.n_base_rows + self.n_friction_rows + self.n_torque_rows
+            self.n_base_rows + self.n_friction_rows + self.n_torque_rows + self.n_limit_rows
         )
 
         self._constraint = np.zeros((self.num_constraints, self.num_vars))
@@ -168,8 +180,21 @@ class WholeBodyController:
             constraint_pattern=self._constraint_pattern(),
         )
         self._write_friction_rows()
+        self._write_limit_rows()
 
     # -- static problem structure ----------------------------------------
+
+    @property
+    def _limit_slice(self) -> slice:
+        start = self.n_base_rows + self.n_friction_rows + self.n_torque_rows
+        return slice(start, start + self.n_limit_rows)
+
+    def _write_limit_rows(self) -> None:
+        rows = self._limit_slice
+        for k, joint in enumerate(self.limited_joints):
+            self._constraint[rows.start + k, QVEL_JOINT0 + int(joint)] = 1.0
+        self._lower[rows] = -np.inf
+        self._upper[rows] = np.inf
 
     @property
     def _joint_slice(self) -> slice:
@@ -220,6 +245,8 @@ class WholeBodyController:
             c = self.nv + 3 * i
             mask[r : r + 5, c : c + 3] = True
         mask[self._torque_slice, :] = True
+        for k, joint in enumerate(self.limited_joints):
+            mask[self._limit_slice.start + k, QVEL_JOINT0 + int(joint)] = True
         return Sparsity(mask)
 
     def _write_friction_rows(self) -> None:
@@ -321,6 +348,20 @@ class WholeBodyController:
         weights[0:2] = pos_w * xy
         weights[2] = pos_w
         weights[3:6] = targets.base_weight_scale * cfg.weight_base_orientation
+
+        if self.n_limit_rows:
+            rows = self._limit_slice
+            if targets.joint_acc_bounds is None:
+                self._lower[rows] = -np.inf
+                self._upper[rows] = np.inf
+            else:
+                self._lower[rows] = targets.joint_acc_bounds[0]
+                self._upper[rows] = targets.joint_acc_bounds[1]
+
+        if targets.force_weight_scale != 1.0:
+            weights[nv:] = cfg.weight_force * float(targets.force_weight_scale)
+        else:
+            weights[nv:] = cfg.weight_force
 
         target = np.empty(self.num_vars)
         target[0:3] = targets.base_linear_acc

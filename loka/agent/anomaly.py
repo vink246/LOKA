@@ -17,12 +17,16 @@ _COST_NAMES = ("roll", "pitch", "yaw", "x", "y", "z", "wx", "wy", "wz", "vx", "v
 def belief_actuator_deviation(plant_bias, belief_bias, contact_jacobian) -> np.ndarray:
     """Model residual in actuator torques.
 
-    ``plant_bias`` is the measured generalized force: actuator torque (current),
-    contact force (foot sensors), and any known external force. ``belief_bias``
+    ``plant_bias`` is the measured generalized force from proprioception alone:
+    actuator torque (motor current), the belief's passive joint force, the
+    contact force each leg's joint torques imply (``FootLoadEstimator``), and
+    any known external force. No foot force sensor is assumed. ``belief_bias``
     is the belief model's inverse dynamics at the measured position, velocity,
     and acceleration. Their difference is zero when the belief explains the
-    motion. Torso mass and COM land on the floating base, so the base wrench is
-    resolved through the sole Jacobian, ``J_base.T @ f = Δ_base``, and the
+    motion. The leg rows are zero by construction, since they define the
+    contact estimate; a torso mass or COM error shows on the floating base,
+    which has no actuator, and on the joints above the pelvis. The base wrench
+    is resolved through the sole Jacobian, ``J_base.T @ f = Δ_base``, and the
     actuator value is ``J_joint.T @ f`` plus the joint residual.
     """
     plant = np.asarray(plant_bias, dtype=float).reshape(-1)

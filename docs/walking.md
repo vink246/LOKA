@@ -21,6 +21,21 @@ Standing is unaffected (8 s hold, 0.01° peak tilt, 0.1 mm mean CoM error).
 Run `python -m loka.verify_gait` for current numbers. The pass/fail gates are in
 `tests/test_gait.py`.
 
+## Terrain mode (stairs and curbs)
+
+When the controller's terrain belief holds a block, terrain mode replaces parts of the flat walk; on a flat belief nothing changes (`scripts/flat_regress.py` checks bit-identity). Two terrain stacks, `--terrain-stack classical|heuristic` (`TERRAIN_STACK` in `loka/control/terrain.py`):
+
+| | `classical` (default) | `heuristic` |
+|---|---|---|
+| Footholds | one foot per tread, mid-tread (`next_tread_center`) | cruise stride snapped onto treads |
+| Stair swing time | 0.35 s + 0.6 s/m of swing + 1.0 s/m of rise | 0.5 s |
+| CoM plan | 3D DCM, heel-to-toe VRP on stair steps | 3D DCM, fixed VRP |
+| Contact forces | DCM feedback to a CMP + contact-wrench distribution QP (`stabilizer.py`); MPC not solved while walking | ConvexMPC |
+| Step adjustment | 0.20 m across the stairs, 0.06 m along them | 0.06 m |
+| Trunk | upright, angular-momentum damping | 0.12 rad lean (`TERRAIN_LEAN_MODE`) |
+
+Shared by both: footholds with heights and edge margins, the lift-then-move stair swing arc, CoM height from the vertical DCM with a reach clamp, contact from leg joint torques (no foot sensors), WBC tracking of the planned forces at 100× the flat weight, trailing-foot toe-off, soft joint-limit dampers, and touchdown handling for a tread whose believed height is off by a few centimetres (a loaded foot up to 4 cm high counts as down, a foot over a lower tread searches down for it, and the weight moves onto a foot only once it is down). Oracle results (classical, 10 seeds): curb 10/10 at 0.10 m; four-step flight 9/10 at 0.07 m (the stair scenes' riser) and 2/10 at 0.10 m. Full description, equations, references and results: `docs/LOKA.md` Section 4.9.
+
 ## Architecture
 
 ```text

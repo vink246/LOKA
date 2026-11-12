@@ -135,7 +135,8 @@ def format_full_state_section(frames: Sequence[dict]) -> str:
 
 _EFFORT_NOTE = (
     "Measured force minus the belief model's inverse dynamics, resolved into actuators through the foot contacts. "
-    "Measured force is actuator torque (current) plus contact force (foot sensors). "
+    "Measured force is actuator torque (current) plus the ground force on each foot as read from that leg's "
+    "joint torques; there are no foot force sensors. "
     "Zero means the believed dynamics explain the motion. "
     "A persistent positive value means the plant outweighs the belief along that joint (mass or COM too low). "
     "A persistent negative value means the belief overshoots the plant. "
@@ -215,38 +216,81 @@ def format_cost_section(observer) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_prop_contact_section(frames: Sequence[dict]) -> str:
-    """Robot-to-prop contact over the window. Empty when nothing was touched.
-
-    Objects are numbered, not named: what the robot bumped into is for the
-    orchestrator to find in the image, as a robot only feels the force.
-    """
-    peak: dict[str, dict] = {}
-    touching_steps: dict[str, int] = {}
-    for frame in frames:
-        for entry in frame.get("prop_contacts") or ():
-            name = entry["prop"]
-            touching_steps[name] = touching_steps.get(name, 0) + 1
-            best = peak.get(name)
-            if best is None or entry["force_n"] > best["force_n"]:
-                peak[name] = entry
-    if not peak:
-        return ""
-    latest = {e["prop"] for e in (frames[-1].get("prop_contacts") or ())}
-    lines = [
-        "OBJECT CONTACT",
-        "  The robot touched an object in this window. Contact force enters the effort "
-        "residual as an external load. It is not a model error; do not queue a belief "
-        "search for it.",
-    ]
-    ranked = sorted(peak.items(), key=lambda kv: -kv[1]["force_n"])
-    for index, (name, entry) in enumerate(ranked, start=1):
-        share = touching_steps[name] / max(len(frames), 1)
-        now = "touching now" if name in latest else "released"
-        lines.append(
-            f"  object {index}: peak normal {entry['force_n']:.1f} N, "
-            f"{share:.0%} of the window, {now}; robot links {', '.join(entry['links'])}"
+def _event_line(event: dict) -> str:
+    kind = event.get("kind")
+    t = float(event.get("sim_t", event.get("t", 0.0)))
+    leg = "left" if int(event.get("leg", 0)) == 0 else "right"
+    xy = event.get("xy") or [0.0, 0.0]
+    where = f"({float(xy[0]):+.2f}, {float(xy[1]):+.2f})"
+    if kind == "touchdown":
+        believed = event.get("believed_z")
+        measured = float(event["measured_z"])
+        if believed is None:
+            return f"t={t:.2f}s {leg} foot planted at z={measured:.3f} m at {where}"
+        line = (
+            f"t={t:.2f}s {leg} foot planted at z={measured:.3f} m at {where}, "
+            f"belief {float(believed):.3f} m ({measured - float(believed):+.3f} m)"
         )
+        if event.get("refine") == "refined":
+            line += "; belief refined to the measurement"
+        elif event.get("refine") == "unexplained":
+            line += "; no believed volume there"
+        return line
+    if kind == "early_contact":
+        return (
+            f"t={t:.2f}s {leg} swing foot met ground at z={float(event['measured_z']):.3f} m at "
+            f"{where}, {float(event['measured_z']) - float(event['believed_z']):+.3f} m above its target"
+        )
+    if kind == "swing_obstructed":
+        load = np.asarray(event.get("load_n") or [0, 0, 0], dtype=float)
+        return (
+            f"t={t:.2f}s {leg} swing foot blocked at {float(event['s']):.0%} of its swing, sole at "
+            f"z={float(event['foot_z']):.3f} m at {where}; load {np.linalg.norm(load):.0f} N "
+            f"(x {load[0]:+.0f}, y {load[1]:+.0f}, z {load[2]:+.0f}): something in front of or under the foot"
+        )
+    return f"t={t:.2f}s {kind}"
+
+
+def format_terrain_section(frames: Sequence[dict]) -> str:
+    """Ground under the feet, the next footholds, and footfall events.
+
+    Footfalls are measured from leg kinematics and the joint-torque foot load;
+    there is no foot force sensing. Empty on a flat belief with no events.
+    """
+    latest = frames[-1] if frames else {}
+    terrain = latest.get("terrain")
+    if not terrain:
+        return ""
+    events = terrain.get("events") or []
+    if not terrain.get("active") and not events and not terrain.get("fault"):
+        return ""
+    lines = [
+        "TERRAIN",
+        "  Ground heights are world z [m]. Measured heights come from where each sole "
+        "rests (leg kinematics); a touchdown is felt as load on the leg's joint torques.",
+    ]
+    names = ("left", "right")
+    for leg in (0, 1):
+        foot = terrain["feet"][leg]
+        load = terrain["load_n"][leg]
+        lines.append(
+            f"  {names[leg]} foot at ({foot[0]:+.2f}, {foot[1]:+.2f}) z={foot[2]:.3f}; "
+            f"believed ground {terrain['believed_z'][leg]:.3f}, measured {terrain['leg_z'][leg]:.3f}; "
+            f"vertical load {load[2]:.0f} N"
+        )
+    if terrain.get("footholds"):
+        planned = "; ".join(
+            f"{names[s['leg']]} ({s['xy'][0]:+.2f}, {s['xy'][1]:+.2f})"
+            + (f" z={s['z']:.3f}" if s.get("z") is not None else "")
+            for s in terrain["footholds"]
+        )
+        lines.append(f"  next footholds: {planned}")
+    fault = terrain.get("fault")
+    if fault:
+        lines.append(f"  EVENT THAT OPENED THIS TURN: {fault.get('note') or _event_line(fault)}")
+    if events:
+        lines.append("  recent footfalls:")
+        lines.extend(f"    {_event_line(e)}" for e in events[-6:])
     return "\n".join(lines) + "\n"
 
 
@@ -307,8 +351,8 @@ def synthesize_stand_telemetry(
 ) -> str:
     """Current state, per-actuator effort deviation, and per-component state cost.
 
-    ``compact`` keeps the state, the effort summary and any prop contact, and
-    drops the per-actuator list and the state cost. With a tracking-cost
+    ``compact`` keeps the state and the effort summary, and drops the
+    per-actuator list and the state cost. With a tracking-cost
     detector (``observer.kind == "cost"``) the report adds the TRACKING COST
     trigger; ``hide_residual`` then leaves out the effort deviation, motor
     deficit and stance slip.
@@ -332,7 +376,7 @@ def synthesize_stand_telemetry(
             format_compact_state_section(window),
             trigger,
             effort,
-            format_prop_contact_section(window),
+            format_terrain_section(window),
             # Without the residual, the per-channel cost is what picks a search.
             format_cost_section(observer) if hide_residual else None,
         ]
@@ -341,7 +385,7 @@ def synthesize_stand_telemetry(
             format_full_state_section(window),
             trigger,
             effort,
-            format_prop_contact_section(window),
+            format_terrain_section(window),
             format_cost_section(observer),
         ]
     return "\n".join(section for section in sections if section)

@@ -102,17 +102,36 @@ def _inject(sim: Simulation, viz: FaultVizState, fault: FaultSpec) -> None:
         raise RuntimeError(message)
 
 
+def _terrain_belief_option(spec) -> str:
+    options = (getattr(spec, "options", None) or {}) if spec is not None else {}
+    mode = str(options.get("terrain_belief", "empty")).strip().lower()
+    if mode not in ("empty", "oracle"):
+        raise ValueError(
+            f"baseline {getattr(spec, 'name', '?')!r}: terrain_belief must be empty or oracle, got {mode!r}"
+        )
+    return mode
+
+
 @register_baseline("low_level")
 class LowLevelBaseline(Baseline):
     """MPC + WBC only. The effort observer is not in this loop, so a model
     error cannot force the gait to stand.
+
+    Options: ``terrain_belief`` (``empty``, the flat-floor controller, or
+    ``oracle``, the plant's own stairs, for the controller-only bound).
     """
 
-    def __init__(self, spec, suite, log_path: Path | None = None) -> None:
-        del spec, log_path
-        self._sim = Simulation(locomotion_config(suite))
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
+        del log_path
+        self._sim = Simulation(locomotion_config(suite), terrain=terrain)
+        self._terrain_belief = _terrain_belief_option(spec)
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
+        self._seed_terrain()
+
+    def _seed_terrain(self) -> None:
+        if self._terrain_belief == "oracle":
+            self._sim.controller.terrain.set_volumes(self._sim.plant_terrain.volumes)
 
     def reset(self, seed: int, init_noise: float) -> None:
         self._sim.reset()
@@ -150,13 +169,14 @@ class UnitreeRLBaseline(LowLevelBaseline):
     (slowest walking command [m/s]).
     """
 
-    def __init__(self, spec, suite, log_path: Path | None = None) -> None:
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
         del log_path
         options = dict(spec.options or {})
         self._sim = UnitreeRLSimulation(
             locomotion_config(suite),
             policy_dir=options.get("policy_dir"),
             min_speed=options.get("min_speed"),
+            terrain=terrain,
         )
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
@@ -179,7 +199,15 @@ def loka_runtime_config(spec, suite, log_path: Path | None = None) -> LokaConfig
     if orch.temperature is not None:
         entry["temperature"] = float(orch.temperature)
     ablations = AblationSet.from_dict(options.get("ablations")) if spec.type == "loka_ablated" else AblationSet()
+    extra = {}
+    if "terrain_belief" in options:
+        extra["terrain_belief"] = _terrain_belief_option(spec)
+    if "terrain_refine" in options:
+        extra["terrain_refine"] = bool(options["terrain_refine"])
+    if "vision" in options:
+        extra["enable_vision"] = bool(options["vision"])
     return LokaConfig(
+        **extra,
         enable_llm=True,
         llm_model=str(entry["model"]),
         llm_provider=str(entry["provider"]),
@@ -202,14 +230,18 @@ class LokaBaseline(Baseline):
 
     ``options.orchestrator`` picks the model per baseline, e.g.
     ``{model: claude-sonnet-4-5}`` or a local key from
-    ``loka/config/orchestrator_models.yaml``.
+    ``loka/config/orchestrator_models.yaml``. Terrain options:
+    ``terrain_belief`` (``empty`` or ``oracle``), ``terrain_refine`` (false
+    is the no-refine ablation) and ``vision`` (the head camera on every turn).
     """
 
     supports_directive = True
 
-    def __init__(self, spec, suite, log_path: Path | None = None) -> None:
-        self._sim = Simulation(locomotion_config(suite))
-        self.runtime = LokaRuntime(self._sim, loka_runtime_config(spec, suite, log_path))
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
+        config = loka_runtime_config(spec, suite, log_path)
+        camera = config.vision.recipe() if config.enable_vision else None
+        self._sim = Simulation(locomotion_config(suite), terrain=terrain, camera=camera)
+        self.runtime = LokaRuntime(self._sim, config)
         self.runtime.effort_observer.printout = False
         self._goal_xy = None
 
@@ -276,7 +308,7 @@ class NavilaBaseline(Baseline):
 
     supports_directive = True
 
-    def __init__(self, spec, suite, log_path: Path | None = None) -> None:
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
         from loka.agent.loka_config import loka_config
         from loka.vla.navila import (
             NavilaConfig,
@@ -304,6 +336,7 @@ class NavilaBaseline(Baseline):
             "props": dict((loka_config().get("props") or {}).get("slots") or {}),
             "static_props": tuple((loka_config().get("props") or {}).get("static") or ()),
             "camera": camera,
+            "terrain": terrain,
         }
         if plant == "unitree_rl":
             self._sim = UnitreeRLSimulation(
@@ -358,5 +391,9 @@ class NavilaBaseline(Baseline):
         return self.runtime.viz
 
 
-def build_baseline(spec, suite, log_path: Path | None = None) -> Baseline:
-    return get_baseline(spec.type)(spec, suite, log_path=log_path)
+def build_baseline(spec, suite, log_path: Path | None = None, terrain=None) -> Baseline:
+    """One baseline on a plant with ``terrain`` (stairs specs) built in, if any."""
+    cls = get_baseline(spec.type)
+    if terrain:
+        return cls(spec, suite, log_path=log_path, terrain=terrain)
+    return cls(spec, suite, log_path=log_path)
