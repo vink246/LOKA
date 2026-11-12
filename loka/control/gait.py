@@ -324,6 +324,23 @@ TERRAIN_TOUCHDOWN_HOLD = 0.35
 #: While held, the swing target sinks at this rate, to at most this depth.
 REACH_DOWN_SPEED = 0.25  # m/s
 REACH_DOWN_MAX = 0.08  # m
+#: Once the unloaded sole is REACH_DOWN_BELOW under the believed tread, the
+#: tread is really lower: the target then sinks at REACH_DOWN_FAST with
+#: velocity feed-forward, so the foot does not lag it. A foot still above
+#: the believed tread keeps the slow position-only reach; driving every held
+#: foot down fast stomped it and cost the 0.08 m oracle flight 4/6 -> 1/6.
+#: The fast search finds a 4 cm error in well under 0.1 s; slower, a 0.14 m
+#: belief over a 0.10 m curb hung long enough to tip the robot (0/3 -> 3/3).
+REACH_DOWN_FAST = 0.6  # m/s
+REACH_DOWN_BELOW = 0.0  # m
+#: Upper side of the believed tread's height range on a stair landing [m]:
+#: a loaded swing foot up to this much above the believed tread is down.
+#: The lower side is the reach-down above. Either way the weight moves onto
+#: the foot only once it is loaded (no early commit on stair landings, and
+#: the stabilizer gives no force to a foot that is not touching).
+TOUCHDOWN_BAND = 0.04
+#: Allow the early plant (clock jump on a seated foot) on stair landings.
+STAIR_EARLY_PLANT = False
 
 #: Plant-side go-to-point (``gait.goal_*``). The scheduler re-aims
 #: ``heading`` at the goal and sets ``speed`` every tick, so the orchestrator
@@ -851,6 +868,7 @@ class GaitScheduler:
         self._opening_zmp = np.zeros(2)
         self._active = False
         self._touchdown_hold = 0.0
+        self._reach_depth = 0.0
         self._swing_cleared = False
         self._capture_hot = False
         self._stop_requested = False
@@ -991,6 +1009,19 @@ class GaitScheduler:
                 return max(t_swing, self._distance_swing_time(index))
             return max(t_swing, STAIR_SWING_TIME)
         return t_swing
+
+    def _stair_landing(self) -> bool:
+        """The swing in progress lands on a tread at another height."""
+        if not self.terrain_active:
+            return False
+        landing = self._steps.get(self._step + 1)
+        return bool(landing is not None and landing.stair and landing.leg >= 0)
+
+    def _touchdown_band(self) -> float:
+        """How far above the believed landing a loaded swing foot counts as down."""
+        if self._stair_landing():
+            return max(TOUCHDOWN_HEIGHT, TOUCHDOWN_BAND)
+        return TOUCHDOWN_HEIGHT
 
     def _distance_swing_time(self, index: int) -> float:
         """Swing time growing with swing length and height (IHMC's stair timing).
@@ -1698,7 +1729,7 @@ class GaitScheduler:
         height = float(feet[leg, 2] - self._landing_z(ground_z))
         rows = slice(0, 4) if leg == 0 else slice(4, 8)
         planted = bool(np.asarray(measured_mask, dtype=bool).reshape(-1)[rows].any())
-        if height > TOUCHDOWN_HEIGHT or not planted:
+        if height > self._touchdown_band() or not planted:
             return False
         if not self._swing_cleared:
             return True
@@ -2397,6 +2428,7 @@ class GaitScheduler:
         self._first_leg = stance
         self._active = True
         self._touchdown_hold = 0.0
+        self._reach_depth = 0.0
         self._swing_cleared = False
         self._stop_extra = 0
         self._stand_pending = False
@@ -2605,9 +2637,13 @@ class GaitScheduler:
         if self._hold_for_stair_liftoff(com_xy, com_vel_xy, omega, t_ds, clock, dt):
             clock = 0.0
         self._tau += clock
+        # A stair landing that touches early is a contact, not the end of the
+        # step: jumping the clock moves the weight before the plan does, and
+        # the step-up then leaves the CoM behind the upper foot.
         if (
             self._swing_cleared
             and t_swing > 1e-6
+            and (STAIR_EARLY_PLANT or not self._stair_landing())
             and self._tau >= t_ds + EARLY_PLANT_S * t_swing
             and self._tau < span
             and self._swing_foot_down(feet, ground_z, measured_mask)
@@ -2803,11 +2839,21 @@ class GaitScheduler:
                     t_swing=t_swing / clock,
                 )
             if self.terrain_active and self._touchdown_hold > 0.0:
-                # The tread is lower than believed: keep reaching down for it.
+                # The tread is lower than believed: keep reaching down for it,
+                # faster and with feed-forward once the unloaded sole is below
+                # the believed tread.
+                below = float(feet[leg, 2]) < float(foothold[2]) - REACH_DOWN_BELOW
+                rate = REACH_DOWN_FAST if below else REACH_DOWN_SPEED
+                self._reach_depth = min(self._reach_depth + rate * float(dt), REACH_DOWN_MAX)
                 des_pos = des_pos.copy()
-                des_pos[2] -= min(REACH_DOWN_SPEED * self._touchdown_hold, REACH_DOWN_MAX)
+                des_pos[2] -= self._reach_depth
                 des_vel_s = des_vel_s.copy()
                 des_vel_s[2] = 0.0
+                if below and self._reach_depth < REACH_DOWN_MAX:
+                    span = max(t_swing / clock, 1e-3) if STEP_TIMING else max(t_swing, 1e-3)
+                    des_vel_s[2] = -rate * span
+            else:
+                self._reach_depth = 0.0
             span_swing = max(t_swing / clock, 1e-3) if STEP_TIMING else max(t_swing, 1e-3)
             shape_d = 6.0 * s * (1.0 - s)
             dyaw = wrap_angle(float(landing.yaw) - float(self._swing.start_yaw))

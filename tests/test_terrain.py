@@ -270,6 +270,24 @@ def test_wrench_distribution_puts_cop_at_the_cmp():
     assert np.allclose(lifted[4:], 0.0)
 
 
+def test_stabilizer_follows_a_mass_belief_changed_after_it_was_built():
+    from loka.control.terrain import classical_stack
+    from loka.sim import Simulation
+
+    if not classical_stack():
+        pytest.skip("classical terrain stack only")
+    sim = Simulation(terrain=[FLIGHT])
+    ctrl = sim.controller
+    ctrl.terrain.set_volumes(sim.plant_terrain.volumes)
+    ctrl.set_task_targets({"gait.mode": "walk", "gait.speed": 0.15, "gait.goal_x": 0.6, "gait.goal_y": 0.0})
+    while ctrl._stabilizer is None and sim.data.time < 3.0:
+        sim.step()
+    assert ctrl._stabilizer is not None
+    ctrl.robot.total_mass += 5.0
+    sim.step()
+    assert ctrl._stabilizer.mass == pytest.approx(ctrl.robot.total_mass)
+
+
 def test_volume_round_trip():
     vol = Volume("a", [1, 2], [0.3, 1.0], 0.1, yaw=0.5, group="g", index=2)
     again = Volume.from_dict(vol.to_dict())

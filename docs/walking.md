@@ -32,9 +32,9 @@ When the controller's terrain belief holds a block, terrain mode replaces parts 
 | CoM plan | 3D DCM, heel-to-toe VRP on stair steps | 3D DCM, fixed VRP |
 | Contact forces | DCM feedback to a CMP + contact-wrench distribution QP (`stabilizer.py`); MPC not solved while walking | ConvexMPC |
 | Step adjustment | 0.20 m across the stairs, 0.06 m along them | 0.06 m |
-| Trunk | upright, angular-momentum damping | 0.15 rad lean (`TERRAIN_LEAN_MODE`) |
+| Trunk | upright, angular-momentum damping | 0.12 rad lean (`TERRAIN_LEAN_MODE`) |
 
-Shared by both: footholds with heights and edge margins, the lift-then-move stair swing arc, CoM height from the vertical DCM with a reach clamp, contact from leg joint torques (no foot sensors), WBC tracking of the planned forces at 100× the flat weight, trailing-foot toe-off, and soft joint-limit dampers. Oracle results (classical): curb 39/40 at 0.04-0.10 m risers, four-step flight 29/40. Full description, equations, references and results: `docs/LOKA.md` Section 4.9.
+Shared by both: footholds with heights and edge margins, the lift-then-move stair swing arc, CoM height from the vertical DCM with a reach clamp, contact from leg joint torques (no foot sensors), WBC tracking of the planned forces at 100× the flat weight, trailing-foot toe-off, soft joint-limit dampers, and touchdown handling for a tread whose believed height is off by a few centimetres (a loaded foot up to 4 cm high counts as down, a foot over a lower tread searches down for it, and the weight moves onto a foot only once it is down). Oracle results (classical, 10 seeds): curb 10/10 at 0.10 m; four-step flight 9/10 at 0.07 m (the stair scenes' riser) and 2/10 at 0.10 m. Full description, equations, references and results: `docs/LOKA.md` Section 4.9.
 
 ## Architecture
 

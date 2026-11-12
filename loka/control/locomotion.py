@@ -240,12 +240,12 @@ TERRAIN_FORCE_WEIGHT_SCALE = 100.0
 #: Forward lean keeps the hips over the upper tread (stair_feasibility.py).
 #: An empirical heuristic for this stack: model-based stair controllers in
 #: the literature keep the torso upright.
-TERRAIN_TORSO_LEAN = 0.15
+TERRAIN_TORSO_LEAN = 0.12
 #: ``step``: full lean exactly while a step changes tread, none otherwise.
 #: ``ramp``: fade in while a climb is in the plan horizon and out after it,
 #: at TORSO_LEAN_RATE. ``off``: upright.
 TERRAIN_LEAN_MODE = "ramp"
-TORSO_LEAN_RATE = 0.3  # rad/s
+TORSO_LEAN_RATE = 0.2  # rad/s
 WAIST_PITCH = 14
 TORSO_LEAN_KP = 100.0
 TORSO_LEAN_KD = 20.0
@@ -267,6 +267,9 @@ JOINT_LIMIT_HORIZON = 0.05  # s
 #: A swing foot this far above its target that already carries load met
 #: ground early [m].
 EARLY_CONTACT_HEIGHT = 0.015
+#: Classical stack: no stabilizer force on a foot that neither touches nor
+#: carries load.
+TERRAIN_FORCE_GATING = True
 #: Swing phase before which load on the foot is a scuff, not a landing.
 EARLY_CONTACT_MIN_S = 0.30
 #: Load on a swinging foot, in the middle of its swing, that means it hit
@@ -663,6 +666,8 @@ class LocomotionController:
                 mu=float(wbc_cfg.friction_mu), fz_min=float(wbc_cfg.fz_min),
                 fz_max=float(wbc_cfg.fz_max),
             )
+        # A mass belief can change after the stabilizer was built.
+        self._stabilizer.mass = float(self.robot.total_mass)
         omega = self.gait.omega
         dcm_ref = np.asarray(gait_out.dcm_ref, dtype=float).reshape(2)
         dcm_rate_ref = omega * (dcm_ref - np.asarray(self.gait.vrp_now(), dtype=float).reshape(2))
@@ -999,7 +1004,9 @@ class LocomotionController:
                 # back onto a short foot and capture saturated.
                 rows = slice(0, 4) if swing.leg == 0 else slice(4, 8)
                 near = float(np.linalg.norm(feet[swing.leg, :2] - swing.foothold[:2]))
-                seated = float(feet[swing.leg, 2] - self.gait._landing_z(ground_z)) <= TOUCHDOWN_HEIGHT
+                seated = float(feet[swing.leg, 2] - self.gait._landing_z(ground_z)) <= (
+                    self.gait._touchdown_band() if terrain else TOUCHDOWN_HEIGHT
+                )
                 if (
                     seated
                     and measured_mask[rows].any()
@@ -1126,8 +1133,24 @@ class LocomotionController:
                 contact_mask, feet, dynamics.com, float(rpy[2]), com_vel=dynamics.com_vel
             )
         if classical:
+            # Weight goes onto a foot only once it is down: a foot the plan
+            # calls planted that neither touches nor carries load (a
+            # touchdown that timed out in the air) is given no force.
+            force_mask = contact_mask.copy()
+            if walking and terrain and TERRAIN_FORCE_GATING:
+                per = robot.num_contacts // 2
+                for leg in (0, 1):
+                    rows = slice(leg * per, (leg + 1) * per)
+                    other = slice((1 - leg) * per, (2 - leg) * per)
+                    if (
+                        force_mask[rows].any()
+                        and not measured_mask[rows].any()
+                        and float(self.foot_load[leg, 2]) <= SWING_CONTACT_N
+                        and force_mask[other].any()
+                    ):
+                        force_mask[rows] = False
             self._desired_forces = self._stabilizer_forces(
-                dynamics, gait_out, com_ref, com_vel_ref, contact_mask, base_quat, rot, face_yaw
+                dynamics, gait_out, com_ref, com_vel_ref, force_mask, base_quat, rot, face_yaw
             )
         forces = self._desired_forces.copy()
         if not contact_mask.all():

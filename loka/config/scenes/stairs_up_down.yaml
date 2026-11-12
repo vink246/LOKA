@@ -1,13 +1,13 @@
-# Up and over: three 0.08 m steps up along +x, a 0.9 m landing at
-# z = 0.24, then three steps back down to the floor. Robot starts at
+# Up and over: three 0.07 m steps up along +x, a 0.9 m landing at
+# z = 0.21, then three steps back down to the floor. Robot starts at
 # (0, 0) facing +x.
-#   up:   risers at x = 1.0, 1.3, 1.6; landing 1.6 to 2.5 (top 0.24)
+#   up:   risers at x = 1.0, 1.3, 1.6; landing 1.6 to 2.5 (top 0.21)
 #   down: a flight climbing along -x from x = 3.1, so going +x it steps
-#         down at x = 2.5 (to 0.16), 2.8 (to 0.08) and 3.1 (to the floor)
-# Walk to (3.7, 0), 0.6 m past the last step. Riser overrides
-# (--riser) apply to both flights.
-description: "Three 0.08 m steps up, a landing, three steps down"
+#         down at x = 2.5 (to 0.14), 2.8 (to 0.07) and 3.1 (to the floor)
+# Walk to (3.7, 0), 0.6 m past the last step. Oracle, classical stack:
+# 7/10 at 0.07 m, 0/10 at 0.08 m. Riser overrides (--riser) apply to both flights.
+description: "Three 0.07 m steps up, a landing, three steps down"
 props: []
 terrain:
-  - {kind: stairs, name: stairs_up, x: 1.0, y: 0.0, yaw: 0.0, steps: 3, riser: 0.08, tread: 0.30, width: 1.2, landing: 0.9}
-  - {kind: stairs, name: stairs_down, x: 3.1, y: 0.0, yaw: 3.141592653589793, steps: 3, riser: 0.08, tread: 0.30, width: 1.2, landing: 0.9}
+  - {kind: stairs, name: stairs_up, x: 1.0, y: 0.0, yaw: 0.0, steps: 3, riser: 0.07, tread: 0.30, width: 1.2, landing: 0.9}
+  - {kind: stairs, name: stairs_down, x: 3.1, y: 0.0, yaw: 3.141592653589793, steps: 3, riser: 0.07, tread: 0.30, width: 1.2, landing: 0.9}

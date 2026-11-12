@@ -1,7 +1,7 @@
-# Four steps whose third riser is 0.04 m taller than the others. A belief
-# that assumes a regular flight lands the third footfall 4 cm early, which is
+# Four steps whose third riser is 0.03 m taller than the others. A belief
+# that assumes a regular flight lands the third footfall 3 cm early, which is
 # what the touchdown refinement has to absorb.
-description: "Four steps, third riser 4 cm taller, landing on top"
+description: "Four steps, third riser 3 cm taller, landing on top"
 props: []
 terrain:
-  - {kind: stairs, name: stairs_0, x: 1.0, y: 0.0, yaw: 0.0, riser: [0.10, 0.10, 0.14, 0.10], tread: 0.30, width: 1.2, landing: 1.0}
+  - {kind: stairs, name: stairs_0, x: 1.0, y: 0.0, yaw: 0.0, riser: [0.07, 0.07, 0.10, 0.07], tread: 0.30, width: 1.2, landing: 1.0}

@@ -393,6 +393,23 @@ Contact is then decided per foot:
 - **Early contact.** A swing foot that takes load more than 1.5 cm above its target after 30% of the swing has met ground early. Its landing is re-planned at the measured height.
 - **Blocked swing.** A swing foot carrying more than 40 N between 5% and 70% of the swing is blocked. This is only reported to the runtime.
 
+**Touchdown on an uncertain tread.** A believed tread height carries an error range, the case of a VLM's geometry estimate. The weight moves onto a foot only once the foot is down:
+- **Tread higher than believed.** On a stair landing, a loaded swing foot up to 4 cm above the believed tread counts as down (`TOUCHDOWN_BAND`).
+- **Tread lower than believed.** The step clock holds at the end of the swing while the foot is unloaded (up to 0.35 s). The swing target sinks at 0.25 m/s, then at 0.6 m/s with velocity feed-forward once the unloaded sole is below the believed tread (`REACH_DOWN_FAST`). The slow phase lets a foot resting on a correct tread load without being driven into it.
+- **No early commit on stair landings.** A stair landing that touches before the step time is accepted as a contact, but the step does not end early. Moving the weight before the plan does left the CoM behind the upper foot on step-ups.
+- **No force on an airborne foot.** The classical stabilizer gives no force to a foot the plan calls planted that neither touches nor carries load (`TERRAIN_FORCE_GATING`).
+
+  With a wrong believed riser over a real 0.10 m one, refined at each touchdown as the runtime does (three seeds each):
+
+  | Believed riser | Curb walk-across, before | after | Four-step flight, highest tread before | after |
+  |---|---|---|---|---|
+  | 0.07 m | 3/3 | 3/3 | 0.12 m | 0.12 m |
+  | 0.10 m | 3/3 | 3/3 | 0.42 m | 0.43 m |
+  | 0.12 m | 0/3 | 3/3 | 0.15 m | 0.33 m |
+  | 0.14 m | 0/3 | 3/3 | 0.14 m | 0.40 m (1/3 complete) |
+
+  Before, a foot that stopped in the air over a lower tread took the weight anyway and the robot fell sideways over it. With the oracle belief (ten seeds) the curb is 10/10, the 0.08 m flight 6/10 and the 0.10 m flight 2/10, against 4/10 for that flight before this change.
+
 **Whole-body QP on terrain.** The WBC (Section 4.4) tracks the contact forces it is given 100 times harder than on flat ground (`TERRAIN_FORCE_WEIGHT_SCALE`), as whole-body impulse control does [43].
 - **Why.** At the flat weight the WBC re-solved the force distribution from its own base and posture tasks. On every step-up it unloaded the trailing foot the force planner was pushing with (4 N of a planned 257 N) and braked the CoM with a backward force under the upper foot. This one change took the oracle curb from 0/5 to 5/5.
 - **Trailing-foot toe-off.** In double support across treads, once the capture point is past the lower foot's toe line and inside the toe polygon, that foot's heel points leave the contact set and the foot pivots on its toes [71], [73].
@@ -428,7 +445,7 @@ never below the cadence's swing time. A 0.3 m, 0.1 m swing takes 0.63 s, and a t
 3. **Net moment about the CoM.** \(M = I_c \cdot 30\,e_R - 8\,L_c\). This holds the trunk at the commanded yaw and upright, and damps the centroidal angular momentum \(L_c\).
 4. **Wrench distribution.** A QP over the 24 force components of the eight sole corners minimises \(\|\sum f_i - f\|^2 + 4\|\sum (p_i - c)\times f_i - M\|^2 + 10^{-4}\|f\|^2\). It enforces a friction pyramid (μ from the WBC configuration), \(f_z \in [1, 500]\) N on planted corners, and zero force on lifted ones. Matching the moment about the CoM puts the centre of pressure at the CMP. When the CMP leaves the support polygon, the QP returns the closest wrench the soles can apply.
 
-The WBC tracks these forces at the terrain force weight. When the walk stops, the MPC is solved on the very next tick instead of waiting for its decimation slot. A change to the WBC configuration, such as a lower friction belief, rebuilds the distribution QP.
+The WBC tracks these forces at the terrain force weight. When the walk stops, the MPC is solved on the very next tick instead of waiting for its decimation slot. A change to the WBC configuration, such as a lower friction belief, rebuilds the distribution QP. The mass \(m\) is read from the belief on every tick, so a mass correction made after the robot has already walked on terrain reaches the vertical force and the DCM feedback; the inertia, CoM and angular momentum come from the belief model too, so an asymmetric payload in the belief moves the centre of pressure with the believed CoM.
 
 **Step adjustment** (Griffin et al. [72]). The DCM capture law (Section 4.3) corrects the next foothold during the first 70% of the swing:
 - **Across the stairs**, the correction may reach 0.20 m to catch a DCM that a 0.9 s two-tread swing lets diverge off the 6 cm sole.
@@ -444,8 +461,8 @@ The WBC tracks these forces at the terrain force weight. When the walk stops, th
 - **Forces.** The centroidal MPC (Section 4.2) plans the contact forces, using absolute contact heights in its preview. The WBC tracks them at the terrain force weight.
 - **Velocity reference.** On a step that changes tread, the MPC tracks the DCM plan's forward rate rather than the cruise speed. A step over a riser is at least a sole length plus two edge margins, several cruise strides, and the CoM covers it in one step period only at the plan's rate.
 - **Step adjustment.** The capture correction of a stair step is capped at 0.06 m in any direction.
-- **Torso lean.** A 0.15 rad waist-pitch lean, an empirical heuristic for this stack rather than a literature component (model-based stair controllers keep the trunk upright). `TERRAIN_LEAN_MODE` selects:
-  - `ramp` (default): fades in at 0.3 rad/s while a climb is in the plan horizon, and out after it;
+- **Torso lean.** A 0.12 rad waist-pitch lean, an empirical heuristic for this stack rather than a literature component (model-based stair controllers keep the trunk upright). `TERRAIN_LEAN_MODE` selects:
+  - `ramp` (default): fades in at 0.2 rad/s while a climb is in the plan horizon, and out after it;
   - `step`: full lean only on a step that changes tread;
   - `off`.
 
@@ -457,9 +474,22 @@ The WBC tracks these forces at the terrain force weight. When the walk stops, th
   | `step` | 0.42 m | 0 of 8 |
   | `off` | 0.37 m | 6 of 8 |
 
+  The table was measured with a 0.15 rad lean at 0.3 rad/s. A later sweep of lean size and fade rate (`ramp`, oracle belief, five seeds on the 0.10 m flight and the four oracle curb walk-across runs) chose the current values:
+
+  | Lean, fade rate | Mean highest tread | Flights completed | Curb walk-across |
+  |---|---|---|---|
+  | 0.15 rad, 0.3 rad/s | 0.43 m | 0 of 5 | 4 of 4 |
+  | 0.15 rad, 0.15 rad/s | 0.42 m | 1 of 5 | 4 of 4 |
+  | 0.12 rad, 0.2 rad/s | 0.44 m | 2 of 5 | 4 of 4 |
+  | 0.08 rad, 0.15 rad/s | 0.38 m | 0 of 5 | 4 of 4 |
+
 #### 4.9.4 Orchestrator side
 
 - **Declaring terrain.** Model mutations of type `stairs` or `volume` write the terrain belief (Table 3).
+- **Estimating the geometry from the camera.** The prompt gives no typical stair dimensions; the VLM infers everything from the image. The foot of the first riser comes from the floor-ray formulas of the camera section. The riser height is measured, not guessed, by single-view metrology [78]: a riser is a vertical face, so its bottom edge (row \(v_b\)) and its nosing (row \(v_t\)) are the same distance ahead. With \(y_n = (v - c_y)/f_y\) and \(r(v) = (\sin p + y_n\cos p)/(\cos p - y_n\sin p)\), the tangent of a pixel ray's angle below horizontal,
+  \[ \text{riser} = h\Bigl(1 - \frac{r(v_t)}{r(v_b)}\Bigr) , \]
+  with the camera height \(h\) and pitch \(p\) of the frame. With the G1 head camera, one image row is about 0.6 cm of riser 0.7 to 1.6 m ahead (a 0.10 m riser spans 15 to 17 rows), and closer than about 0.6 m the bottom edge leaves the image. The VLM writes \(v_b\), \(v_t\) and the result into its Analysis, so a wrong riser can be traced to a misread pixel or to the arithmetic. On the 0.10 m curb it read rows 415 and 398 against 414.3 and 397.2 from the scene geometry, and declared 0.10 m. Edges on a raised surface (a tread's or platform's far edge) are placed with the floor formulas using \(h - t\) in place of \(h\); with \(h\), the curb's far edge came out 2.63 m ahead instead of 2.43 m.
+- **Approach procedure** (system prompt). A raised surface whose step up looks taller than 0.16 m is routed around unless the directive says otherwise. To step onto one, the orchestrator declares its best estimate, walks to a staging point well before it with a near_xy listener, and re-measures from the closer frame. When the edges are unclear it rounds the riser down: a riser declared too low makes the swing foot meet the tread early, which the controller absorbs; one declared too high is the failure mode Section 4.9.1 guards against.
 - **Height refinement.** Each footfall on a believed volume measures its tread by leg kinematics. The runtime moves that volume's top to the measurement, and moves every higher step of the same flight with it.
 - **Terrain faults.** These open a failure episode, with a terrain event and a TERRAIN telemetry section, when:
   - a footfall lands where the belief has no explanation for it;
@@ -468,23 +498,22 @@ The WBC tracks these forces at the terrain force weight. When the walk stops, th
 
 #### 4.9.5 Oracle results
 
-November 2026. The controller is given the plant's own terrain (`scripts/riser_sweep.py`, `scripts/stairs_gate.py`). The four-step flight has 0.30 m treads, and success means standing on the top landing for 1 s. Classical runs use 10 seeds per cell and heuristic runs 5.
+November 2026. The controller is given the plant's own terrain (`scripts/riser_sweep.py`, `scripts/stairs_gate.py`). The four-step flight has 0.30 m treads, and success means standing on the top landing for 1 s (for `stairs_up_down`, standing at (3.7, 0) past the descent). Classical stack, 10 seeds per cell, with the touchdown handling of Section 4.9.1:
 
-| Scene | Stack | Riser 0.04 m | 0.06 m | 0.08 m | 0.10 m |
-|---|---|---|---|---|---|
-| Curb (one step, 1.5 m platform) | classical | 10/10 | 10/10 | 10/10 | 9/10 |
-| | heuristic | 5/5 | 5/5 | 5/5 | 5/5 |
-| Four-step flight | classical | 8/10 | **10/10** | 7/10 | 4/10 |
-| | heuristic | 0/5 | 0/5 | 0/5 | 0/5 |
-| Irregular flight (0.10, 0.10, 0.14, 0.10 m) | classical | | | | 0/5 |
-| | heuristic | | | | 0/5 |
-| Up and down (`stairs_up_down`: three steps each way, 0.9 m landing) | classical | | 0/5 | 0/5 | |
+| Scene | Riser 0.06 m | 0.07 m | 0.08 m | 0.10 m |
+|---|---|---|---|---|
+| Curb (one step, 1.5 m platform) | | | | 10/10 |
+| Four-step flight | 10/10 | **9/10** | 6/10 | 2/10 |
+| Irregular flight (0.07, 0.07, 0.10, 0.07 m) | | **9/10** | | |
+| Up and down (three steps each way, 0.9 m landing) | 5/10 | **7/10** | | |
 
-Curb walk-across: a walk to (2.0, 0) on the curb platform, the walk that failed under LOKA. Over 8 runs (4 seeds with the oracle belief and 4 with the block a VLM declared), the classical stack stops at the goal in 8 of 8, within 8 cm. The heuristic stack with its lean ramp manages 3 of 8.
+The stair scenes (`stairs_regular`, `stairs_irregular`, `stairs_up_down`) use 0.07 m risers, the bold cells; the curb keeps 0.10 m. Before the touchdown handling, the classical flight was 8/10, 10/10, 7/10 and 4/10 at 0.04, 0.06, 0.08 and 0.10 m, the curb 10/10 at 0.04 to 0.08 m and 9/10 at 0.10 m, the old irregular flight (0.10, 0.10, 0.14, 0.10 m) 0/5, and the up-and-down scene 0/5 at 0.06 and 0.08 m. The heuristic stack (5 seeds, not re-measured since) climbed the curb 5/5 at every riser and no flight.
+
+Curb walk-across: a walk to (2.0, 0) on the curb platform, the walk that failed under LOKA. Over 8 runs (4 seeds with the oracle belief and 4 with the block a VLM declared), the classical stack stops at the goal in 8 of 8, within 8 cm. The heuristic stack with its lean ramp manages 3 of 8. With a wrong believed riser instead of the oracle, see the table in Section 4.9.1.
 
 **Remaining failures of the classical stack:**
-- **Irregular flight.** It climbs to about the top and falls on the swing that crosses the 0.14 m riser and its neighbour.
-- **Up and down.** It climbs and crosses the landing, then falls on the first step down. Descent has no dedicated timing, and the descending leg's height estimate lags the tread.
+- **Taller flights.** At 0.10 m the four-step flight succeeds 2/10. The touchdown handling cost it two successes there (4/10 before) for the gains with wrong beliefs.
+- **Up and down.** Before the touchdown handling it climbed and crossed the landing, then fell on the first step down: descent has no dedicated timing, and the descending leg's height estimate lags the tread. The 3/10 failures at 0.07 m have not been diagnosed.
 - **Heuristic flights, for comparison.** They fail near the top. The snapped cruise stride alternates 0.3 m step-ups with near-zero joining steps, and the CoM reaches a tread with more momentum than the joining step can absorb.
 
 **Known limitations:**
@@ -520,7 +549,7 @@ On the heuristic stack, four fixes in a row without a 2 cm gain triggered the st
 | Make the capture prediction use the moving VRP | 21/30 to 6/30 successes |
 | Shorter distance-scaled swings | 0/20 successes |
 
-In one earlier run, a vision-language orchestrator declared a curb from the camera image and the first footfall corrected its height, but the declared edges were 5 to 18 cm off. Bench scripts: `scripts/stairs_gate.py`, `scripts/riser_sweep.py`, `scripts/terrain_ablate.py`; suite: `loka/config/eval_stairs.yaml`.
+In one earlier run, a vision-language orchestrator declared a curb from the camera image and the first footfall corrected its height, but the declared edges were 5 to 18 cm off. Later runs show the riser as the critical estimate: declared 2 to 5 cm too high (0.12 to 0.14 m over 0.10 m, 0.12 m over 0.07 m), the robot shifted its weight onto a foot that was still in the air and fell, which led to the touchdown handling of Section 4.9.1 and the riser measurement of Section 4.9.4. A declared tread of 0.25 m over a real 0.30 m one left the classical planner stepping in place short of the first riser, with no event to the orchestrator. Bench scripts: `scripts/stairs_gate.py`, `scripts/riser_sweep.py`, `scripts/terrain_ablate.py`; suite: `loka/config/eval_stairs.yaml`.
 
 ---
 
@@ -1156,3 +1185,5 @@ These points are for the authors and should not appear in the paper.
 [76] M. Murooka et al., "BaselineWalkingController: Humanoid walking controller with various baseline methods," GitHub repository (isri-aist). [Online]. Available: https://github.com/isri-aist/BaselineWalkingController (accessed Nov. 2026).
 
 [77] B. Faverjon and P. Tournassoud, "A local based approach for path planning of manipulators with a high number of degrees of freedom," in *Proc. IEEE Int. Conf. Robot. Autom. (ICRA)*, 1987, pp. 1152–1159.
+
+[78] A. Criminisi, I. Reid, and A. Zisserman, "Single view metrology," *Int. J. Comput. Vis.*, vol. 40, no. 2, pp. 123–148, 2000.

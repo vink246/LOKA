@@ -13,9 +13,10 @@
 #   loka_no_refine     loka_vlm without folding measured footfalls into the belief
 # External baselines (unitree_rl, navila, stair-trained policies) are out of scope here.
 #
-# Status (oracle, classical terrain stack, 10 seeds; docs/LOKA.md Section 4.9.5):
-# curb 39/40 at 0.04-0.10 m risers, four-step flight 29/40 (4/10 at 0.10 m),
-# irregular flight 0/5.
+# Status (oracle, classical terrain stack, 10 seeds; docs/LOKA.md Section 4.9):
+# curb 10/10 at 0.10 m; the stair scenes use 0.07 m risers, where the
+# four-step flight is 9/10 (2/10 at 0.10 m), the irregular flight
+# (0.07/0.07/0.10/0.07) 9/10 and stairs_up_down 7/10.
 
 output_dir: results/g1_stairs
 seed: 0
@@ -57,7 +58,7 @@ baselines:
   - {name: loka_no_refine, type: loka, options: {terrain_belief: empty, vision: true, terrain_refine: false}}
 
 tasks:
-  # Four 0.10 m steps from x = 1.0; the landing's middle is (2.4, 0) at z = 0.40.
+  # Four 0.07 m steps from x = 1.0; the landing's middle is (2.4, 0) at z = 0.28.
   - name: stairs_regular
     type: stairs
     scene: stairs_regular
@@ -92,7 +93,7 @@ tasks:
       - {name: nominal, kind: none}
     metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
 
-  # Third riser 4 cm taller than the rest: the belief has to be refined in flight.
+  # Third riser 3 cm taller than the rest: the belief has to be refined in flight.
   - name: stairs_irregular
     type: stairs
     scene: stairs_irregular

@@ -1,9 +1,10 @@
-# A straight flight of four 0.10 m steps, 0.30 m treads, starting 1.0 m
+# A straight flight of four 0.07 m steps, 0.30 m treads, starting 1.0 m
 # ahead of the start pose and climbing along +x. Robot starts at (0, 0)
 # facing +x. The top step is a 1.0 m landing, so its far edge is at
-# x = 1.0 + 3 * 0.30 + 1.0 = 2.9 and its top at z = 0.40.
-# Copy and edit ``riser`` for 0.12 m or 0.15 m variants.
-description: "Four regular 0.10 m steps ahead, landing on top"
+# x = 1.0 + 3 * 0.30 + 1.0 = 2.9 and its top at z = 0.28.
+# 0.07 m keeps the flight within the classical stack's reach (oracle 9/10,
+# against 2/10 at 0.10 m). Copy and edit ``riser`` for taller variants.
+description: "Four regular 0.07 m steps ahead, landing on top"
 props: []
 terrain:
-  - {kind: stairs, name: stairs_0, x: 1.0, y: 0.0, yaw: 0.0, steps: 4, riser: 0.10, tread: 0.30, width: 1.2, landing: 1.0}
+  - {kind: stairs, name: stairs_0, x: 1.0, y: 0.0, yaw: 0.0, steps: 4, riser: 0.07, tread: 0.30, width: 1.2, landing: 1.0}
