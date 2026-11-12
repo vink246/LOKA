@@ -177,7 +177,7 @@ class NavigateTask:
         self.spec = spec
 
     def run(self, suite, unit, unit_dir: Path) -> dict:
-        from loka.scene_props import load_scene
+        from loka.scene_props import load_scene, load_scene_terrain
 
         raw = self.spec.raw
         goal = raw["goal"]
@@ -191,9 +191,14 @@ class NavigateTask:
         perturb_at = float(raw.get("perturbation_time_s", command_at))
         timeout_s = float(raw["timeout_s"])
         spawns = load_scene(str(raw["scene"]))
+        terrain = load_scene_terrain(str(raw["scene"])) or None
         perturbation = make_perturbation(self.spec.perturbation(unit.perturbation))
         agent = build_baseline(
-            suite.baseline(unit.baseline), suite, log_path=unit_dir / "session.log", props=spawns
+            suite.baseline(unit.baseline),
+            suite,
+            log_path=unit_dir / "session.log",
+            terrain=terrain,
+            props=spawns,
         )
         if not agent.supports_directive:
             raise ValueError(f"baseline {unit.baseline!r} takes no language; navigate tasks need it")
@@ -245,6 +250,7 @@ class NavigateTask:
                 "seed": unit.seed,
                 "init_noise": suite.init_noise,
                 "scene": str(raw["scene"]),
+                "terrain": terrain,
                 "props": [list(item) for item in spawns],
                 "instruction": instruction,
                 "goal_xy": [xy[0], xy[1]],

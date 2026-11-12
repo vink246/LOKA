@@ -196,7 +196,7 @@ def format_effort_section(observer) -> str:
     lines.append(
         f"  stance slip={observer.slip_mps:.3f} m/s"
         f"  threshold={observer.slip_threshold_mps:.2f}"
-        "  fastest planted sole, ground plane. Persistent slip with a quiet motor is friction."
+        "  fastest planted foot's translation, ground plane (a foot twisting in a turn is not slip). Persistent slip with a quiet motor is friction."
     )
     return "\n".join(lines) + "\n"
 

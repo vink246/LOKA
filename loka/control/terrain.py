@@ -140,8 +140,11 @@ def stairs_volumes(spec: dict, *, source: str = "oracle") -> list[Volume]:
 
     ``x``, ``y`` is the foot of the first riser, on the centre line. The
     flight climbs along ``yaw``. ``riser`` is one height or a list, one per
-    step; ``landing`` is the depth of the top step.
+    step; ``landing`` is the depth of the top step. A ``wall`` spec is not
+    ground and has none.
     """
+    if str(spec.get("kind", "stairs")).lower() == "wall":
+        return []
     name = str(spec.get("name", "stairs"))
     steps = int(spec.get("steps", 3))
     risers = spec.get("riser", 0.10)

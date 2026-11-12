@@ -136,6 +136,23 @@ class LokaConfig:
     terrain_fault_cooldown_s: float = float(_TERRAIN.get("fault_cooldown_s", 3.0))
 
 
+def _foot_slip(corner_vel: np.ndarray, planted: np.ndarray) -> float:
+    """Fastest translation of a fully planted foot in the ground plane [m/s].
+
+    The mean of a foot's four corner velocities is its translation; a foot
+    that twists in place while the robot turns moves its corners but not
+    that mean. The fastest corner read 0.37 m/s (0.5 s window) on a nominal
+    turning start and 1.4 on a mu 0.4 floor; foot translation reads 0.04 and
+    0.4, either side of the 0.15 threshold.
+    """
+    feet = [
+        float(np.linalg.norm(corner_vel[4 * leg:4 * leg + 4].mean(axis=0)))
+        for leg in (0, 1)
+        if planted[4 * leg:4 * leg + 4].all()
+    ]
+    return max(feet) if feet else 0.0
+
+
 class LokaRuntime:
     """Owns a ``Simulation`` plus LOKA session state."""
 
@@ -1080,11 +1097,9 @@ class LokaRuntime:
             sim.data.qfrc_actuator[:nv],
         )
         planted = self.controller.planted_mask()
-        tang = np.linalg.norm(
-            (contact_jac @ sim.robot_qvel).reshape(-1, 3)[:, :2],
-            axis=1,
-        )
-        slip = float(tang[planted].max()) if np.any(planted) else 0.0
+        corner_vel = (contact_jac @ sim.robot_qvel).reshape(-1, 3)[:, :2]
+        tang = np.linalg.norm(corner_vel, axis=1)
+        slip = _foot_slip(corner_vel, planted)
         self._sample_friction_ratio(tang, planted, load.forces)
         tel = self.controller.telemetry
         self.effort_observer.is_walking = bool(tel is not None and tel.walking)

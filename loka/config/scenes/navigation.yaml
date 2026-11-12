@@ -7,6 +7,12 @@
 #   shelf  0.65 x 0.9 x 1.85 m; yaw 0 turns its open side (local -x) toward the
 #          start, so its front face is at x = 4.3.
 description: "Box right of the route, chair blocking the line, table ahead-left, bookshelf ahead facing the start"
+# Room walls (plant geometry, not terrain): back wall behind the shelf, side
+# walls clear of the table; the side behind the start is open. 2.5 m tall.
+terrain:
+  - {kind: wall, name: wall_back, x: 5.6, y: 0.5, yaw: 1.5708, length: 5.6, height: 2.5}
+  - {kind: wall, name: wall_left, x: 2.2, y: 3.2, yaw: 0.0, length: 6.9, height: 2.5}
+  - {kind: wall, name: wall_right, x: 2.2, y: -2.2, yaw: 0.0, length: 6.9, height: 2.5}
 props:
   - {kind: box, x: 1.3, y: -0.45, yaw: 0.0}
   - {kind: chair, x: 2.5, y: 0.0, yaw: 3.14159}

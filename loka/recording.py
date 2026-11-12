@@ -99,9 +99,10 @@ def _render_clip_worker(job: dict) -> None:
     import mujoco
 
     if job.get("recipe"):
-        from loka.scene_props import build_plant_model
+        from loka.scene_props import build_plant_model, see_through_walls
 
         model, _ = build_plant_model(job["recipe"])
+        see_through_walls(model)
     else:
         model = mujoco.MjModel.from_xml_path(job["model_path"])
     from loka.viz import hide_foot_contact_markers
@@ -310,12 +311,13 @@ def _render_session_worker(job: dict) -> None:
     import mediapy as media
     import mujoco
 
-    from loka.scene_props import apply_snapshot, build_plant_model
+    from loka.scene_props import apply_snapshot, build_plant_model, see_through_walls
     from loka.viz import hide_foot_contact_markers
 
     with open(job["frames_path"], "rb") as handle:
         snapshots = pickle.load(handle)
     model, _ = build_plant_model(job["recipe"])
+    see_through_walls(model)
     hide_foot_contact_markers(model)
     width, height = int(job["width"]), int(job["height"])
     model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), width)

@@ -1106,6 +1106,29 @@ def test_closed_loop_turn_in_place_stays_near_the_start():
     assert abs(wrap_angle(yaw - np.pi / 2)) < 0.15
 
 
+def test_heading_after_goal_arrival_walks_again():
+    """Arrival sets stand by itself; a later heading-only update must turn, not stand."""
+    from loka.control.gait import MODE_STAND, MODE_WALK
+
+    sim = Simulation()
+    controller = sim.controller
+    controller.set_task_targets(
+        {"gait.mode": "walk", "gait.speed": 0.15, "gait.goal_x": 0.6, "gait.goal_y": 0.0, "gait.goal_tolerance": 0.15}
+    )
+    gait = controller.gait
+    while sim.data.time < 15.0 and not (gait.goal_arrived and not gait.wants_walk()):
+        sim.step()
+        assert not sim.fell
+    assert gait.goal_arrived and gait.config.mode == MODE_STAND
+    applied = controller.set_task_targets({"gait.speed": 0.0, "gait.heading": 0.6})
+    assert applied.get("gait.mode") == MODE_WALK
+    assert gait.wants_walk()
+
+    controller.set_task_targets({"gait.mode": "stand"})
+    applied = controller.set_task_targets({"gait.heading": 0.0})
+    assert "gait.mode" not in applied and gait.config.mode == MODE_STAND
+
+
 def test_mid_swing_period_change_does_not_jump_phase():
     sched = walking_scheduler(step_period=0.80, duty_factor=0.80)
     com = np.array([0.0, 0.0, HEIGHT])

@@ -26,8 +26,13 @@ MASS_RGBA = (1.00, 0.45, 0.05, 0.90)
 MIN_DRAW_FORCE_N = 0.05
 
 
-def render_episode_dir(directory, *, recording, model_path: str) -> Path:
-    """Encode ``directory/episode.mp4`` from the stored ``render.npz``."""
+def render_episode_dir(directory, *, recording, model_path: str, until_s: float | None = None) -> Path:
+    """Encode ``directory/episode.mp4`` from the stored ``render.npz``.
+
+    ``until_s`` stops the clip at that sim time (``episode_0-<until>s.mp4``).
+    An episode with ``props`` in its metadata is rendered on the same prop
+    plant it ran on, so its ``qpos`` (robot, then prop slots) lines up.
+    """
     directory = Path(directory)
     blob_path = directory / "render.npz"
     if not blob_path.is_file():
@@ -36,13 +41,19 @@ def render_episode_dir(directory, *, recording, model_path: str) -> Path:
         times = np.asarray(blob["times"])
         qpos = np.asarray(blob["qpos"])
         overlays = json.loads(str(blob["overlays_json"].item()))
+    if until_s is not None:
+        keep = times <= float(until_s) + 1e-9
+        times, qpos = times[keep], qpos[keep]
     if times.size == 0 or qpos.size == 0:
         raise ValueError(f"No frames in {blob_path}")
-    out_path = directory / "episode.mp4"
+    out_path = directory / ("episode.mp4" if until_s is None else f"episode_0-{float(until_s):g}s.mp4")
     terrain = None
+    props = None
     meta_path = directory / "metadata.json"
     if meta_path.is_file():
-        terrain = json.loads(meta_path.read_text(encoding="utf-8")).get("terrain") or None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        terrain = meta.get("terrain") or None
+        props = meta.get("props") or None
     _spawn_render(
         model_path=model_path,
         times=times,
@@ -51,11 +62,20 @@ def render_episode_dir(directory, *, recording, model_path: str) -> Path:
         out_path=out_path,
         recording=recording,
         terrain=terrain,
+        props=props,
     )
     return out_path
 
 
-def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, terrain=None) -> None:
+def _prop_pool() -> tuple[dict, tuple]:
+    """The slot pool every prop plant is built with (``props:`` in ``loka.yaml``)."""
+    from loka.agent.loka_config import loka_config
+
+    pool = loka_config().get("props") or {}
+    return dict(pool.get("slots") or {}), tuple(pool.get("static") or ())
+
+
+def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, terrain=None, props=None) -> None:
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
         frames_path = tmp.name
     np.savez_compressed(
@@ -76,6 +96,7 @@ def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, ter
         "distance": float(recording.distance),
         "min_push_visible_s": float(recording.min_push_visible_s),
         "terrain": terrain,
+        "props": props,
     }
     # Spawn re-imports the main module, and that import pulls MuJoCo in,
     # before ``_render_worker`` runs. The GL backend is chosen on first
@@ -109,10 +130,23 @@ def _render_worker(job: dict) -> None:
         hide_foot_contact_markers,
     )
 
-    if job.get("terrain"):
-        from loka.scene_props import build_plant_model, plant_recipe
+    if job.get("terrain") or job.get("props"):
+        from loka.scene_props import build_plant_model, plant_recipe, see_through_walls, yaw_quat
 
-        model, _ = build_plant_model(plant_recipe(job["model_path"], terrain=job["terrain"]))
+        slots, static_kinds = _prop_pool() if job.get("props") else ({}, ())
+        recipe = plant_recipe(job["model_path"], slots, static_kinds, terrain=job.get("terrain"))
+        model, layout = build_plant_model(recipe)
+        see_through_walls(model)
+        # Free props are in the stored qpos; static ones live in body_pos.
+        used: set[str] = set()
+        for kind, x, y, yaw in job.get("props") or ():
+            slot = next(
+                (s for s in layout.slots if s.static and s.kind == kind and s.name not in used), None
+            )
+            if slot is not None:
+                used.add(slot.name)
+                model.body_pos[slot.body_id] = (float(x), float(y), 0.0)
+                model.body_quat[slot.body_id] = yaw_quat(float(yaw))
     else:
         model = mujoco.MjModel.from_xml_path(job["model_path"])
     hide_foot_contact_markers(model)

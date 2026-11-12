@@ -277,6 +277,12 @@ EARLY_CONTACT_MIN_S = 0.30
 OBSTRUCTION_N = 40.0
 OBSTRUCTION_MIN_S = 0.05
 OBSTRUCTION_MAX_S = 0.70
+#: A load that pushes up with ``|F_xy| <= OBSTRUCTION_FLOOR_RATIO * F_z`` is
+#: the floor: a ground reaction inside its friction cone (mu 1.0, 0.4 on the
+#: low-friction floor), from a scuff, a late lift-off or an early landing. Those
+#: read 1.0-1.3 on obstacle-free walks; a foot hitting a prop or riser side on
+#: is pushed sideways (ratio 2 to 10) or not up at all.
+OBSTRUCTION_FLOOR_RATIO = 1.5
 #: Position feedback folded into the CoM velocity reference of a
 #: quasi-static stair step [1/s], and its cap [m/s].
 QS_POSITION_GAIN = 3.0
@@ -806,7 +812,8 @@ class LocomotionController:
 
         Read from the leg's joint torques (see contact_estimate), on any
         belief, flat or not. One event per swing. Late swing is left to the
-        touchdown logic, where load is the landing itself.
+        touchdown logic, where load is the landing itself, and a load that
+        looks like the floor (``OBSTRUCTION_FLOOR_RATIO``) is not an obstruction.
         """
         last = self._last_gait
         if last is None or not last.walking or not last.swing.active:
@@ -817,6 +824,9 @@ class LocomotionController:
             return
         load = self.foot_load[leg]
         if float(np.linalg.norm(load)) <= OBSTRUCTION_N:
+            return
+        up = float(load[2])
+        if up > 0.0 and float(np.hypot(load[0], load[1])) <= OBSTRUCTION_FLOOR_RATIO * up:
             return
         key = (int(self.gait.step_index), leg)
         if key == self._obstruction_key:

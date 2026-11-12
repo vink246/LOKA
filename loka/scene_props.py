@@ -38,7 +38,10 @@ import numpy as np
 
 PROPS_DIR = Path(__file__).resolve().parents[1] / "models" / "props"
 PROP_KINDS = ("chair", "table", "box", "cube", "shelf")
-TERRAIN_KINDS = ("stairs",)
+TERRAIN_KINDS = ("stairs", "wall")
+#: Walls as the robot's cameras see them, and as the viewer and recordings do.
+WALL_RGBA = (0.86, 0.83, 0.77, 1.0)
+WALL_VIEW_ALPHA = 0.2
 #: Tread and riser friction, the floor's nominal.
 TERRAIN_FRICTION = (1.0, 0.02, 0.001)
 TERRAIN_RGBA = (0.62, 0.58, 0.52, 1.0)
@@ -300,6 +303,34 @@ def add_stairs(spec, flight: dict) -> None:
         geom.priority = 1
 
 
+def add_wall(spec, wall: dict) -> None:
+    """A static vertical slab: ``x, y`` its centre, ``length`` along ``yaw``.
+
+    A wall is plant geometry only. It has no terrain volumes, so the fall
+    check, an oracle belief and the controller never treat it as ground.
+    """
+    length = float(wall.get("length", 4.0))
+    height = float(wall.get("height", 2.5))
+    thickness = float(wall.get("thickness", 0.1))
+    body = spec.worldbody.add_body()
+    body.name = wall["name"]
+    geom = body.add_geom()
+    geom.name = f"{wall['name']}/wall"
+    geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    geom.size = [0.5 * length, 0.5 * thickness, 0.5 * height]
+    geom.pos = [float(wall["x"]), float(wall["y"]), 0.5 * height]
+    geom.quat = list(yaw_quat(float(wall.get("yaw", 0.0))))
+    geom.rgba = list(WALL_RGBA)
+
+
+def see_through_walls(model, alpha: float = WALL_VIEW_ALPHA) -> None:
+    """Fade wall geoms for a third-person view; the ego cameras build their own opaque copy."""
+    for g in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+        if name.endswith("/wall"):
+            model.geom_rgba[g, 3] = float(alpha)
+
+
 def build_plant_model(recipe: dict):
     """Compile the plant described by :func:`plant_recipe`. Returns (model, layout)."""
     if recipe_is_plain(recipe):
@@ -341,7 +372,10 @@ def build_plant_model(recipe: dict):
             index += 1
     terrain = list(recipe.get("terrain") or [])
     for flight in terrain:
-        add_stairs(spec, flight)
+        if flight.get("kind") == "wall":
+            add_wall(spec, flight)
+        else:
+            add_stairs(spec, flight)
     for key in spec.key:
         key.qpos = list(key.qpos) + park_qpos
     model = spec.compile()

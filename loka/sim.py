@@ -107,6 +107,7 @@ class Simulation:
             PropManager,
             build_plant_model,
             plant_recipe,
+            see_through_walls,
         )
 
         self.recipe = plant_recipe(
@@ -117,6 +118,8 @@ class Simulation:
             terrain,
         )
         self.model, self.prop_layout = build_plant_model(self.recipe)
+        # Only the viewer renders this model; ego frames come from their own build.
+        see_through_walls(self.model)
         self.data = mujoco.MjData(self.model)
         self.pelvis_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"

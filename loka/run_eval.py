@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="MUJOCO_GL backend for the render process (egl or osmesa).",
     )
+    render.add_argument(
+        "--until",
+        type=float,
+        default=None,
+        help="Stop the clip at this sim time [s] (writes episode_0-<until>s.mp4).",
+    )
     return parser
 
 
@@ -87,6 +93,7 @@ def _render(args) -> int:
         args.episode,
         recording=suite.recording,
         model_path=str(locomotion_config(suite).model_path),
+        until_s=args.until,
     )
     print(path)
     return 0

@@ -181,10 +181,17 @@ def _message_text(message: dict) -> str:
 
 TERRAIN_FAULT_TEXT = (
     "A terrain event opened this episode: a foot met ground the terrain belief does not "
-    "have, or a swing was blocked (see TERRAIN). This is not a model-parameter error. "
-    "Declare the ground with a volume or stairs Model_Mutation (estimate it from the "
-    "camera frame if there is one, else from where the foot was stopped); the robot "
-    "measures the exact tread heights as it steps. Do not queue a belief search for it."
+    "have, or a swing was blocked (see TERRAIN). This is not a model-parameter error; do "
+    "not queue a belief search for it. First decide what the foot hit, from the camera "
+    "frame if there is one. If it is ground the robot is meant to stand on (a step, a "
+    "stair, a curb, a platform), declare it with a volume or stairs Model_Mutation "
+    "(estimate it from the frame, else from where the foot was stopped); the robot "
+    "measures the exact tread heights as it steps. If it is an obstacle (furniture, a "
+    "box, a chair or table leg, any object), do not declare a volume: a volume is ground "
+    "the planner steps onto, and one under or beside the feet makes the robot misjudge "
+    "its own footing. Instead set a waypoint that backs away from the object and routes "
+    "around it, keeping the robot's 0.5 m width clear of it. With no camera frame, a "
+    "blocked swing is a riser only when the task is to climb."
 )
 
 _STOOD_FOR_FAULT = (

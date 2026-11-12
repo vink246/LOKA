@@ -841,6 +841,8 @@ class GaitScheduler:
         self._goal_cruise = GOAL_DEFAULT_SPEED
         self._goal_cmd = None
         self._goal_point = None
+        #: The stand in ``config.mode`` was set by goal arrival, not by a caller.
+        self._arrival_stand = False
         # Set by the runtime while |bias| is above the mode threshold.
         self.block_walk = False
         #: The controller's :class:`~loka.control.terrain.TerrainBelief`.
@@ -1401,6 +1403,8 @@ class GaitScheduler:
             applied[name] = value
             if field_name in _SCHEDULED_FIELDS:
                 self._user_gait_fields.add(field_name)
+            if field_name == "mode":
+                self._arrival_stand = False
             if field_name == "mode" and value == MODE_STAND:
                 self._user_gait_fields.clear()
                 if self._active:
@@ -1414,6 +1418,7 @@ class GaitScheduler:
                 # The next walk has to drop it, or the speed target stays 0.
                 self._release_stop()
         self._apply_goal_updates(applied)
+        self._resume_after_arrival(applied)
         self._use_speed_schedule = float(self.config.mode) >= MODE_WALK
         applied.update(self.apply_speed_schedule())
         return applied
@@ -1461,6 +1466,27 @@ class GaitScheduler:
                 applied["gait.mode"] = MODE_WALK
                 self._release_stop()
 
+    def _resume_after_arrival(self, applied: dict[str, float]) -> None:
+        """A heading or speed sent after an arrival stand walks again.
+
+        Arrival switches ``mode`` to stand on its own, so a caller that set walk
+        and then sends only ``gait.heading`` (a turn in place) or a speed would
+        otherwise leave the robot standing. A stand the caller set, or one held
+        by ``block_walk``, is kept.
+        """
+        cfg = self.config
+        if not self._arrival_stand or "gait.mode" in applied or float(cfg.mode) >= MODE_WALK:
+            return
+        if "gait.heading" not in applied and float(applied.get("gait.speed", 0.0)) <= 1e-4:
+            return
+        if self.block_walk:
+            print("     * [WARN] gait.mode=walk ignored: effort, motor, or slip is above its threshold")
+            return
+        cfg.mode = MODE_WALK
+        applied["gait.mode"] = MODE_WALK
+        self._arrival_stand = False
+        self._release_stop()
+
     def _release_stop(self) -> None:
         """Drop a stand request so a new walk can command a speed."""
         self._stop_requested = False
@@ -1495,6 +1521,7 @@ class GaitScheduler:
             if dist <= tol + GOAL_REENGAGE_MARGIN:
                 self._goal_cmd = 0.0
                 cfg.mode = MODE_STAND
+                self._arrival_stand = True
                 return
             self._goal_arrived = False
             if self.block_walk:
@@ -1502,6 +1529,7 @@ class GaitScheduler:
                 cfg.mode = MODE_STAND
                 return
             cfg.mode = MODE_WALK
+            self._arrival_stand = False
             cfg.heading = float(np.arctan2(delta[1], delta[0]))
             self._release_stop()
         if self._goal_stopping:
@@ -1514,6 +1542,7 @@ class GaitScheduler:
                 self._goal_cmd = 0.0
                 self._goal_arrived = True
                 cfg.mode = MODE_STAND
+                self._arrival_stand = True
                 return
             cfg.heading = float(np.arctan2(delta[1], delta[0]))
             mode = float(cfg.mode)
@@ -1526,6 +1555,7 @@ class GaitScheduler:
                 return
             self._goal_arrived = True
             cfg.mode = MODE_STAND
+            self._arrival_stand = True
             return
         if mode < MODE_WALK:
             if self.block_walk:
@@ -1686,7 +1716,9 @@ class GaitScheduler:
         step = self._steps.get(self._step) if self._steps else None
         if step is not None:
             return float(step.yaw)
-        return 0.0
+        # Standing: the measured yaw between the feet, refreshed every tick. A
+        # fixed 0 here made a heading near world +x look reached from any stand.
+        return float(self._stand_yaw)
 
     def _current_duration(self, t_step: float) -> float:
         """Duration of the step in progress [s].

@@ -39,7 +39,7 @@ _GROUP_DESCRIPTIONS = {
         "inverse dynamics resolved into that actuator"
     ),
     "motor_dev": "m_<actuator> motor deficit [Nm], commanded minus applied torque",
-    "slip": "slip fastest planted sole speed in the ground plane [m/s]",
+    "slip": "slip fastest planted foot's translation in the ground plane [m/s]",
     "mpc_cost": (
         "c_<channel> MPC weighted state residual for "
         + " ".join(COST_CHANNEL_NAMES)
