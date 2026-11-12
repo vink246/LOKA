@@ -8,8 +8,10 @@
 #   bash scripts/pace_ice_eval.sh --config loka/config/eval_models_api.yaml \
 #       --conda-prefix ~/scratch/envs/loka
 #
-# Every LOKA baseline uses latency mode pause (zero simulated latency), so the
-# models are compared on decisions, not on API speed. temperature 0 is
+# Every LOKA baseline uses latency mode fixed_sim at 4 s: each call costs the
+# same simulated time whatever the model's API speed, so the models are
+# compared on decisions under one latency. Wall-clock latency is still
+# recorded per turn and in wall_time_to_goal_s. temperature 0 is
 # requested for the record; these API models refuse it and run at their
 # default (see each turn's decoding record).
 
@@ -27,8 +29,8 @@ controller:
 orchestrator:
   model: gpt-6-luna
   latency:
-    mode: pause
-    seconds: 2.0
+    mode: fixed_sim
+    seconds: 4.0
   request_timeout_s: 120.0
   temperature: 0.0
 

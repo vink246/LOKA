@@ -505,6 +505,11 @@ class UnitreeRLController:
     def place_default_pose(self, data: mujoco.MjData) -> None:
         self.policy.place_default_pose(self.model, data)
 
+    def walk_speed(self, speed: float) -> float:
+        """Cruise speed a goal walk commanded at ``speed`` actually gets [m/s]."""
+        capped = min(max(float(speed), 0.0), float(self.policy.cmd_high[0]))
+        return max(capped, float(self.commander.min_speed))
+
     def set_task_targets(self, updates: dict) -> dict:
         cfg = self.commander.config
         applied: dict = {}

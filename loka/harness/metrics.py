@@ -85,19 +85,60 @@ def t_first_fall_s(episode: EpisodeData):
     return _finite(episode.metadata.get("t_first_fall"))
 
 
-@register_metric("path_length_m", scope="episode")
-def path_length_m(episode: EpisodeData):
+#: Centred moving-average window on the pelvis track before its length is
+#: taken [s], applied ``PATH_SMOOTH_PASSES`` times. It is longer than one gait
+#: cycle (0.64-0.80 s on both stacks), so the side-to-side sway of each step is
+#: not counted as distance walked, and gaits that sway more are not penalised
+#: for it. One pass leaves about a fifth of the sway, which at 0.15 m/s (12 cm
+#: per cycle) still adds ~4 % to the length; three leave under 1 %.
+PATH_SMOOTH_S = 1.0
+PATH_SMOOTH_PASSES = 3
+
+
+def _smoothed_xy(episode: EpisodeData):
+    """Pelvis xy with step sway averaged out. The end points are kept exactly."""
     pelvis = episode.column("pelvis_xyz")
     if pelvis.ndim != 2 or pelvis.shape[0] < 2:
         return None
-    steps = np.linalg.norm(np.diff(pelvis[:, :2], axis=0), axis=1)
+    xy = np.asarray(pelvis[:, :2], dtype=float)
+    t = episode.column("t")
+    if t.ndim != 1 or t.shape[0] != xy.shape[0]:
+        return xy
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0.0:
+        return xy
+    half = int(round(0.5 * PATH_SMOOTH_S / dt))
+    if half < 1:
+        return xy
+    n = xy.shape[0]
+    index = np.arange(n)
+    # The window shrinks toward each end, so the first and last samples stay put.
+    reach = np.minimum(np.minimum(index, n - 1 - index), half)
+    lo, hi = index - reach, index + reach + 1
+    for _ in range(PATH_SMOOTH_PASSES):
+        cumsum = np.vstack([np.zeros((1, 2)), np.cumsum(xy, axis=0)])
+        xy = (cumsum[hi] - cumsum[lo]) / (hi - lo)[:, None]
+    return xy
+
+
+@register_metric("path_length_m", scope="episode")
+def path_length_m(episode: EpisodeData):
+    """Length of the pelvis path in the ground plane, after ``PATH_SMOOTH_S`` smoothing."""
+    xy = _smoothed_xy(episode)
+    if xy is None:
+        return None
+    steps = np.linalg.norm(np.diff(xy, axis=0), axis=1)
     return float(np.sum(steps))
 
 
 @register_metric("path_efficiency", scope="episode")
 def path_efficiency(episode: EpisodeData):
-    """Straight-line distance from the start to the goal, over the path taken.
+    """Straight-line distance from the start to the goal region, over the path taken.
 
+    The optimum is measured to the boundary of the goal region (``goal_radius``),
+    where arrival is declared, so stopping at its edge cannot score above 1.
+    The path is the smoothed one of ``path_length_m``, which keeps its end
+    points, so it is never shorter than that optimum.
     Failures are omitted. A short path that never arrives is not a high score.
     """
     if episode.metadata.get("outcome") != "success":
@@ -109,7 +150,9 @@ def path_efficiency(episode: EpisodeData):
     pelvis = episode.column("pelvis_xyz")
     if not goal or pelvis.ndim != 2 or pelvis.shape[0] == 0:
         return None
-    optimal = float(np.linalg.norm(np.asarray(goal, dtype=float)[:2] - pelvis[0, :2]))
+    radius = _finite(episode.metadata.get("goal_radius")) or 0.0
+    to_centre = float(np.linalg.norm(np.asarray(goal, dtype=float)[:2] - pelvis[0, :2]))
+    optimal = max(to_centre - max(radius, 0.0), 0.0)
     if optimal < 1e-6:
         return 1.0
     if length < 1e-9:

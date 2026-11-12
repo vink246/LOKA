@@ -35,7 +35,7 @@ class ControllerSpec:
 class OrchestratorSpec:
     model: str = "gpt-5.4-mini"
     latency_mode: str = "fixed_sim"
-    latency_s: float = 2.0
+    latency_s: float = 4.0
     request_timeout_s: float = 120.0
     #: openai, anthropic or local. None routes by model name and the registry.
     provider: str | None = None
@@ -445,7 +445,7 @@ def _parse_orchestrator(raw: Any) -> OrchestratorSpec:
     spec = OrchestratorSpec(
         model=str(data.get("model", "gpt-5.4-mini")),
         latency_mode=str(latency.get("mode", "fixed_sim")),
-        latency_s=float(latency.get("seconds", 2.0)),
+        latency_s=float(latency.get("seconds", 4.0)),
         request_timeout_s=float(data.get("request_timeout_s", 120.0)),
         provider=None if data.get("provider") is None else str(data["provider"]),
         prompt_style=str(data.get("prompt_style", "full")),

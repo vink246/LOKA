@@ -993,7 +993,7 @@ The shove is a control condition: it changes no model parameter, so a correct re
 - *Successes* and *falls*: the number of the five trials that reached the goal and that fell. The success rate is reported with a Wilson score interval [68], which remains meaningful at five trials and at rates of 0 or 1.
 - *Time to goal*: simulated time from the request to arrival, over successful trials only; a failure is not scored as the timeout.
 - *Wall-clock time to goal*: real time from the start of the episode to arrival, over successful trials only. For LOKA it includes the time spent waiting for the language model.
-- *Path efficiency*: the straight-line distance from the starting pelvis position to the goal, divided by the length of the pelvis path actually walked, over successful trials only.
+- *Path efficiency*: the straight-line distance from the starting pelvis position to the boundary of the goal region (the distance to the goal minus the 0.2 m arrival radius), divided by the length of the pelvis path actually walked, over successful trials only. The path is first smoothed with three passes of a centred 1 s moving average that keeps its end points, so the side-to-side sway of each step (one gait cycle is 0.64–0.80 s) is not counted as distance walked. Without this, a gait that sways more scores lower even on a straight walk. With the end points kept, the score cannot exceed 1.
 - *Auxiliary quantities*: the final distance to the goal, the time of the first fall, the number of orchestrator calls, and the wall-clock duration of the episode.
 
 For Experiment 2 the metric is the largest survived push force. Continuous metrics are reported as the mean, the sample standard deviation and a 95 % Student-$t$ interval over trials.

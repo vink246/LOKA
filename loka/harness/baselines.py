@@ -82,6 +82,11 @@ class Baseline:
     def mutation_count(self) -> int:
         return 0
 
+    def walk_speed(self, speed: float) -> float:
+        """Cruise speed of a goal commanded at ``speed``, after any plant floor [m/s]."""
+        floor = getattr(self.sim.controller, "walk_speed", None)
+        return float(speed) if floor is None else float(floor(speed))
+
 
 def _apply_goal(controller, xy, speed: float, radius: float) -> None:
     controller.set_task_targets(

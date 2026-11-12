@@ -4,6 +4,8 @@ Standing push resistance stays one bar chart with a 95% interval. Go-to-goal
 is one figure per perturbation: successes, falls, sim time, wall time, and
 path efficiency. Counts have no interval. Time and path efficiency use only
 the trials that arrived, and a baseline with no arrivals is left off those panels.
+A baseline whose ``walk_speed`` differs from the task's ``goal_speed`` is hatched
+on the time panels, with its speed under its name and a note in the spare panel.
 """
 
 from __future__ import annotations
@@ -36,6 +38,9 @@ _GOTO_PANELS = (
     ("Time to goal (wall s)", "wall_time_to_goal_s", "mean"),
     ("Path efficiency", "path_efficiency", "mean"),
 )
+#: Panels that scale with walking speed. A baseline that walks at another speed
+#: than the task's (unitree_rl below its floor) is hatched there, not compared.
+_SPEED_PANELS = {"time_to_goal_s", "wall_time_to_goal_s"}
 
 
 def plot_run(run_dir: Path, rows: list[dict], stats: dict[str, Any]) -> list[Path]:
@@ -84,23 +89,37 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict]) -> None:
         name = str(row.get("baseline"))
         if name not in baselines:
             baselines.append(name)
+    goal_speed, speeds = _walk_speeds(rows, baselines)
+    off_speed = {
+        name for name, speed in speeds.items()
+        if goal_speed is not None and abs(speed - goal_speed) > 1e-6
+    }
     fig, axes = plt.subplots(3, 2, figsize=(10.5, 11.0), constrained_layout=True)
     flat = list(axes.ravel())
     x = np.arange(len(baselines))
     colors = [_COLORS[i % len(_COLORS)] for i in range(len(baselines))]
     for ax, (title, key, how) in zip(flat, _GOTO_PANELS):
         means, errors = _panel_values(rows, baselines, key, how)
+        speed_bound = key in _SPEED_PANELS
         for index, (height, err) in enumerate(zip(means, errors)):
             if not np.isfinite(height):
                 continue
+            hatched = speed_bound and baselines[index] in off_speed
             ax.bar(
                 x[index],
                 height,
                 color=colors[index],
                 yerr=None if how == "count" else err,
                 capsize=0 if how == "count" else 3,
+                alpha=0.4 if hatched else 1.0,
+                hatch="//" if hatched else None,
+                edgecolor=colors[index] if hatched else None,
             )
-        ax.set_xticks(x, baselines)
+        labels = [
+            f"{name}\n{speeds[name]:g} m/s" if speed_bound and name in off_speed else name
+            for name in baselines
+        ]
+        ax.set_xticks(x, labels)
         ax.set_ylabel(title)
         ax.set_title(title)
         ax.grid(True, axis="y", alpha=0.3)
@@ -111,9 +130,44 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict]) -> None:
             top = float(np.max(finite + err[: finite.size])) if finite.size else 1.0
         ax.set_ylim(0.0, max(top * 1.15, 1e-3))
     flat[-1].axis("off")
+    if off_speed:
+        names = ", ".join(f"{name} ({speeds[name]:g} m/s)" for name in baselines if name in off_speed)
+        flat[-1].text(
+            0.0,
+            1.0,
+            f"Hatched time bars: {names} does not walk at the task's "
+            f"{goal_speed:g} m/s, so its time to goal is not comparable "
+            "with the other baselines.",
+            transform=flat[-1].transAxes,
+            va="top",
+            ha="left",
+            wrap=True,
+            fontsize=10,
+        )
     fig.suptitle(f"goto_goal / {perturbation}")
     fig.savefig(path, dpi=120)
     plt.close(fig)
+
+
+def _walk_speeds(rows: list[dict], baselines: list[str]):
+    """The task's goal speed and each baseline's cruise speed [m/s].
+
+    Runs from before ``walk_speed`` was stored fall back to the goal speed.
+    """
+    goal_speed = None
+    speeds: dict[str, float] = {}
+    for row in rows:
+        if goal_speed is None and row.get("goal_speed") is not None:
+            goal_speed = float(row["goal_speed"])
+    for baseline in baselines:
+        for row in rows:
+            if str(row.get("baseline")) != baseline:
+                continue
+            value = row.get("walk_speed", row.get("goal_speed"))
+            if value is not None:
+                speeds[baseline] = float(value)
+                break
+    return goal_speed, speeds
 
 
 def _panel_values(rows: list[dict], baselines: list[str], key: str, how: str):

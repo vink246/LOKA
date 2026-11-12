@@ -32,8 +32,8 @@ controller:
 orchestrator:
   model: gpt-6-luna
   latency:
-    mode: wall
-    seconds: 2.0
+    mode: fixed_sim
+    seconds: 4.0
   request_timeout_s: 120.0
 
 recording:

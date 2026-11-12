@@ -16,10 +16,12 @@ orchestrator:
   model: gpt-6-luna
   # fixed_sim keeps the plant running for `seconds` of sim time after a
   # dispatch, then waits for the reply. wall uses arrival time. pause waits
-  # immediately (zero sim-time latency).
+  # immediately (zero sim-time latency). Every model is charged the same 4 s
+  # of sim time per call, independent of API and machine speed; wall-clock
+  # latency is still recorded per turn and in wall_time_to_goal_s.
   latency:
-    mode: wall
-    seconds: 2.0
+    mode: fixed_sim
+    seconds: 4.0
   request_timeout_s: 120.0
 
 recording:
@@ -42,7 +44,12 @@ ablation_config: loka/config/loka_ablations.yaml
 
 # A baseline is a name, or {name, type, options}. unitree_rl takes
 # options.policy_dir (default models/unitree_rl/g1_29dof_velocity_v0) and
-# options.min_speed (0.30 m/s; the v0 policy stands still below ~0.25).
+# options.min_speed (default 0.30 m/s). Here it is 0.25 m/s, the slowest
+# command the v0 policy walks at reliably on this plant: on the nominal goal
+# task it never moves at 0.20, stalls partway at 0.22-0.23 and arrives with a
+# spread of a few seconds at 0.24. Its training only rewards stepping above
+# 0.1 m/s (feet_gait), so the upstream config gives no tighter bound. The other
+# baselines walk at 0.15 m/s, so its time to goal is not directly comparable.
 # loka and loka_ablated take options.orchestrator, which overrides the
 # orchestrator block above for that baseline (model, provider, latency,
 # prompt_style, reply_check, max_tokens, temperature); loka_ablated also takes
@@ -50,9 +57,12 @@ ablation_config: loka/config/loka_ablations.yaml
 #   - {name: loka_raw_telemetry, type: loka_ablated, options: {variant: raw_telemetry}}
 #   - {name: loka_cost_detector, type: loka_ablated, options: {variant: cost_detector}}
 #   - {name: loka_claude, type: loka, options: {orchestrator: {model: claude-sonnet-5-5}}}
-#   - {name: loka_gemma3_27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it, latency: {mode: pause}}}}
+#   - {name: loka_gemma3_27b, type: loka, options: {orchestrator: {model: gemma-3-27b-it}}}
 # Local models (orchestrator_models.yaml, provider: local) run as PACE GPU jobs.
-baselines: [low_level, loka, unitree_rl]
+baselines:
+  - low_level
+  - loka
+  - {name: unitree_rl, type: unitree_rl, options: {min_speed: 0.25}}
 
 tasks:
   - name: stand_push

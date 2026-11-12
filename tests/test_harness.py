@@ -146,7 +146,7 @@ def test_recording_follows_the_yaml_unless_a_flag_is_set():
 
 
 def test_goto_plot_is_one_figure_per_perturbation(tmp_path: Path):
-    from loka.harness.plots import _panel_values, plot_run
+    from loka.harness.plots import _panel_values, _walk_speeds, plot_run
 
     rows = [
         {
@@ -179,6 +179,11 @@ def test_goto_plot_is_one_figure_per_perturbation(tmp_path: Path):
     times, _time_err = _panel_values(rows, ["low_level", "loka"], "time_to_goal_s", "mean")
     assert times[0] == pytest.approx(10.0)
     assert np.isnan(times[1])
+    rows[0]["goal_speed"] = rows[1]["goal_speed"] = 0.15
+    rows.append({**rows[0], "baseline": "unitree_rl", "walk_speed": 0.25})
+    goal_speed, speeds = _walk_speeds(rows, ["low_level", "loka", "unitree_rl"])
+    assert goal_speed == pytest.approx(0.15)
+    assert speeds == {"low_level": 0.15, "loka": 0.15, "unitree_rl": 0.25}
     stats = {
         "conditions": [
             {
@@ -266,6 +271,21 @@ def test_metrics_from_stored_episode():
     assert fell(episode) == 0.0
     assert path_length_m(episode) == pytest.approx(1.0)
     assert path_efficiency(episode) == pytest.approx(1.0)
+    # A 1 m path to the centre of a 0.2 m goal region; its edge is 0.8 m away.
+    bounded = _episode(outcome="success", goal_xy=[1.0, 0.0], goal_radius=0.2)
+    assert path_efficiency(bounded) == pytest.approx(0.8)
+    # 3 m in 20 s with 4 cm of side sway per 0.8 s gait cycle, logged at 100 Hz.
+    t = np.arange(0.0, 20.0 + 1e-9, 0.01)
+    sway = np.column_stack([0.15 * t, 0.04 * np.sin(2.0 * np.pi * t / 0.8), np.full_like(t, 0.78)])
+    swaying = EpisodeData(
+        directory=Path("."),
+        metadata={"outcome": "success", "goal_xy": [3.0, 0.0], "goal_radius": 0.0},
+        timeseries={"pelvis_xyz": sway, "t": t},
+    )
+    raw = float(np.sum(np.linalg.norm(np.diff(sway[:, :2], axis=0), axis=1)))
+    assert raw > 3.4
+    assert path_length_m(swaying) == pytest.approx(3.0, abs=0.03)
+    assert 0.99 < path_efficiency(swaying) <= 1.0
     missed = _episode(outcome="timeout", fell=True, t_first_fall=1.5, goal_xy=[1.0, 0.0], wall_s=9.0)
     assert success(missed) == 0.0
     assert num_successes(missed) == 0.0
