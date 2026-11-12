@@ -34,9 +34,9 @@
 
 - unless: [hide_residual]
   find: |-
-    STANCE SLIP is the fastest planted foot's translation
+    STANCE SLIP is the fastest planted sole
   replace: |-
-    STANCE SLIP (the slip column) is the fastest planted foot's translation
+    STANCE SLIP (the slip column) is the fastest planted sole
 
 - unless: [cost_detector]
   find: |-

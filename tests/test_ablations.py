@@ -32,6 +32,13 @@ FILLS = {"RAW_TELEMETRY_COLUMNS": "<columns>", "GAIT_SAFE_BAND": "<band>"}
 VARIANTS = ("raw_telemetry", "cost_detector", "raw_and_cost")
 
 
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_every_variant_patches_the_shipped_prompt(variant):
+    """Each patch anchor must still occur in the shipped prompt, or every unit of the variant fails."""
+    for style in ("full", "compact"):
+        load_stand_system_prompt(style=style, ablations=_ablations(variant), fills=FILLS)
+
+
 def _ablations(variant: str, **cost_overrides) -> AblationSet:
     resolved = resolve_variant(variant)
     if cost_overrides and "cost_detector" in resolved["params"]:

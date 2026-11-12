@@ -6,8 +6,8 @@ dependencies:
   - python=3.10
   - pip
   # OSMesa for offscreen rendering on CPU nodes (LOKA's head camera, videos).
-  # Recent conda-forge ships libOSMesa in libosmesa, not mesalib.
-  - libosmesa
+  # Mesa 25.1 removed OSMesa, so libOSMesa needs an older mesalib.
+  - mesalib<25.1
   - pip:
       # Encodes head-camera frames (LOKA vision) and plots.
       - Pillow
