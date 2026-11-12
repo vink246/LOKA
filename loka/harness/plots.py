@@ -43,7 +43,20 @@ _GOTO_PANELS = (
 _SPEED_PANELS = {"time_to_goal_s", "wall_time_to_goal_s"}
 
 
-def plot_run(run_dir: Path, rows: list[dict], stats: dict[str, Any]) -> list[Path]:
+#: Stairs and curb panels: arrival, falls, time, and how high the robot got.
+_STAIRS_PANELS = (
+    ("Successes", "num_successes", "count"),
+    ("Falls", "num_falls", "count"),
+    ("Time to goal (sim s)", "time_to_goal_s", "mean"),
+    ("Highest step reached (m)", "highest_step_m", "mean"),
+)
+
+
+def plot_run(
+    run_dir: Path, rows: list[dict], stats: dict[str, Any], groups: dict[str, list[str]] | None = None
+) -> list[Path]:
+    """Every chart of a run. With ``groups`` (``plot_groups:``), one set per
+    group in ``plots/<group>/``, each drawing only that group's baselines."""
     if not rows:
         return []
     try:
@@ -56,9 +69,22 @@ def plot_run(run_dir: Path, rows: list[dict], stats: dict[str, Any]) -> list[Pat
         return []
 
     plot_dir = Path(run_dir) / "plots"
+    conditions = stats.get("conditions") or []
+    if not groups:
+        return _plot_set(plt, plot_dir, rows, conditions)
+    written: list[Path] = []
+    for group, names in groups.items():
+        keep = set(names)
+        sub_rows = [row for row in rows if str(row.get("baseline")) in keep]
+        if sub_rows:
+            sub_conditions = [c for c in conditions if str(c.get("baseline")) in keep]
+            written.extend(_plot_set(plt, plot_dir / group, sub_rows, sub_conditions))
+    return written
+
+
+def _plot_set(plt, plot_dir: Path, rows: list[dict], conditions: list[dict]) -> list[Path]:
     plot_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    conditions = stats.get("conditions") or []
     stand = [c for c in conditions if str(c.get("task")) == "stand_push"]
     if any(c.get("max_push_force_n_mean") is not None for c in stand):
         path = plot_dir / "stand_push_max_push_force_n.png"
@@ -70,10 +96,10 @@ def plot_run(run_dir: Path, rows: list[dict], stats: dict[str, Any]) -> list[Pat
 
 
 def _goto_figures(plt, plot_dir: Path, rows: list[dict]) -> list[Path]:
-    """One figure per goto_goal perturbation and per navigate task and perturbation."""
+    """One figure per goto_goal perturbation, and per navigate or stairs task and perturbation."""
     grouped: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
-        if str(row.get("task")) != "goto_goal" and row.get("task_type") != "navigate":
+        if str(row.get("task")) != "goto_goal" and row.get("task_type") not in ("navigate", "stairs"):
             continue
         grouped.setdefault((str(row.get("task")), str(row.get("perturbation"))), []).append(row)
     written = []
@@ -95,7 +121,8 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict], task: str
         name for name, speed in speeds.items()
         if goal_speed is not None and abs(speed - goal_speed) > 1e-6
     }
-    panels = list(_GOTO_PANELS)
+    stairs = any(row.get("task_type") == "stairs" for row in rows)
+    panels = list(_STAIRS_PANELS if stairs else _GOTO_PANELS)
     if any(row.get("model_invocations") for row in rows):
         panels.append(("Model calls per trial", "model_invocations", "mean"))
     if any(row.get("task_type") == "navigate" for row in rows):
@@ -130,7 +157,10 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict], task: str
             f"{name}\n{speeds[name]:g} m/s" if speed_bound and name in off_speed else name
             for name in baselines
         ]
-        ax.set_xticks(x, labels)
+        if len(baselines) > 4:
+            ax.set_xticks(x, labels, rotation=30, ha="right", fontsize=8)
+        else:
+            ax.set_xticks(x, labels)
         ax.set_ylabel(title)
         ax.set_title(title)
         ax.grid(True, axis="y", alpha=0.3)

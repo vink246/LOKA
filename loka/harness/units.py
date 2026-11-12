@@ -47,8 +47,10 @@ def iter_units(suite) -> list[WorkUnit]:
     """Stable order: task, perturbation, baseline, trial."""
     units: list[WorkUnit] = []
     for task in suite.tasks:
+        names = task.baseline_names
+        task_baselines = [b for b in suite.baselines if names is None or b.name in names]
         for perturbation in task.perturbations:
-            for baseline in suite.baselines:
+            for baseline in task_baselines:
                 for trial in trial_indices(suite):
                     units.append(
                         WorkUnit(

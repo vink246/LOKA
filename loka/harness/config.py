@@ -117,6 +117,12 @@ class TaskSpec:
                 return item
         raise KeyError(f"Task {self.name!r} has no perturbation {name!r}")
 
+    @property
+    def baseline_names(self) -> list[str] | None:
+        """The suite baselines this task runs (``baselines:``); None runs them all."""
+        names = self.raw.get("baselines")
+        return None if names is None else [str(name) for name in names]
+
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "name": self.name,
@@ -145,6 +151,8 @@ class SuiteConfig:
     run_dir: Path | None = None
     unit: str | None = None
     ablation_config: str | None = None
+    #: Plot sets: name -> baselines drawn together. Empty draws every baseline at once.
+    plot_groups: dict[str, list[str]] = field(default_factory=dict)
 
     def task(self, name: str) -> TaskSpec:
         for item in self.tasks:
@@ -195,6 +203,8 @@ class SuiteConfig:
             payload["unit"] = self.unit
         if self.ablation_config is not None:
             payload["ablation_config"] = self.ablation_config
+        if self.plot_groups:
+            payload["plot_groups"] = {name: list(items) for name, items in self.plot_groups.items()}
         return payload
 
     def orchestrator_for(self, baseline: BaselineSpec | str) -> OrchestratorSpec:
@@ -516,6 +526,20 @@ def parse_suite(raw: dict[str, Any]) -> SuiteConfig:
     tasks = [_parse_task(item) for item in tasks_raw]
     if len({item.name for item in tasks}) != len(tasks):
         raise ValueError("duplicate task names")
+    known = {item.name for item in baselines}
+    for task in tasks:
+        names = task.baseline_names
+        if names is not None:
+            unknown = [name for name in names if name not in known]
+            if unknown or not names:
+                raise ValueError(f"Task {task.name!r} baselines {unknown or names} are not suite baselines")
+    plot_groups = {}
+    for group, names in dict(data.get("plot_groups") or {}).items():
+        names = [str(name) for name in names or ()]
+        unknown = [name for name in names if name not in known]
+        if unknown or not names:
+            raise ValueError(f"plot_groups.{group} baselines {unknown or names} are not suite baselines")
+        plot_groups[_check_name(group, "plot group")] = names
     num_trials = int(data.get("num_trials", 1))
     if num_trials < 1:
         raise ValueError("num_trials must be >= 1")
@@ -547,6 +571,7 @@ def parse_suite(raw: dict[str, Any]) -> SuiteConfig:
         run_dir=None if not run_dir else Path(run_dir),
         unit=None if unit is None else str(unit),
         ablation_config=ablation_config,
+        plot_groups=plot_groups,
     )
 
 
@@ -584,6 +609,22 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
         if missing:
             raise ValueError(f"Unknown --baselines names: {missing}")
         baselines = [by_name[name] for name in baseline_filter]
+    kept = {item.name for item in baselines}
+    pruned = []
+    for task in tasks:
+        names = task.baseline_names
+        if names is None:
+            pruned.append(task)
+            continue
+        names = [name for name in names if name in kept]
+        if names:
+            pruned.append(TaskSpec(task.name, task.type, {**task.raw, "baselines": names}, task.perturbations, task.metrics))
+    tasks = pruned
+    plot_groups = {
+        group: [name for name in names if name in kept]
+        for group, names in config.plot_groups.items()
+        if any(name in kept for name in names)
+    }
 
     num_trials = config.num_trials
     if getattr(args, "num_trials", None) is not None:
@@ -636,6 +677,7 @@ def apply_cli_overrides(config: SuiteConfig, args: Any) -> SuiteConfig:
         run_dir=run_dir,
         unit=unit,
         ablation_config=config.ablation_config,
+        plot_groups=plot_groups,
     )
 
 

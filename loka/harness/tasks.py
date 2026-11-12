@@ -377,6 +377,7 @@ class StairsTask:
                 "walk_speed": agent.walk_speed(speed),
                 "goal_radius": radius,
                 "goal_via": used_via,
+                "task_type": "stairs",
                 "terrain": terrain,
                 "landing_z": landing_z,
             },

@@ -1,0 +1,231 @@
+# Master evaluation suite: every experiment, 10 trials, one PACE-ICE submission.
+#
+#   python -m loka.submit_pace_ice --config loka/config/eval_master.yaml --dry-run
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_master.yaml \
+#       --conda-prefix ~/scratch/envs/loka --navila-prefix ~/scratch/envs/loka-navila
+#
+# Each baseline runs only the tasks that list it (tasks.<name>.baselines), and
+# a baseline that appears in several experiments runs once per task: `loka`
+# is the reference for the main comparison, the ablations and the model
+# comparison alike, and `loka_vision` serves both the terrain and navigation
+# tasks.
+#
+#   stand_push, goto_goal (6 perturbations)
+#       main        low_level, loka, unitree_rl
+#       ablations   loka_raw_telemetry, loka_cost_detector, loka_raw_and_cost
+#       models      3 API models (CPU jobs)
+#   curb, stairs_regular                 loka_vision only
+#   nav_object_goal, nav_route           loka_vision, navila (GPU jobs, loka-navila env)
+#
+# 690 units: 630 stand_push/goto_goal, 20 terrain, 40 navigation. The 20
+# NaVILA units run as GPU jobs, the rest as CPU jobs.
+#
+# Plots: one set per plot_groups entry under plots/<group>/ (max push force,
+# the go-to-goal panels per perturbation, successes and highest step for the
+# terrain tasks, and the navigation panels).
+#
+# Every LOKA baseline pays fixed_sim 4 s of simulated latency per call at
+# temperature 0 (the API models refuse temperature 0 and run at their default;
+# each turn records the decoding used). Wall-clock latency is still recorded.
+# No videos: render.npz is still written, so any episode can be encoded later
+# with `python -m loka.run_eval render <run_dir> --episode <unit_dir>`.
+
+output_dir: results/g1_master
+seed: 0
+num_trials: 10
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: fixed_sim
+    seconds: 4.0
+  request_timeout_s: 120.0
+  temperature: 0.0
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+ablation_config: loka/config/loka_ablations.yaml
+
+baselines:
+  # Main comparison. unitree_rl walks at its 0.25 m/s floor (the slowest it
+  # walks reliably on this plant); its time panels are hatched.
+  - low_level
+  - loka
+  - {name: unitree_rl, type: unitree_rl, options: {min_speed: 0.25}}
+  # Component ablations of loka (same orchestrator).
+  - {name: loka_raw_telemetry, type: loka_ablated, options: {variant: raw_telemetry}}
+  - {name: loka_cost_detector, type: loka_ablated, options: {variant: cost_detector}}
+  - {name: loka_raw_and_cost, type: loka_ablated, options: {variant: raw_and_cost}}
+  # Orchestrator model comparison; loka (gpt-6-luna) is the reference.
+  - {name: loka_gpt61_sol, type: loka, options: {orchestrator: {model: gpt-6.1-sol}}}
+  - {name: loka_claude_haiku, type: loka, options: {orchestrator: {model: claude-haiku-5-5}}}
+  - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-5-5}}}
+  # LOKA with the head camera, for the terrain and navigation tasks.
+  - {name: loka_vision, type: loka, options: {vision: true}}
+  # NaVILA on the MPC plant at LOKA's walking speed; it inherits the 4 s latency.
+  - name: navila
+    type: navila
+    options:
+      plant: mpc
+      model_path: ~/scratch/models/navila-llama3-8b-8f
+      forward_speed: 0.15
+
+plot_groups:
+  main: [low_level, loka, unitree_rl]
+  ablations: [loka, loka_raw_telemetry, loka_cost_detector, loka_raw_and_cost]
+  models:
+    - loka
+    - loka_gpt61_sol
+    - loka_claude_haiku
+    - loka_claude_sonnet
+  vision: [loka_vision, navila]
+
+tasks:
+  - name: stand_push
+    type: stand_push
+    baselines: &push_and_goto
+      - low_level
+      - loka
+      - unitree_rl
+      - loka_raw_telemetry
+      - loka_cost_detector
+      - loka_raw_and_cost
+      - loka_gpt61_sol
+      - loka_claude_haiku
+      - loka_claude_sonnet
+    mass:
+      body: left_shoulder_roll_link
+      delta_kg: 10.0
+    mass_time_s: 2.0
+    push_delay_s: 10.0
+    observe_s: 10.0
+    push:
+      direction: [0.0, 1.0]
+      duration_s: 0.05
+    search:
+      lo_n: 0.0
+      hi_n: 200.0
+      max_hi_n: 2000.0
+      resolution_n: 0.2
+    metrics: [max_push_force_n]
+
+  - name: goto_goal
+    type: goto_goal
+    baselines: *push_and_goto
+    goal:
+      xy: [3.0, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 0.0
+    command_time_s: 0.0
+    perturbation_time_s: 5.0
+    timeout_s: 60.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+      - {name: torso_mass, kind: mass, body: torso_link, delta_kg: 10.0}
+      - {name: shoulder_mass, kind: mass, body: left_shoulder_roll_link, delta_kg: 7.0}
+      - {name: weak_right_knee, kind: actuator_gear, actuator: right_knee, scale: 0.75}
+      - {name: low_friction, kind: friction, mu: 0.4}
+      - {name: shove, kind: push, force_n: 120.0, direction: [0.0, 1.0], duration_s: 0.05}
+    metrics:
+      - num_successes
+      - num_falls
+      - time_to_goal_s
+      - wall_time_to_goal_s
+      - path_efficiency
+      - llm_turn_count
+      - model_invocations
+      - llm_input_tokens
+      - llm_output_tokens
+      - telemetry_tokens_mean
+
+  # One 0.10 m curb with a 1.5 m platform; the goal is its middle.
+  - name: curb
+    type: stairs
+    baselines: [loka_vision]
+    scene: curb
+    goal:
+      xy: [1.75, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Step up onto the platform ahead and stop at the world coordinate (1.75, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 60.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
+  # Four 0.07 m steps from x = 1.0; the goal is the landing's middle, (2.4, 0) at z = 0.28.
+  - name: stairs_regular
+    type: stairs
+    baselines: [loka_vision]
+    scene: stairs_regular
+    goal:
+      xy: [2.4, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Climb the stairs ahead and stop on the landing at the world coordinate (2.4, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
+  # Navigation: same instruction and head-camera view for both, no coordinates.
+  # goal.xy is a stand-off point 0.7 m in front of the bookshelf, used only to score.
+  - name: nav_object_goal
+    type: navigate
+    baselines: [loka_vision, navila]
+    scene: navigation
+    instruction: "Walk to the bookshelf and stop in front of it."
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, llm_turn_count, model_invocations, camera_frames]
+
+  - name: nav_route
+    type: navigate
+    baselines: [loka_vision, navila]
+    scene: navigation
+    instruction: "Walk forward past the box on your right, go around the chair keeping it on your right, and stop in front of the bookshelf."
+    route:
+      - {xy: [1.3, -0.45], keep_on: right}
+      - {xy: [2.5, 0.0], keep_on: right}
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, route_followed, llm_turn_count, model_invocations, camera_frames]

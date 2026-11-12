@@ -149,7 +149,13 @@ def _finalize(run_dir: Path, rows: list[dict]) -> None:
     write_statistics(run_dir, stats)
     from loka.harness.plots import plot_run
 
-    for path in plot_run(run_dir, rows, stats):
+    groups = None
+    resolved = Path(run_dir) / "config.resolved.yaml"
+    if resolved.is_file():
+        import yaml
+
+        groups = (yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}).get("plot_groups")
+    for path in plot_run(run_dir, rows, stats, groups=groups):
         print(f"[eval] plot {path}")
     for condition in stats.get("conditions") or []:
         print(f"[eval] {format_condition_line(condition)}")

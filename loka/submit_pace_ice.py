@@ -163,6 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
     gpu.add_argument("--vllm-prefix", default=None, help="Server env for engine vllm (default: registry).")
     gpu.add_argument("--hf-prefix", default=None, help="Server env for engine hf (default: registry).")
     gpu.add_argument(
+        "--navila-prefix",
+        default=None,
+        help=f"Conda env NaVILA units run in (default: {NAVILA_GPU_ENTRY['server_env']}).",
+    )
+    gpu.add_argument(
         "--no-local-check",
         action="store_true",
         help="Do not check on this node that local checkpoints and server envs exist.",
@@ -367,6 +372,18 @@ def render_gpu_worker_script(
         constraint=constraint,
         gres=gres,
     )
+    if entry.get("engine") == "none":
+        # NaVILA: its own env, no server; the policy loads inside each unit.
+        lines += [
+            f"# GPU job: runs a bundle of {key} units in {entry['server_env']} (no model server).",
+            *_preamble(repo, conda_env, str(Path(entry["server_env"]).expanduser()), jobs_file),
+            f"export LOKA_JOB_OFFSET={int(offset)}",
+            "export MUJOCO_GL=egl",
+            "nvidia-smi || true",
+            f'"$CONDA_PREFIX/bin/python" -m loka.submit_pace_ice --gpu-worker --run-dir {run_q}',
+            "",
+        ]
+        return "\n".join(lines)
     log = f"{run_dir}/slurm/server/{key}_${{SLURM_ARRAY_JOB_ID}}_${{SLURM_ARRAY_TASK_ID}}.log"
     lines += [
         f"# GPU job: serves local orchestrator {key} and runs a bundle of units against it.",
@@ -469,11 +486,25 @@ def _sbatch(script: Path, extra: list[str] | None = None) -> str:
 # -- which units need what ---------------------------------------------------
 
 
+#: NaVILA units run as GPU jobs in their own env (scripts/setup_navila_env.sh)
+#: with no model server: the policy loads inside the unit. ``--navila-prefix``
+#: and the ``--gpu-*`` flags override these.
+NAVILA_GPU_ENTRY = {
+    "key": "navila",
+    "provider": "local",
+    "engine": "none",
+    "server_env": "~/scratch/envs/loka-navila",
+    "slurm": {"gres": "gpu:A100:1", "mem": "64G", "cpus": 4, "time": "04:00:00"},
+}
+
+
 def baseline_model_entry(suite: SuiteConfig, baseline: str) -> dict | None:
-    """The resolved orchestrator model of a LOKA baseline; None for the others."""
+    """The resolved orchestrator model of a LOKA baseline, the NaVILA GPU entry, or None."""
     from loka.agent.model_registry import resolve_model
 
     spec = suite.baseline(baseline)
+    if spec.type == "navila" and not (spec.options or {}).get("script"):
+        return {**NAVILA_GPU_ENTRY, "path": str((spec.options or {}).get("model_path") or "")}
     if spec.type not in LOKA_BASELINE_TYPES:
         return None
     entry = (spec.options or {}).get("model_entry")
@@ -539,7 +570,10 @@ def _gpu_resources(entry: dict, args) -> dict:
 
 def _with_server_env(entry: dict, args) -> dict:
     entry = dict(entry)
-    override = args.vllm_prefix if entry.get("engine") == "vllm" else args.hf_prefix
+    if entry.get("engine") == "none":
+        override = getattr(args, "navila_prefix", None)
+    else:
+        override = args.vllm_prefix if entry.get("engine") == "vllm" else args.hf_prefix
     if override:
         entry["server_env"] = override
     return entry
@@ -575,6 +609,32 @@ def _require_credentials(suite: SuiteConfig, repo: Path, *, check_local: bool = 
                 f"baseline {names} needs {variable} in the environment or in .env. "
                 "The key is read on the compute node; it is not written into the Slurm script."
             )
+
+
+def _require_vision_env(suite: SuiteConfig) -> None:
+    """LOKA with the head camera on a CPU job renders through OSMesa and encodes with Pillow.
+
+    Without them the renderer fails at start and LOKA runs text-only without
+    stopping; check on the login node, in the env the CPU jobs activate.
+    """
+    vision = [
+        spec.name for spec in suite.baselines
+        if spec.type in LOKA_BASELINE_TYPES and (spec.options or {}).get("vision")
+    ]
+    if not vision:
+        return
+    problems = []
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        problems.append("Pillow is not installed (pip install Pillow)")
+    lib = Path(os.environ.get("CONDA_PREFIX", "")) / "lib"
+    if not any(lib.glob("libOSMesa*")):
+        problems.append(f"no libOSMesa in {lib} (conda install -c conda-forge mesalib)")
+    if problems:
+        raise RuntimeError(
+            f"baselines {', '.join(vision)} use the head camera on CPU jobs, but " + "; ".join(problems)
+        )
 
 
 def _require_openai(suite: SuiteConfig, repo: Path) -> None:
@@ -1098,6 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
     args.conda_prefix = conda_prefix
     try:
         _require_credentials(suite, repo, check_local=not args.no_local_check)
+        _require_vision_env(suite)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1164,6 +1225,7 @@ def _resubmit(args, repo: Path) -> int:
     args.conda_prefix = conda_prefix
     try:
         _require_credentials(suite, repo, check_local=not args.no_local_check)
+        _require_vision_env(suite)
         cpu_cap, per_model_cap = _cap_split(args, len(gpu_units), bool(jobs))
     except (RuntimeError, ValueError) as exc:
         print(f"Submit error: {exc}", file=sys.stderr)
