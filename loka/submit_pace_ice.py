@@ -501,7 +501,9 @@ NAVILA_GPU_ENTRY = {
     "units_per_job": 1,
     "slurm": {
         "gres": "gpu:1",
-        "constraint": "gpu-a100|gpu-h100|gpu-h200",
+        # Grouped: PACE's submit filter appends "&cuda13", and an ungrouped
+        # OR list mixed with that AND is rejected (BadConstraints).
+        "constraint": "(gpu-a100|gpu-h100|gpu-h200)",
         "mem": "48G",
         "cpus": 4,
         "time": "00:45:00",
