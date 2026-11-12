@@ -2,7 +2,7 @@
 #
 #   python -m loka.submit_pace_ice --config loka/config/eval_master.yaml --dry-run
 #   bash scripts/pace_ice_eval.sh --config loka/config/eval_master.yaml \
-#       --conda-prefix ~/scratch/envs/loka --navila-prefix ~/scratch/envs/loka-navila
+#       --conda-prefix ~/scratch/envs/loka
 #
 # Each baseline runs only the tasks that list it (tasks.<name>.baselines), and
 # a baseline that appears in several experiments runs once per task: `loka`
@@ -15,10 +15,9 @@
 #       ablations   loka_raw_telemetry, loka_cost_detector, loka_raw_and_cost
 #       models      3 API models (CPU jobs)
 #   curb, stairs_regular                 loka_vision only
-#   nav_object_goal, nav_route           loka_vision, navila (GPU jobs, loka-navila env)
+#   nav_object_goal, nav_route           loka_vision (NaVILA left out of this run)
 #
-# 690 units: 630 stand_push/goto_goal, 20 terrain, 40 navigation. The 20
-# NaVILA units run as GPU jobs, the rest as CPU jobs.
+# 670 units, all CPU jobs: 630 stand_push/goto_goal, 20 terrain, 20 navigation.
 #
 # Plots: one set per plot_groups entry under plots/<group>/ (max push force,
 # the go-to-goal panels per perturbation, successes and highest step for the
@@ -79,13 +78,9 @@ baselines:
   - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-5-5}}}
   # LOKA with the head camera, for the terrain and navigation tasks.
   - {name: loka_vision, type: loka, options: {vision: true}}
-  # NaVILA on the MPC plant at LOKA's walking speed; it inherits the 4 s latency.
-  - name: navila
-    type: navila
-    options:
-      plant: mpc
-      model_path: ~/scratch/models/navila-llama3-8b-8f
-      forward_speed: 0.15
+  # NaVILA (GPU jobs) is left out of this run; add it back from eval_navigation.yaml:
+  #   - {name: navila, type: navila, options: {plant: mpc, model_path: ~/scratch/models/navila-llama3-8b-8f, forward_speed: 0.15}}
+  # and list it in the navigation tasks' baselines and the vision plot group.
 
 plot_groups:
   main: [low_level, loka, unitree_rl]
@@ -95,7 +90,7 @@ plot_groups:
     - loka_gpt61_sol
     - loka_claude_haiku
     - loka_claude_sonnet
-  vision: [loka_vision, navila]
+  vision: [loka_vision]
 
 tasks:
   - name: stand_push
@@ -193,11 +188,11 @@ tasks:
       - {name: nominal, kind: none}
     metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
 
-  # Navigation: same instruction and head-camera view for both, no coordinates.
+  # Navigation: an instruction and the head-camera view, no coordinates.
   # goal.xy is a stand-off point 0.7 m in front of the bookshelf, used only to score.
   - name: nav_object_goal
     type: navigate
-    baselines: [loka_vision, navila]
+    baselines: [loka_vision]
     scene: navigation
     instruction: "Walk to the bookshelf and stop in front of it."
     goal:
@@ -213,7 +208,7 @@ tasks:
 
   - name: nav_route
     type: navigate
-    baselines: [loka_vision, navila]
+    baselines: [loka_vision]
     scene: navigation
     instruction: "Walk forward past the box on your right, go around the chair keeping it on your right, and stop in front of the bookshelf."
     route:
