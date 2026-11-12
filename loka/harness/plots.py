@@ -70,20 +70,21 @@ def plot_run(run_dir: Path, rows: list[dict], stats: dict[str, Any]) -> list[Pat
 
 
 def _goto_figures(plt, plot_dir: Path, rows: list[dict]) -> list[Path]:
-    grouped: dict[str, list[dict]] = {}
+    """One figure per goto_goal perturbation and per navigate task and perturbation."""
+    grouped: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
-        if str(row.get("task")) != "goto_goal":
+        if str(row.get("task")) != "goto_goal" and row.get("task_type") != "navigate":
             continue
-        grouped.setdefault(str(row.get("perturbation")), []).append(row)
+        grouped.setdefault((str(row.get("task")), str(row.get("perturbation"))), []).append(row)
     written = []
-    for perturbation, group in grouped.items():
-        path = plot_dir / f"goto_goal_{perturbation}.png"
-        _goto_figure(plt, path, perturbation, group)
+    for (task, perturbation), group in grouped.items():
+        path = plot_dir / f"{task}_{perturbation}.png"
+        _goto_figure(plt, path, perturbation, group, task=task)
         written.append(path)
     return written
 
 
-def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict]) -> None:
+def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict], task: str = "goto_goal") -> None:
     baselines = []
     for row in rows:
         name = str(row.get("baseline"))
@@ -94,11 +95,21 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict]) -> None:
         name for name, speed in speeds.items()
         if goal_speed is not None and abs(speed - goal_speed) > 1e-6
     }
-    fig, axes = plt.subplots(3, 2, figsize=(10.5, 11.0), constrained_layout=True)
+    panels = list(_GOTO_PANELS)
+    if any(row.get("model_invocations") for row in rows):
+        panels.append(("Model calls per trial", "model_invocations", "mean"))
+    if any(row.get("task_type") == "navigate" for row in rows):
+        panels.append(("Prop collisions", "prop_collisions", "count"))
+        if any(row.get("route") for row in rows):
+            panels.append(("Route followed (of successes)", "route_followed", "count"))
+    n_rows = (len(panels) + 2) // 2
+    fig, axes = plt.subplots(n_rows, 2, figsize=(10.5, 3.7 * n_rows), constrained_layout=True)
     flat = list(axes.ravel())
+    for spare in flat[len(panels):]:
+        spare.axis("off")
     x = np.arange(len(baselines))
     colors = [_COLORS[i % len(_COLORS)] for i in range(len(baselines))]
-    for ax, (title, key, how) in zip(flat, _GOTO_PANELS):
+    for ax, (title, key, how) in zip(flat, panels):
         means, errors = _panel_values(rows, baselines, key, how)
         speed_bound = key in _SPEED_PANELS
         for index, (height, err) in enumerate(zip(means, errors)):
@@ -129,7 +140,6 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict]) -> None:
             err = errors[np.isfinite(means)] if finite.size else np.array([0.0])
             top = float(np.max(finite + err[: finite.size])) if finite.size else 1.0
         ax.set_ylim(0.0, max(top * 1.15, 1e-3))
-    flat[-1].axis("off")
     if off_speed:
         names = ", ".join(f"{name} ({speeds[name]:g} m/s)" for name in baselines if name in off_speed)
         flat[-1].text(
@@ -144,7 +154,7 @@ def _goto_figure(plt, path: Path, perturbation: str, rows: list[dict]) -> None:
             wrap=True,
             fontsize=10,
         )
-    fig.suptitle(f"goto_goal / {perturbation}")
+    fig.suptitle(f"{task} / {perturbation}")
     fig.savefig(path, dpi=120)
     plt.close(fig)
 
@@ -286,6 +296,8 @@ def _trajectories(plt, plot_dir: Path, rows: list[dict]) -> list[Path]:
             ax.plot(pelvis[:, 0], pelvis[:, 1], color=color, alpha=0.45, linewidth=1.0)
         for index, baseline in enumerate(baselines):
             ax.plot([], [], color=_COLORS[index % len(_COLORS)], label=baseline)
+        for kind, px, py, yaw in group[0].get("props") or ():
+            _draw_prop(ax, plt, str(kind), float(px), float(py), float(yaw))
         circle = plt.Circle(goal, radius, fill=False, linestyle="--", color="black")
         ax.add_patch(circle)
         ax.scatter([goal[0]], [goal[1]], c="black", s=20, zorder=3)
@@ -300,6 +312,27 @@ def _trajectories(plt, plot_dir: Path, rows: list[dict]) -> list[Path]:
         plt.close(fig)
         written.append(path)
     return written
+
+
+#: Floor footprint of each prop kind in its body frame: centre offset and half sizes [m]
+#: (``models/props/*.xml`` collision geoms).
+_PROP_FOOTPRINTS = {
+    "box": ((0.0, 0.0), (0.2, 0.1)),
+    "chair": ((-0.01, 0.0), (0.24, 0.21)),
+    "table": ((0.0, 0.0), (0.5, 0.5)),
+    "shelf": ((0.025, 0.0), (0.325, 0.45)),
+    "cube": ((0.0, 0.0), (0.1, 0.1)),
+}
+
+
+def _draw_prop(ax, plt, kind: str, x: float, y: float, yaw: float) -> None:
+    offset, half = _PROP_FOOTPRINTS.get(kind, ((0.0, 0.0), (0.2, 0.2)))
+    c, s = np.cos(yaw), np.sin(yaw)
+    rot = np.array([[c, -s], [s, c]])
+    corners = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=float) * np.asarray(half)
+    world = (corners + np.asarray(offset)) @ rot.T + np.array([x, y])
+    ax.add_patch(plt.Polygon(world, closed=True, facecolor="0.8", edgecolor="0.4", zorder=1))
+    ax.annotate(kind, (x, y), ha="center", va="center", fontsize=7, color="0.25", zorder=2)
 
 
 def _pelvis(episode_dir) -> np.ndarray | None:

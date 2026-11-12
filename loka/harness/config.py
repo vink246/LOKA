@@ -244,6 +244,22 @@ def _stand_push_perturbation(raw: dict[str, Any], task_name: str) -> Perturbatio
     )
 
 
+def _check_navigate(name: str, data: dict[str, Any]) -> None:
+    from loka.scene_props import load_scene
+
+    if not str(data.get("instruction") or "").strip():
+        raise ValueError(f"Task {name!r} (navigate) needs an instruction")
+    if not data.get("scene"):
+        raise ValueError(f"Task {name!r} (navigate) needs a scene")
+    if not load_scene(str(data["scene"])):
+        raise ValueError(f"Task {name!r} scene {data['scene']!r} places no props")
+    for leg in data.get("route") or []:
+        if not isinstance(leg, dict) or len(leg.get("xy") or []) != 2:
+            raise ValueError(f"Task {name!r} route entries need xy: [x, y]")
+        if str(leg.get("keep_on", "")).lower() not in ("left", "right"):
+            raise ValueError(f"Task {name!r} route entries need keep_on: left or right")
+
+
 def _parse_task(raw: Any) -> TaskSpec:
     data = dict(_mapping(raw, "task"))
     name = _check_name(data.pop("name"), "task name")
@@ -296,6 +312,8 @@ def _parse_task(raw: Any) -> TaskSpec:
             raise ValueError(f"Task {name!r} needs goal.xy")
         if "timeout_s" not in data:
             raise ValueError(f"Task {name!r} needs timeout_s")
+        if kind == "navigate":
+            _check_navigate(name, data)
     return TaskSpec(
         name=name,
         type=str(kind),

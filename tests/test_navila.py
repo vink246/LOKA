@@ -15,6 +15,7 @@ from loka.control.locomotion import LocomotionConfig
 from loka.control.unitree_rl import yaw_of
 from loka.sim import Simulation, UnitreeRLSimulation
 from loka.vla.navila import (
+    MPC_TURN_SPEED,
     NavAction,
     NavActionExecutor,
     NavilaConfig,
@@ -244,7 +245,8 @@ def test_executor_turn_mpc_ramps_speed_from_walk():
 
 
 @pytest.mark.slow
-def test_executor_turn_mpc_inplace():
+def test_executor_turn_mpc_arc_from_stand():
+    """From a stand the MPC turn walks a short arc at the crawl, then stands."""
     sim = Simulation(LocomotionConfig(), props=None, camera=None)
     sim.reset()
     ex = NavActionExecutor(
@@ -253,19 +255,40 @@ def test_executor_turn_mpc_inplace():
     yaw0 = _pelvis_yaw(sim)
     xy0 = sim.robot_qpos[:2].copy()
     ex.start(NavAction("turn_left", 30.0), sim.robot_qpos, float(sim.data.time))
+    assert ex.active.speed == pytest.approx(MPC_TURN_SPEED)
     done = None
     for _ in range(int(25.0 / sim.config.control_dt)):
         sim.step()
         done = ex.poll(sim.robot_qpos, float(sim.data.time))
         if done is not None:
             break
-    assert done is not None
+    assert done is not None and done["kind"] == "turn_arc"
     yaw1 = _pelvis_yaw(sim)
     err = abs(((yaw1 - yaw0) + math.pi) % (2 * math.pi) - math.pi)
     assert err > math.radians(15.0)
-    # Mostly in place: lateral drift should stay small.
     assert float(np.linalg.norm(sim.robot_qpos[:2] - xy0)) < 0.6
+    for _ in range(int(3.0 / sim.config.control_dt)):
+        sim.step()
     assert not sim.fell
+
+
+def test_script_action_waits_for_fixed_sim_latency(tmp_path):
+    sim = Simulation(LocomotionConfig(), props=None, camera=None)
+    sim.reset()
+    runtime = NavilaRuntime(
+        sim,
+        NavilaConfig(latency_mode="fixed_sim", latency_s=0.5, save_frames=False, log_dir=tmp_path),
+        plant="mpc",
+        script=[NavAction("stop")],
+        enable_camera=False,
+    )
+    runtime.submit_instruction("script")
+    while not runtime.stopped and sim.data.time < 2.0:
+        runtime.step()
+    assert runtime.stopped
+    assert 0.5 <= float(sim.data.time) < 0.6
+    assert len(runtime.turns) == 1 and runtime.turns[0]["sim_latency_s"] >= 0.5
+    runtime.close()
 
 
 @pytest.mark.slow

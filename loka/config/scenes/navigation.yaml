@@ -1,0 +1,14 @@
+# Navigation scene for eval_navigation.yaml. Robot starts at (0, 0) facing +x.
+# yaw is radians, CCW from +x.
+#   box    0.4 x 0.2 m, right of the route: a landmark the route passes.
+#   chair  0.42 m seat, on the straight line to the shelf: the route must go
+#          around it. yaw pi turns its seat toward the start.
+#   table  1 x 1 m, ahead-left: a distractor off the route.
+#   shelf  0.65 x 0.9 x 1.85 m; yaw 0 turns its open side (local -x) toward the
+#          start, so its front face is at x = 4.3.
+description: "Box right of the route, chair blocking the line, table ahead-left, bookshelf ahead facing the start"
+props:
+  - {kind: box, x: 1.3, y: -0.45, yaw: 0.0}
+  - {kind: chair, x: 2.5, y: 0.0, yaw: 3.14159}
+  - {kind: table, x: 2.2, y: 1.9, yaw: 0.0}
+  - {kind: shelf, x: 4.6, y: 0.0, yaw: 0.0}

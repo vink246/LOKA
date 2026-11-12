@@ -127,6 +127,7 @@ tasks:
       - wall_time_to_goal_s
       - path_efficiency
       - llm_turn_count
+      - model_invocations
       - llm_input_tokens
       - llm_output_tokens
       - telemetry_tokens_mean

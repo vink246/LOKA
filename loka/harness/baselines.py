@@ -87,6 +87,51 @@ class Baseline:
         floor = getattr(self.sim.controller, "walk_speed", None)
         return float(speed) if floor is None else float(floor(speed))
 
+    def holding_stop(self) -> bool:
+        """True while the agent stands by its own choice: its gait is not walking."""
+        gait = getattr(self.sim.controller, "gait", None)
+        return gait is not None and not gait.wants_walk()
+
+    def declared_done(self) -> bool:
+        """True once the agent has ended its own run and will not move again."""
+        return False
+
+    def model_invocations(self) -> int:
+        """Calls sent to the agent's model, answered or not. 0 without one."""
+        return 0
+
+    def camera_frames(self) -> int:
+        """Answered model calls that carried a rendered camera frame."""
+        return sum(
+            1 for turn in self.turns if turn.get("frame_path") or turn.get("camera_frame")
+        )
+
+    #: Props placed after every reset, ``[(kind, x, y, yaw), ...]``.
+    _spawns: tuple = ()
+
+    def _reset_plant(self, seed: int, init_noise: float) -> None:
+        """Keyframe reset, robot-only seeded noise, then the scene's props."""
+        sim = self.sim
+        sim.reset()
+        apply_seeded_state_noise(
+            sim.model, sim.data, seed, init_noise, nq=sim.robot_nq, nv=sim.robot_nv
+        )
+        for kind, x, y, yaw in self._spawns:
+            print(sim.props.spawn(kind, x, y, yaw))
+
+
+def _prop_plant(props) -> dict:
+    """Plant keyword arguments for a scene's props: the ``loka.yaml`` slot pool."""
+    if not props:
+        return {}
+    from loka.agent.loka_config import loka_config
+
+    pool = loka_config().get("props") or {}
+    return {
+        "props": dict(pool.get("slots") or {}),
+        "static_props": tuple(pool.get("static") or ()),
+    }
+
 
 def _apply_goal(controller, xy, speed: float, radius: float) -> None:
     controller.set_task_targets(
@@ -126,9 +171,10 @@ class LowLevelBaseline(Baseline):
     ``oracle``, the plant's own stairs, for the controller-only bound).
     """
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
         del log_path
-        self._sim = Simulation(locomotion_config(suite), terrain=terrain)
+        self._spawns = tuple(props or ())
+        self._sim = Simulation(locomotion_config(suite), terrain=terrain, **_prop_plant(props))
         self._terrain_belief = _terrain_belief_option(spec)
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
@@ -139,8 +185,7 @@ class LowLevelBaseline(Baseline):
             self._sim.controller.terrain.set_volumes(self._sim.plant_terrain.volumes)
 
     def reset(self, seed: int, init_noise: float) -> None:
-        self._sim.reset()
-        apply_seeded_state_noise(self._sim.model, self._sim.data, seed, init_noise)
+        self._reset_plant(seed, init_noise)
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
 
@@ -174,14 +219,16 @@ class UnitreeRLBaseline(LowLevelBaseline):
     (slowest walking command [m/s]).
     """
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
         del log_path
         options = dict(spec.options or {})
+        self._spawns = tuple(props or ())
         self._sim = UnitreeRLSimulation(
             locomotion_config(suite),
             policy_dir=options.get("policy_dir"),
             min_speed=options.get("min_speed"),
             terrain=terrain,
+            **_prop_plant(props),
         )
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
@@ -242,10 +289,13 @@ class LokaBaseline(Baseline):
 
     supports_directive = True
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
         config = loka_runtime_config(spec, suite, log_path)
         camera = config.vision.recipe() if config.enable_vision else None
-        self._sim = Simulation(locomotion_config(suite), terrain=terrain, camera=camera)
+        self._spawns = tuple(props or ())
+        self._sim = Simulation(
+            locomotion_config(suite), terrain=terrain, camera=camera, **_prop_plant(props)
+        )
         self.runtime = LokaRuntime(self._sim, config)
         self.runtime.effort_observer.printout = False
         self._goal_xy = None
@@ -253,8 +303,7 @@ class LokaBaseline(Baseline):
     def reset(self, seed: int, init_noise: float) -> None:
         # Belief, sessions and an in-flight LLM call do not have a safe reset.
         # Callers build a new baseline per episode instead of reusing one.
-        self._sim.reset()
-        apply_seeded_state_noise(self._sim.model, self._sim.data, seed, init_noise)
+        self._reset_plant(seed, init_noise)
         self._goal_xy = None
 
     def step(self) -> None:
@@ -292,6 +341,9 @@ class LokaBaseline(Baseline):
     def mutation_count(self) -> int:
         return len(self.runtime.loka_state.get("mutations") or [])
 
+    def model_invocations(self) -> int:
+        return int(self.runtime.llm_invocations)
+
 
 @register_baseline("loka_ablated")
 class LokaAblatedBaseline(LokaBaseline):
@@ -308,18 +360,24 @@ class NavilaBaseline(Baseline):
 
     Options: ``plant`` (``mpc`` | ``unitree_rl``), ``model_path`` (local
     checkpoint directory; required for real inference), ``device``,
+    ``forward_speed`` and the other ``navila:`` keys of ``loka.yaml``,
     ``policy_dir`` / ``min_speed`` when ``plant`` is ``unitree_rl``.
+    ``latency`` (``{mode, seconds, request_timeout_s}``) defaults to the suite
+    orchestrator's, so NaVILA and LOKA pay the same simulated latency per call.
+    ``script`` (``"move forward 100 cm; stop"``) replaces the model with fixed
+    actions and needs no checkpoint or GPU (harness smoke tests only).
     """
 
     supports_directive = True
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None) -> None:
+    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
         from loka.agent.loka_config import loka_config
         from loka.vla.navila import (
             NavilaConfig,
             NavilaPolicy,
             NavilaRuntime,
             apply_scratch_cache_defaults,
+            parse_script,
             prefer_egl_rendering,
             require_navila_checkpoint,
             require_navila_gpu,
@@ -328,14 +386,24 @@ class NavilaBaseline(Baseline):
         options = dict(spec.options or {})
         plant = str(options.get("plant", "mpc")).strip().lower()
         settings = (loka_config().get("navila") or {}).copy()
-        settings.update({k: v for k, v in options.items() if k not in ("plant", "policy_dir", "min_speed")})
+        reserved = ("plant", "policy_dir", "min_speed", "latency", "script")
+        settings.update({k: v for k, v in options.items() if k not in reserved})
         if options.get("model_path"):
             settings["model_path"] = options["model_path"]
+        latency = dict(options.get("latency") or {})
+        settings["latency_mode"] = str(latency.get("mode", suite.orchestrator.latency_mode))
+        settings["latency_s"] = float(latency.get("seconds", suite.orchestrator.latency_s))
+        settings["request_timeout_s"] = float(
+            latency.get("request_timeout_s", suite.orchestrator.request_timeout_s)
+        )
         cfg = NavilaConfig.from_dict(settings)
-        model_path = require_navila_checkpoint(cfg.model_path)
-        apply_scratch_cache_defaults()
-        require_navila_gpu(cfg.device, cfg.min_free_gb, cfg.min_compute_capability)
-        prefer_egl_rendering()
+        script = parse_script(str(options["script"])) if options.get("script") else None
+        if script is None:
+            model_path = require_navila_checkpoint(cfg.model_path)
+            apply_scratch_cache_defaults()
+            require_navila_gpu(cfg.device, cfg.min_free_gb, cfg.min_compute_capability)
+            prefer_egl_rendering()
+        self._spawns = tuple(props or ())
         camera = cfg.camera.recipe()
         plant_kw = {
             "props": dict((loka_config().get("props") or {}).get("slots") or {}),
@@ -354,21 +422,37 @@ class NavilaBaseline(Baseline):
             self._sim = Simulation(locomotion_config(suite), **plant_kw)
         else:
             raise ValueError(f"navila plant must be mpc or unitree_rl, got {plant!r}")
-        policy = NavilaPolicy(
-            model_path, device=cfg.device, num_frames=cfg.num_frames, max_new_tokens=cfg.max_new_tokens
-        )
+        policy = None
+        if script is None:
+            policy = NavilaPolicy(
+                model_path, device=cfg.device, num_frames=cfg.num_frames, max_new_tokens=cfg.max_new_tokens
+            )
         if log_path is not None:
-            cfg.log_dir = Path(log_path)
+            cfg.log_dir = Path(log_path).parent / "navila"
         self.runtime = NavilaRuntime(
-            self._sim, cfg, plant=plant, policy=policy, enable_camera=True
+            self._sim, cfg, plant=plant, policy=policy, script=script, enable_camera=True
         )
         self._goal_xy = None
         self._plant = plant
 
     def reset(self, seed: int, init_noise: float) -> None:
-        self._sim.reset()
-        apply_seeded_state_noise(self._sim.model, self._sim.data, seed, init_noise)
+        self._reset_plant(seed, init_noise)
         self._goal_xy = None
+
+    def holding_stop(self) -> bool:
+        """NaVILA stands between actions while it waits for a reply; only ``stop`` counts."""
+        return bool(self.runtime.stopped) and not self.runtime.executor.busy
+
+    def declared_done(self) -> bool:
+        """``stop``, ``max_actions`` or a failed query: NaVILA takes no further action."""
+        return bool(self.runtime._finished) and not self.runtime.executor.busy
+
+    def model_invocations(self) -> int:
+        return int(self.runtime.invocations)
+
+    @property
+    def turns(self) -> list[dict]:
+        return self.runtime.turns
 
     def step(self) -> None:
         self.runtime.step()
@@ -396,9 +480,13 @@ class NavilaBaseline(Baseline):
         return self.runtime.viz
 
 
-def build_baseline(spec, suite, log_path: Path | None = None, terrain=None) -> Baseline:
-    """One baseline on a plant with ``terrain`` (stairs specs) built in, if any."""
+def build_baseline(spec, suite, log_path: Path | None = None, terrain=None, props=None) -> Baseline:
+    """One baseline on a plant with ``terrain`` (stairs specs) built in, if any,
+    and ``props`` (``[(kind, x, y, yaw), ...]``) placed after every reset."""
     cls = get_baseline(spec.type)
+    kwargs = {}
     if terrain:
-        return cls(spec, suite, log_path=log_path, terrain=terrain)
-    return cls(spec, suite, log_path=log_path)
+        kwargs["terrain"] = terrain
+    if props:
+        kwargs["props"] = props
+    return cls(spec, suite, log_path=log_path, **kwargs)

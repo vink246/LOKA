@@ -1,0 +1,99 @@
+# Language navigation among props: LOKA against NaVILA. CLI flags override these values.
+#   python -m loka.run_eval --config loka/config/eval_navigation.yaml
+# NaVILA needs a GPU and its local checkpoint (scripts/fetch_navila_checkpoint.py),
+# so run this on a GPU node. A smoke test without either swaps the model for a
+# fixed script: options: {script: "move forward 100 cm; stop"}.
+#
+# Both baselines get the same instruction, the same head-camera view of the
+# scene and no coordinates: NaVILA has no pose input and was trained on
+# landmark instructions (R2R), so a world-coordinate goal would fail it by
+# construction. goal.xy is a stand-off point 0.7 m in front of the bookshelf's
+# open face (x = 4.3, see loka/config/scenes/navigation.yaml), used only to
+# score. Success is the pelvis within goal.radius of it, standing by the
+# agent's own choice for goal.hold_s: LOKA standing at its own last goal,
+# NaVILA after its stop action. Standing to wait for a reply does not count.
+#
+# Kept equal between the two: the low-level controller (NaVILA on plant mpc),
+# the walking speed (NaVILA forward_speed 0.15 m/s, the speed the LOKA prompt
+# starts walks at) and the simulated latency per call (fixed_sim 4 s; NaVILA
+# inherits the orchestrator block below unless its options.latency overrides).
+# LOKA still knows its own pose and NaVILA does not; that is part of each
+# system and should be stated with the results.
+
+output_dir: results/g1_navigation
+seed: 0
+num_trials: 5
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: fixed_sim
+    seconds: 4.0
+  request_timeout_s: 120.0
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+baselines:
+  - {name: loka, type: loka, options: {vision: true}}
+  - name: navila
+    type: navila
+    options:
+      plant: mpc
+      model_path: ~/scratch/models/navila-llama3-8b-8f
+      forward_speed: 0.15
+
+tasks:
+  # Object goal: the target is named, the route is up to the agent. The chair
+  # sits on the straight line to the shelf, so both have to go around it.
+  - name: nav_object_goal
+    type: navigate
+    scene: navigation
+    instruction: "Walk to the bookshelf and stop in front of it."
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, llm_turn_count, model_invocations, camera_frames]
+
+  # Route instruction in the R2R style NaVILA was trained on. route_followed
+  # checks, on successful trials, that each landmark was passed on the side
+  # the instruction names (keep_on is the robot's side).
+  - name: nav_route
+    type: navigate
+    scene: navigation
+    instruction: "Walk forward past the box on your right, go around the chair keeping it on your right, and stop in front of the bookshelf."
+    route:
+      - {xy: [1.3, -0.45], keep_on: right}
+      - {xy: [2.5, 0.0], keep_on: right}
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, route_followed, llm_turn_count, model_invocations, camera_frames]

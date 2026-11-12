@@ -25,8 +25,11 @@ from loka.harness.metrics import (
     max_push_force_n,
     num_falls,
     num_successes,
+    camera_frames,
+    model_invocations,
     path_efficiency,
     path_length_m,
+    route_followed,
     success,
     time_to_goal_s,
     wall_time_to_goal_s,
@@ -298,6 +301,70 @@ def test_metrics_from_stored_episode():
     assert max_push_force_n([survived, toppled]) == 4.0
     early = _episode(fell=True, fell_before_push=True, push_force_n=2.0)
     assert max_push_force_n([early]) == 0.0
+
+
+def test_navigation_suite_parses():
+    suite = load_suite_yaml(REPO_ROOT / "loka" / "config" / "eval_navigation.yaml")
+    assert [b.type for b in suite.baselines] == ["loka", "navila"]
+    assert {t.type for t in suite.tasks} == {"navigate"}
+    assert len(list(iter_units(suite))) == 2 * 2 * 5
+    with pytest.raises(ValueError, match="instruction"):
+        parse_suite(
+            {
+                "baselines": ["loka"],
+                "tasks": [
+                    {
+                        "name": "nav",
+                        "type": "navigate",
+                        "scene": "navigation",
+                        "goal": {"xy": [1.0, 0.0]},
+                        "timeout_s": 10.0,
+                        "perturbations": [{"name": "nominal", "kind": "none"}],
+                        "metrics": ["num_successes"],
+                    }
+                ],
+            }
+        )
+
+
+def test_route_followed_by_side():
+    # Walk +x past a landmark at (1, 0) while 0.5 m to its left: it is on the right.
+    t = np.arange(0.0, 20.0 + 1e-9, 0.01)
+    x = 0.15 * t
+    y = 0.5 * np.exp(-((x - 1.0) ** 2) / 0.2)
+    pelvis = np.column_stack([x, y, np.full_like(t, 0.78)])
+
+    def episode(keep_on, outcome="success"):
+        return EpisodeData(
+            directory=Path("."),
+            metadata={"outcome": outcome, "route": [{"xy": [1.0, 0.0], "keep_on": keep_on}]},
+            timeseries={"pelvis_xyz": pelvis, "t": t},
+        )
+
+    assert route_followed(episode("right")) == 1.0
+    assert route_followed(episode("left")) == 0.0
+    assert route_followed(episode("right", outcome="timeout")) is None
+    assert route_followed(_episode(outcome="success")) is None
+
+
+def test_model_invocations_and_camera_frames():
+    assert model_invocations(_episode(model_invocations=7, llm_turn_count=6)) == 7.0
+    assert model_invocations(_episode(llm_turn_count=6)) is None
+    assert camera_frames(_episode(camera_frames=0)) == 0.0
+
+
+def test_prop_contacts_debounce():
+    from loka.harness.tasks import PropContacts
+
+    sim = Simulation(props={"box": 1}, static_props=())
+    sim.reset()
+    sim.props.spawn("box", 0.25, 0.0, 0.0)
+    contacts = PropContacts(sim, gap_s=0.5)
+    for _ in range(int(0.3 / sim.config.control_dt)):
+        sim.step()
+        contacts.update(sim)
+    assert contacts.total == 1
+    assert list(contacts.onsets) == ["box_0"]
 
 
 def test_intervals():

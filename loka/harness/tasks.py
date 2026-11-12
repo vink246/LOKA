@@ -21,7 +21,7 @@ def _rewrite(directory: Path, metadata: dict) -> None:
     )
 
 
-def _run(agent, suite, directory: Path, events, timeout_s, metadata, success_fn, encode: bool):
+def _run(agent, suite, directory: Path, events, timeout_s, metadata, success_fn, encode: bool, stop_fn=None):
     return run_episode(
         agent,
         directory=directory,
@@ -34,6 +34,7 @@ def _run(agent, suite, directory: Path, events, timeout_s, metadata, success_fn,
         encode_video=encode,
         recording=suite.recording,
         model_path=str(agent.sim.config.model_path),
+        stop_fn=stop_fn,
     )
 
 
@@ -109,6 +110,155 @@ class GotoGoalTask:
             meta["time_to_goal_s"] = meta["t_end"]
         else:
             meta["time_to_goal_s"] = None
+        _rewrite(unit_dir, meta)
+        return meta
+
+
+class PropContacts:
+    """Counts collisions between any robot geom and each placed prop.
+
+    A collision starts when a prop touches the robot after ``gap_s`` without
+    contact, so a foot that flickers on and off a prop while it pushes along
+    it is one collision, not one per step.
+    """
+
+    def __init__(self, sim, gap_s: float = 0.5) -> None:
+        self.gap_s = float(gap_s)
+        self.last_touch: dict[int, float] = {}
+        model = sim.model
+        layout = sim.prop_layout
+        root = layout.robot_root if layout.robot_root >= 0 else int(model.body_rootid[sim.pelvis_id])
+        self.robot_geom = model.body_rootid[model.geom_bodyid] == root
+        self.prop_index = np.full(model.ngeom, -1, dtype=int)
+        self.names = [slot.name for slot in layout.slots]
+        for index, slot in enumerate(layout.slots):
+            for geom, _contype, _conaffinity in slot.collision_geoms:
+                self.prop_index[geom] = index
+        self.onsets: dict[str, int] = {}
+
+    def update(self, sim) -> None:
+        data = sim.data
+        n = int(data.ncon)
+        if n == 0:
+            return
+        g1 = np.asarray(data.contact.geom1[:n], dtype=int)
+        g2 = np.asarray(data.contact.geom2[:n], dtype=int)
+        p1, p2 = self.prop_index[g1], self.prop_index[g2]
+        hit = np.concatenate([p1[(p1 >= 0) & self.robot_geom[g2]], p2[(p2 >= 0) & self.robot_geom[g1]]])
+        now = float(data.time)
+        for index in set(int(i) for i in hit):
+            last = self.last_touch.get(index)
+            if last is None or now - last > self.gap_s:
+                name = self.names[index]
+                self.onsets[name] = self.onsets.get(name, 0) + 1
+            self.last_touch[index] = now
+
+    @property
+    def total(self) -> int:
+        return int(sum(self.onsets.values()))
+
+
+@register_task("navigate")
+class NavigateTask:
+    """Follow a language instruction among props to a region in front of an object.
+
+    Every baseline gets the same ``instruction`` and no coordinates. ``goal.xy``
+    (a stand-off point in front of the target object) is used only to score.
+    Success is the pelvis inside ``goal.radius`` for ``goal.hold_s`` while the
+    agent stands by its own choice (``Baseline.holding_stop``) and its pelvis
+    moves slower than ``goal.still_speed``: passing through the region, or
+    waiting in it for a reply, does not count. An agent that ends its own run
+    (NaVILA's ``stop``) outside the region ends the episode as ``stopped``.
+    The scene's props are placed after every reset; contacts between the robot
+    and a prop are counted as ``prop_collisions``.
+    """
+
+    def __init__(self, spec) -> None:
+        self.spec = spec
+
+    def run(self, suite, unit, unit_dir: Path) -> dict:
+        from loka.scene_props import load_scene
+
+        raw = self.spec.raw
+        goal = raw["goal"]
+        xy = (float(goal["xy"][0]), float(goal["xy"][1]))
+        speed = float(goal.get("speed", 0.15))
+        radius = float(goal.get("radius", 0.75))
+        hold_s = float(goal.get("hold_s", 1.0))
+        still_speed = float(goal.get("still_speed", 0.10))
+        instruction = str(raw["instruction"])
+        command_at = float(raw.get("command_time_s", 0.5))
+        perturb_at = float(raw.get("perturbation_time_s", command_at))
+        timeout_s = float(raw["timeout_s"])
+        spawns = load_scene(str(raw["scene"]))
+        perturbation = make_perturbation(self.spec.perturbation(unit.perturbation))
+        agent = build_baseline(
+            suite.baseline(unit.baseline), suite, log_path=unit_dir / "session.log", props=spawns
+        )
+        if not agent.supports_directive:
+            raise ValueError(f"baseline {unit.baseline!r} takes no language; navigate tasks need it")
+        agent.reset(unit.seed, suite.init_noise)
+        contacts = PropContacts(agent.sim)
+        held = {"in": None, "done": None}
+
+        def standing(agent) -> bool:
+            planar = float(np.linalg.norm(agent.sim.data.qvel[:2]))
+            return planar < still_speed and agent.holding_stop()
+
+        def arrived(agent) -> bool:
+            contacts.update(agent.sim)
+            if agent.goal_xy is None:
+                return False
+            now = float(agent.sim.data.time)
+            dist = float(np.linalg.norm(agent.sim.data.qpos[:2] - agent.goal_xy))
+            if dist <= radius and standing(agent):
+                if held["in"] is None:
+                    held["in"] = now
+                return now - held["in"] + 1e-9 >= hold_s
+            held["in"] = None
+            return False
+
+        def gave_up(agent) -> bool:
+            now = float(agent.sim.data.time)
+            if not agent.declared_done():
+                held["done"] = None
+                return False
+            if held["done"] is None:
+                held["done"] = now
+            return now - held["done"] + 1e-9 >= hold_s + 2.0
+
+        meta = _run(
+            agent,
+            suite,
+            unit_dir,
+            [
+                Event(command_at, "directive", (instruction, xy, speed, radius)),
+                Event(perturb_at, "perturbation", perturbation),
+            ],
+            timeout_s,
+            {
+                "task": unit.task,
+                "task_type": "navigate",
+                "perturbation": unit.perturbation,
+                "baseline": unit.baseline,
+                "trial": unit.trial,
+                "seed": unit.seed,
+                "init_noise": suite.init_noise,
+                "scene": str(raw["scene"]),
+                "props": [list(item) for item in spawns],
+                "instruction": instruction,
+                "goal_xy": [xy[0], xy[1]],
+                "goal_radius": radius,
+                "goal_via": "directive",
+                "route": list(raw.get("route") or []),
+            },
+            arrived,
+            encode=bool(suite.recording.enabled),
+            stop_fn=gave_up,
+        )
+        meta["time_to_goal_s"] = meta["t_end"] if meta.get("outcome") == "success" else None
+        meta["prop_collisions"] = contacts.total
+        meta["prop_contacts"] = dict(contacts.onsets)
         _rewrite(unit_dir, meta)
         return meta
 

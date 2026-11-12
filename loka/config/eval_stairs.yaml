@@ -73,7 +73,7 @@ tasks:
     goal_via: directive
     perturbations:
       - {name: nominal, kind: none}
-    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
 
   # Same flight with 0.15 m risers (top at 0.60).
   - name: stairs_riser_015
@@ -91,7 +91,7 @@ tasks:
     goal_via: directive
     perturbations:
       - {name: nominal, kind: none}
-    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
 
   # Third riser 3 cm taller than the rest: the belief has to be refined in flight.
   - name: stairs_irregular
@@ -108,7 +108,7 @@ tasks:
     goal_via: directive
     perturbations:
       - {name: nominal, kind: none}
-    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
 
   # One 0.10 m curb with a 1.5 m platform; the goal is its middle.
   - name: curb
@@ -125,4 +125,4 @@ tasks:
     goal_via: directive
     perturbations:
       - {name: nominal, kind: none}
-    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count]
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]

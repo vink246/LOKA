@@ -23,25 +23,32 @@ def apply_seeded_state_noise(
     data: mujoco.MjData,
     seed: int,
     scale: float,
+    *,
+    nq: int | None = None,
+    nv: int | None = None,
 ) -> None:
     """Add ``Uniform(-scale, scale)`` to joint ``qpos`` and joint ``qvel``.
 
     ``scale == 0`` leaves the reset state untouched. Call this after the
     keyframe reset. The first 7 ``qpos`` (xyz and quaternion) and the first 6
-    ``qvel`` (base twist) are not modified.
+    ``qvel`` (base twist) are not modified. ``nq`` / ``nv`` limit the noise to
+    the robot's prefix of the state, so prop slots after it neither move nor
+    change the robot's draws.
     """
     scale = float(scale)
     if scale < 0.0:
         raise ValueError("init_noise must be >= 0")
     if scale == 0.0:
         return
+    nq = model.nq if nq is None else int(nq)
+    nv = model.nv if nv is None else int(nv)
     rng = np.random.default_rng(int(seed))
     qpos = np.array(data.qpos, dtype=float)
-    if model.nq > 7:
-        qpos[7:] += rng.uniform(-scale, scale, size=model.nq - 7)
+    if nq > 7:
+        qpos[7:nq] += rng.uniform(-scale, scale, size=nq - 7)
     data.qpos[:] = qpos
     qvel = np.array(data.qvel, dtype=float)
-    if model.nv > 6:
-        qvel[6:] += rng.uniform(-scale, scale, size=model.nv - 6)
+    if nv > 6:
+        qvel[6:nv] += rng.uniform(-scale, scale, size=nv - 6)
     data.qvel[:] = qvel
     mujoco.mj_forward(model, data)

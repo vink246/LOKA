@@ -226,6 +226,9 @@ class LokaRuntime:
         self.llm_queue: queue.Queue = queue.Queue()
         self.llm_busy = False
         self.turns: list[dict] = []
+        #: Orchestrator calls dispatched, including any that time out or are
+        #: still in flight when the run ends (``turns`` holds only answered ones).
+        self.llm_invocations = 0
         self._dispatch_sim_t = 0.0
         self._dispatch_wall_t = 0.0
         self.operator_queue: queue.Queue = queue.Queue()
@@ -792,6 +795,7 @@ class LokaRuntime:
             return False
         user_content, vision = self._vision_request(user_content)
         self.llm_busy = True
+        self.llm_invocations += 1
         self.active_session = session
         self._pending_user_content = user_content
         self._pending_dispatch_reason = reason

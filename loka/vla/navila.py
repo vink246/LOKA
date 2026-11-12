@@ -52,6 +52,13 @@ _TURN_RE = re.compile(
 _STOP_RE = re.compile(r"\bstop\b", re.IGNORECASE)
 
 DEFAULT_LOG_DIR = Path("logs") / "navila"
+#: Turns on the MPC plant walk an arc at the planner's 0.10 m/s crawl instead of
+#: turning on the spot: in-place turns fall on this stack (13 of 16 seeded
+#: 20-90 degree turns, and tests/test_gait.py turn-in-place), arcs did not (0 of
+#: 16). A 90 degree turn moves the pelvis about 0.7 m, a 20 degree one 0.2 m.
+MPC_TURN_SPEED = 0.10
+#: Longest wait for the MPC planner's turn settle once the heading is in tolerance [s].
+TURN_SETTLE_WAIT_S = 1.5
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,13 @@ class NavilaConfig:
     timeout_factor: float = 3.0
     max_actions: int = 40
     unparseable_fallback: str = "stop"
+    #: As ``LokaConfig.llm_latency_mode``: ``wall`` applies a reply on the step
+    #: it arrives; ``fixed_sim`` lets the plant run ``latency_s`` of sim time
+    #: after the query, then blocks until the reply (or ``request_timeout_s``
+    #: of wall time); ``pause`` is ``fixed_sim`` with a latency of 0.
+    latency_mode: str = "wall"
+    latency_s: float = 4.0
+    request_timeout_s: float = 120.0
     min_free_gb: float = 20.0
     min_compute_capability: tuple[int, int] = (8, 0)
     log_dir: Path | None = None
@@ -110,6 +124,10 @@ class NavilaConfig:
             cc = fields["min_compute_capability"]
             fields["min_compute_capability"] = (int(cc[0]), int(cc[1]))
         cfg = cls(camera=cam, **fields)
+        if cfg.latency_mode not in ("wall", "fixed_sim", "pause"):
+            raise ValueError(f"navila latency_mode must be wall, fixed_sim or pause, got {cfg.latency_mode!r}")
+        if cfg.latency_s < 0.0 or cfg.request_timeout_s < 0.0:
+            raise ValueError("navila latency_s and request_timeout_s must be >= 0")
         return cfg
 
 
@@ -444,6 +462,8 @@ class _ActiveAction:
     start_speed: float = 0.0
     speed: float = 0.0
     speed_floor: float = 0.0
+    #: Turns only: sim time the heading first came within tolerance.
+    within_since: float | None = None
 
 
 class NavActionExecutor:
@@ -453,8 +473,9 @@ class NavActionExecutor:
     stands once progress along that axis reaches the distance minus
     ``stop_lead`` (the stopping step covers the rest). Turns set the new
     heading and ramp ``gait.speed`` down at ``turn_decel`` from whatever speed
-    the plant had, to zero on the MPC plant and to ``MIN_WALK_SPEED`` on
-    unitree_rl, whose policy only yaws while walking.
+    the plant had, to ``MPC_TURN_SPEED`` on the MPC plant (in-place turns fall
+    there) and to ``MIN_WALK_SPEED`` on unitree_rl, whose policy only yaws
+    while walking. Both are arcs.
     """
 
     def __init__(
@@ -547,11 +568,10 @@ class NavActionExecutor:
         if self.plant == "unitree_rl":
             floor = MIN_WALK_SPEED
             yaw_rate = 0.2  # unitree_rl v0 ang_vel_z cap
-            kind = "turn_arc"
         else:
-            floor = 0.0
+            floor = MPC_TURN_SPEED
             yaw_rate = 0.4
-            kind = "turn_inplace"
+        kind = "turn_arc"
         speed = max(self._current_speed(), floor)
         nominal = max(abs_delta / yaw_rate, 1.0) + (speed - floor) / self.turn_decel
         self.controller.set_task_targets(
@@ -599,9 +619,18 @@ class NavActionExecutor:
             if float(np.dot(xy - act.start_xy, act.axis)) >= act.stop_at:
                 done = True
         elif act.target_yaw is not None:
+            # Standing before the MPC planner's turn settle has finished is the
+            # post-turn fall; it does not always report settled, so wait at most
+            # TURN_SETTLE_WAIT_S once the heading is within tolerance.
+            settling = bool(getattr(getattr(self.controller, "gait", None), "turning", False))
             if abs(wrap_angle(act.target_yaw - yaw)) <= self.turn_tol:
-                done = True
+                if act.within_since is None:
+                    act.within_since = float(sim_time)
+                if not settling or float(sim_time) - act.within_since >= TURN_SETTLE_WAIT_S:
+                    done = True
             else:
+                act.within_since = None
+            if not done:
                 self._ramp_turn_speed(act, sim_time)
         if not done and float(sim_time) >= act.deadline:
             done = True
@@ -673,6 +702,9 @@ class NavilaRuntime:
         self._inferring = False
         self._finished = False
         self._awaiting_query = False
+        self._dispatch_sim = 0.0
+        #: True once the policy (or script) itself chose ``stop`` for this instruction.
+        self.stopped = False
         self.log_path = Path(self.config.log_dir or DEFAULT_LOG_DIR)
         self.log_path.mkdir(parents=True, exist_ok=True)
         self.session_path = self.log_path / "session.jsonl"
@@ -685,6 +717,10 @@ class NavilaRuntime:
         # Script mode: queue the scripted actions as if the VLA emitted them.
         self._script_index = 0
         self.history: list[dict] = []
+        #: One record per answered VLA query, in the shape the eval harness stores.
+        self.turns: list[dict] = []
+        #: Queries dispatched (model or script), answered or not.
+        self.invocations = 0
 
     # -- operator / faults -------------------------------------------------
 
@@ -714,6 +750,7 @@ class NavilaRuntime:
         self._actions_this_instruction = 0
         self._frame_bank.clear()
         self._finished = False
+        self.stopped = False
         self._awaiting_query = True
         self._script_index = 0
         if self.script_mode and self.script:
@@ -815,6 +852,7 @@ class NavilaRuntime:
                 return
             action = self.script[self._script_index]
             self._script_index += 1
+            self.invocations += 1
             self._log(
                 {
                     "event": "script_action",
@@ -824,7 +862,21 @@ class NavilaRuntime:
                     "parsed": action.describe(),
                 }
             )
-            self._start_action(action)
+            # Through the reply queue, so a script pays latency_mode like the model.
+            self._dispatch_sim = float(self.sim.data.time)
+            self._inferring = True
+            self.executor.clear()
+            self._pending.put(
+                {
+                    "generation": self._infer_generation,
+                    "raw": action.describe(),
+                    "wall_ms": 0.0,
+                    "dispatch_sim": self._dispatch_sim,
+                    "dispatch_wall": time.perf_counter(),
+                    "frame": None,
+                    "ok": True,
+                }
+            )
             return
 
         if self.policy is None:
@@ -837,6 +889,8 @@ class NavilaRuntime:
         generation = self._infer_generation
         dispatch_sim = float(self.sim.data.time)
         dispatch_wall = time.perf_counter()
+        self._dispatch_sim = dispatch_sim
+        self.invocations += 1
         self._inferring = True
         self.executor.clear()  # hold stand while waiting
 
@@ -870,12 +924,36 @@ class NavilaRuntime:
         threading.Thread(target=worker, daemon=True).start()
         print(f"[navila] querying VLA at t={dispatch_sim:.2f}s …")
 
+    def _next_reply(self) -> dict | None:
+        """The current generation's reply, honouring ``latency_mode``; None if not due."""
+        mode = self.config.latency_mode
+        if mode == "wall" or not self._inferring:
+            while True:
+                try:
+                    reply = self._pending.get_nowait()
+                except queue.Empty:
+                    return None
+                if int(reply.get("generation", -1)) == self._infer_generation:
+                    return reply
+        latency = 0.0 if mode == "pause" else float(self.config.latency_s)
+        if float(self.sim.data.time) + 1e-9 < self._dispatch_sim + latency:
+            return None
+        deadline = time.perf_counter() + max(0.0, float(self.config.request_timeout_s))
+        while True:
+            try:
+                reply = self._pending.get(timeout=max(0.0, deadline - time.perf_counter()))
+            except queue.Empty:
+                return {
+                    "generation": self._infer_generation,
+                    "ok": False,
+                    "error": f"no reply within {self.config.request_timeout_s:.0f}s",
+                }
+            if int(reply.get("generation", -1)) == self._infer_generation:
+                return reply
+
     def _drain_replies(self) -> None:
-        try:
-            reply = self._pending.get_nowait()
-        except queue.Empty:
-            return
-        if int(reply.get("generation", -1)) != self._infer_generation:
+        reply = self._next_reply()
+        if reply is None:
             return
         self._inferring = False
         if not reply.get("ok", False):
@@ -912,6 +990,19 @@ class NavilaRuntime:
                 "frame": str(frame_path) if frame_path else None,
             }
         )
+        self.turns.append(
+            {
+                "reason": "navila_query",
+                "sim_time": float(reply["dispatch_sim"]),
+                "applied_sim_time": apply_sim,
+                "wall_latency_s": wall_latency,
+                "sim_latency_s": sim_latency,
+                "instruction": self.instruction,
+                "raw": raw,
+                "action": action.describe(),
+                "camera_frame": self.renderer is not None and reply.get("frame") is not None,
+            }
+        )
         print(f"[navila] t={apply_sim:.2f}s -> {action.describe()!r} ({raw!r})")
         self._start_action(action)
 
@@ -921,6 +1012,7 @@ class NavilaRuntime:
         self._log({"event": "action_start", "sim_time": float(self.sim.data.time), **info})
         if action.kind == "stop":
             self._finished = True
+            self.stopped = True
 
     def _capture_frame(self) -> np.ndarray:
         if self.renderer is None:

@@ -1545,6 +1545,11 @@ class GaitScheduler:
     def goal_arrived(self) -> bool:
         return bool(self._goal_arrived)
 
+    @property
+    def turning(self) -> bool:
+        """True from a large heading error until the turn settles (``TURN_SETTLE``)."""
+        return bool(self._turning)
+
     def apply_speed_schedule(self) -> dict[str, float]:
         """Fill cadence/width from ``gait.speed`` unless the user pinned them."""
         cfg = self.config

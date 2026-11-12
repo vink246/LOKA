@@ -160,6 +160,47 @@ def path_efficiency(episode: EpisodeData):
     return float(optimal / length)
 
 
+@register_metric("prop_collisions", scope="episode")
+def prop_collisions(episode: EpisodeData):
+    """Contact onsets between the robot and any prop, over the whole episode."""
+    return _finite(episode.metadata.get("prop_collisions"))
+
+
+#: Half-window either side of the closest approach used for the path tangent [samples].
+_ROUTE_TANGENT_SAMPLES = 25
+
+
+@register_metric("route_followed", scope="episode")
+def route_followed(episode: EpisodeData):
+    """1 when every ``route`` landmark was passed on its ``keep_on`` side, else 0.
+
+    The side is the sign of the cross product of the smoothed path's tangent
+    at its closest approach to the landmark and the direction to it. A path
+    that is closest to the landmark at its start or end never passed it.
+    Failures and tasks without a route are omitted.
+    """
+    route = episode.metadata.get("route") or []
+    if not route or episode.metadata.get("outcome") != "success":
+        return None
+    xy = _smoothed_xy(episode)
+    if xy is None:
+        return None
+    n = xy.shape[0]
+    for leg in route:
+        point = np.asarray(leg["xy"], dtype=float)[:2]
+        index = int(np.argmin(np.linalg.norm(xy - point, axis=1)))
+        if index == 0 or index == n - 1:
+            return 0.0
+        k = _ROUTE_TANGENT_SAMPLES
+        tangent = xy[min(index + k, n - 1)] - xy[max(index - k, 0)]
+        to_point = point - xy[index]
+        cross = float(tangent[0] * to_point[1] - tangent[1] * to_point[0])
+        side = "left" if cross > 0.0 else "right"
+        if side != str(leg.get("keep_on", "")).lower():
+            return 0.0
+    return 1.0
+
+
 @register_metric("rms_tilt_rad", scope="episode")
 def rms_tilt_rad(episode: EpisodeData):
     rpy = episode.column("rpy")
@@ -174,6 +215,27 @@ def llm_turn_count(episode: EpisodeData) -> float:
     if episode.turns:
         return float(len(episode.turns))
     return float(episode.metadata.get("llm_turn_count") or 0)
+
+
+@register_metric("model_invocations", scope="episode")
+def model_invocations(episode: EpisodeData):
+    """Calls sent to the baseline's model (LOKA's orchestrator, NaVILA's VLA).
+
+    Unlike ``llm_turn_count``, a call that timed out or was still in flight at
+    the end counts. 0 for a baseline without a model; None for runs recorded
+    before the count was stored.
+    """
+    return _finite(episode.metadata.get("model_invocations"))
+
+
+@register_metric("camera_frames", scope="episode")
+def camera_frames(episode: EpisodeData):
+    """Answered model calls that carried a rendered head-camera frame.
+
+    A vision baseline whose renderer failed to start falls back to text and
+    scores 0 here.
+    """
+    return _finite(episode.metadata.get("camera_frames"))
 
 
 @register_metric("wall_s", scope="episode")

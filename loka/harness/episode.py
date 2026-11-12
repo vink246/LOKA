@@ -30,8 +30,9 @@ def run_episode(
     encode_video: bool,
     recording,
     model_path: str,
+    stop_fn: Callable[[Any], bool] | None = None,
 ) -> dict[str, Any]:
-    """Step ``agent`` until success, a fall, or ``timeout_s``.
+    """Step ``agent`` until success, a fall, ``stop_fn`` (outcome ``stopped``), or ``timeout_s``.
 
     Scheduled events (a goal command, a perturbation) fire when sim time
     reaches them, before that step's control update.
@@ -67,6 +68,10 @@ def run_episode(
                 outcome = "success"
                 store.event({"t": now, "kind": "arrived"})
                 break
+            if stop_fn is not None and stop_fn(agent):
+                outcome = "stopped"
+                store.event({"t": now, "kind": "stopped"})
+                break
             if now + 1e-9 >= float(timeout_s):
                 outcome = "timeout"
                 break
@@ -80,6 +85,8 @@ def run_episode(
             "t_first_fall": t_first_fall,
             "wall_s": wall,
             "llm_turn_count": len(agent.turns),
+            "model_invocations": int(getattr(agent, "model_invocations", lambda: 0)()),
+            "camera_frames": int(getattr(agent, "camera_frames", lambda: 0)()),
             "episode_dir": str(directory),
         }
         if agent.goal_xy is not None:
