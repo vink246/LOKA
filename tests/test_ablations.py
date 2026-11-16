@@ -376,6 +376,12 @@ def test_session_wording_defaults_are_unchanged():
     assert "|bias|" not in turn and "tracking cost" in turn
     beat = OperatorSession(raw_telemetry=True).build_heartbeat_turn("T", {}, 1.0, "C", period_s=15)
     assert "closing speed" not in beat and "RAW TELEMETRY" in beat
+    assert "active gait goal" in beat and "not the locked directive" in beat
+    assert "camera" not in beat.lower()
+    summary = OperatorSession().build_heartbeat_turn("T", {}, 1.0, "C", period_s=15)
+    assert "active gait goal" in summary and "parsed world xy" in summary
+    assert "camera" not in summary.lower()
+    assert "SELF-ASSIGNED PLAN" in summary
 
 
 def test_cost_runtime_hides_the_residual():

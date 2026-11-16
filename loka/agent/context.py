@@ -96,8 +96,17 @@ def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) ->
             f"{spec.pitch_down_deg:.0f} deg down, horizontal FOV {spec.fovx_deg:.0f} deg, "
             f"about {h:.2f} m above the floor. The image's left is the robot's left. Horizon "
             f"near row {horizon:.0f}; floor distance ahead by image row: {', '.join(ranges)}.{floor}",
+            "A WHAT THE CAMERA SHOWS section is your own description of the image. Directions "
+            "are relative to where the robot faces: left is positive, so an object "
+            "\"left, about 20 degrees\" is at world heading yaw + 20 deg (yaw is in STATE; "
+            "gait.heading is in radians, 20 deg = 0.35 rad), and one about d m away along "
+            "heading h is near (x + d cos h, y + d sin h). If you trust only the direction, "
+            "walk that way by heading: gait.mode: walk, gait.speed: 0.15, gait.heading: <rad>, "
+            "plus an after_s listener (2 to 4 s) to look again.",
             "The plant does not see obstacles: route around them with waypoints. Stairs and "
-            "curbs are terrain: declare them with a stairs Model_Mutation and set the goal on top.",
+            "curbs are terrain: declare them with a stairs Model_Mutation and set the goal on top. "
+            "A locked directive with no parsed world xy is unfinished until the image shows you "
+            "stopped at the place it describes; arriving at an intermediate gait goal is not enough.",
         ]
     )
 
@@ -208,9 +217,9 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "2 cm error. Measure from a frame with the first riser 0.7 to 1.6 m ahead (closer, its "
         "bottom edge leaves the image) and re-measure from the staging point. Write v_b, v_t and "
         "the resulting riser in Analysis.",
-        "  The robot measures every tread it steps on and corrects the belief. When the edges are "
-        "unclear, round the riser down rather than up: a riser declared too high can make the "
-        "robot fall.",
+        "  The robot measures every tread it steps on and corrects the belief.",
+        "- A locked directive with no parsed world xy is unfinished until the image shows you "
+        "stopped at the place it describes; arriving at an intermediate gait goal is not enough.",
         "- Do not plan to step onto movable objects: route around them.",
         "- The robot has no touch sensing. Pressing on an object also raises |bias|; that is an "
         "external load, not a model error. If |bias| rises while the frame shows the robot "

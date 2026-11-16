@@ -143,6 +143,59 @@ def test_refine_moves_the_flight_above_a_mismeasured_step():
     assert refine_from_touchdown(state, {"xy": [1.15, 0.0], "measured_z": 0.104}).kind == "consistent"
 
 
+def test_refine_skips_lowering_a_flight_step():
+    state: dict = {}
+    apply_terrain_mutation(state, {
+        "object_type": "stairs", "name": "s",
+        "value": {"start": [1.0, 0.0], "steps": 3, "riser": 0.10, "tread": 0.3},
+    })
+    before = [v.top for v in volumes_of(state)]
+    # 0.17 is still closer to step 1 (0.20) than to step 0 (0.10), so the
+    # sibling guard does not fire; the down-refine guard should.
+    result = refine_from_touchdown(state, {"xy": [1.45, 0.0], "measured_z": 0.17})
+    assert result.kind == "skipped"
+    assert "refusing to lower" in result.note
+    assert [v.top for v in volumes_of(state)] == pytest.approx(before)
+
+
+def test_refine_skips_when_a_sibling_tread_matches_better():
+    state: dict = {}
+    apply_terrain_mutation(state, {
+        "object_type": "stairs", "name": "s",
+        "value": {"start": [1.0, 0.0], "steps": 3, "riser": 0.10, "tread": 0.3},
+    })
+    # Sole is still over step 1's footprint, but the measured height is step 0.
+    before = [v.top for v in volumes_of(state)]
+    result = refine_from_touchdown(state, {"xy": [1.45, 0.0], "measured_z": 0.10})
+    assert result.kind == "skipped"
+    assert "matches" in result.note
+    assert [v.top for v in volumes_of(state)] == pytest.approx(before)
+
+
+def test_refine_still_lowers_a_single_curb_volume():
+    state: dict = {}
+    apply_terrain_mutation(state, {
+        "object_type": "volume", "name": "curb",
+        "value": {"center": [1.75, 0.0], "size": [1.5, 1.5], "top": 0.15},
+    })
+    result = refine_from_touchdown(state, {"xy": [1.75, 0.0], "measured_z": 0.10})
+    assert result.kind == "refined"
+    assert volumes_of(state)[0].top == pytest.approx(0.10)
+
+
+def test_refine_refuses_non_touchdown_kinds():
+    state: dict = {}
+    apply_terrain_mutation(state, {
+        "object_type": "volume", "name": "curb",
+        "value": {"center": [1.75, 0.0], "size": [1.5, 1.5], "top": 0.10},
+    })
+    result = refine_from_touchdown(
+        state, {"kind": "early_contact", "xy": [1.75, 0.0], "measured_z": 0.12}
+    )
+    assert result.kind == "skipped"
+    assert volumes_of(state)[0].top == pytest.approx(0.10)
+
+
 def test_refine_reports_ground_the_belief_does_not_have():
     state: dict = {}
     ensure_terrain_state(state)

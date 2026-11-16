@@ -54,3 +54,22 @@ def test_camera_blocks_keep_the_camera_facts():
 def test_prompts_promise_no_contact_sensing(name):
     text = _prompts()[name]
     assert "OBJECT CONTACT" not in text and "prop_n" not in text
+
+
+@pytest.mark.parametrize("style", ["full", "compact"])
+def test_text_only_prompt_has_no_camera_mission_rules(style):
+    """Language-only runs must not be told to use a camera they do not have."""
+    text = load_stand_system_prompt(style=style, vision=None)
+    assert "camera" not in text.lower()
+    assert "round the riser" not in text.lower()
+    assert "round heights" not in text.lower()
+    assert "parsed world xy" in text
+
+
+@pytest.mark.parametrize("style", ["full", "compact"])
+def test_vision_prompt_keeps_image_completion_in_the_camera_block(style):
+    spec = EgoCameraSpec()
+    cam = format_compact_vision_block(spec, _POSE, 0.2) if style == "compact" else format_vision_block(spec, _POSE, 0.2)
+    text = load_stand_system_prompt(style=style, vision=cam)
+    assert "round the riser" not in text.lower()
+    assert "no parsed world xy is unfinished until the image shows" in text

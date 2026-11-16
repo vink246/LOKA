@@ -351,6 +351,11 @@ class LokaRuntime:
                         and abs(result.error_m) > self.config.terrain_refine_fault_m
                     ):
                         self._raise_terrain_fault(record, now, result.note)
+                elif result.kind == "skipped":
+                    if result.note:
+                        print(f"[LOKA] {result.note} at t={now:.2f}s")
+                        if self.log is not None:
+                            self.log.note(result.note, sim_time=now)
                 elif result.kind == "unexplained":
                     self._raise_terrain_fault(record, now, result.note)
             elif kind == "early_contact":

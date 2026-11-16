@@ -186,12 +186,16 @@ TERRAIN_FAULT_TEXT = (
     "frame if there is one. If it is ground the robot is meant to stand on (a step, a "
     "stair, a curb, a platform), declare it with a volume or stairs Model_Mutation "
     "(estimate it from the frame, else from where the foot was stopped); the robot "
-    "measures the exact tread heights as it steps. If it is an obstacle (furniture, a "
-    "box, a chair or table leg, any object), do not declare a volume: a volume is ground "
-    "the planner steps onto, and one under or beside the feet makes the robot misjudge "
-    "its own footing. Instead set a waypoint that backs away from the object and routes "
-    "around it, keeping the robot's 0.5 m width clear of it. With no camera frame, a "
-    "blocked swing is a riser only when the task is to climb."
+    "measures the exact tread heights as it steps. If it "
+    "is an obstacle (furniture, a box, a chair or table leg, any object), do not declare "
+    "a volume: a volume is ground the planner steps onto, and one under or beside the "
+    "feet makes the robot misjudge its own footing. On this turn, set only a retreat "
+    "waypoint at least 0.6 m back from the contact along the approach (behind the robot, "
+    "away from the object), walk there, and arm a near_xy on that retreat. From the "
+    "clear pose on a later turn, set the next waypoint that routes around the object "
+    "with 0.5 m clearance. Do not place a new approach waypoint past or beside the "
+    "object on the same turn as the blocked swing. With no camera frame, a blocked "
+    "swing is a riser only when the task is to climb."
 )
 
 _STOOD_FOR_FAULT = (
@@ -496,24 +500,31 @@ class OperatorSession(ConversationMixin):
         if self.raw_telemetry:
             motion = (
                 "No listener invoked you in this interval. Work out from RAW TELEMETRY "
-                "whether the robot moves toward the goal: project the pelvis velocity "
-                "(vx, vy) on the direction from the pelvis to the goal. Negative means "
-                "the robot is walking away. If it is walking away, set "
+                "whether the robot moves toward the active gait goal: project the pelvis "
+                "velocity (vx, vy) on the direction from the pelvis to that goal. Negative "
+                "means it is walking away from the waypoint; if so, set gait.goal_x and "
+                "gait.goal_y again. "
             )
         else:
             motion = (
-                "No listener invoked you in this interval. Read closing speed and "
-                "along heading in the full-state snapshot. Positive closing speed "
-                "is motion toward the goal. Negative means the robot is walking "
-                "away; planar speed has no sign. If it is walking away, set "
+                "No listener invoked you in this interval. Closing speed and along "
+                "heading in the snapshot are relative to the active gait goal, not proof "
+                "the locked directive is done. Positive closing speed is toward that "
+                "waypoint; negative means walking away (planar speed has no sign). If it "
+                "is walking away, set gait.goal_x and gait.goal_y again. "
             )
         return (
             f"--- PERIODIC CHECK (t={sim_time:.2f}s, every {period_s:.0f}s) ---\n"
             f"{motion}"
-            "gait.goal_x and gait.goal_y again. If gait.mode is stand because a "
+            "Being inside gait.goal_tolerance finishes only that waypoint, not the locked "
+            "directive. If SELF-ASSIGNED PLAN still has unfinished steps, set the next "
+            "walk goal; do not stand and clear listeners. If the locked directive has no "
+            "parsed world xy, waypoint arrival alone does not finish it — keep pursuing "
+            "the locked text. If gait.mode is stand because a "
             f"{self.text['heartbeat_fixed']}"
-            "unfinished, set gait.mode=walk, gait.goal_x, gait.goal_y, and "
-            "gait.speed. Leave listeners armed "
+            "unfinished, or if you are standing with residual in bounds, the directive "
+            "or plan still unfinished, and no listeners armed, set gait.mode=walk, "
+            "gait.goal_x, gait.goal_y, and gait.speed this turn. Leave listeners armed "
             "if they are still the right wake-up.\n\n"
             + _format_context_sections(
                 mpc_config,
