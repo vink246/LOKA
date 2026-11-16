@@ -143,7 +143,7 @@ def test_refine_moves_the_flight_above_a_mismeasured_step():
     assert refine_from_touchdown(state, {"xy": [1.15, 0.0], "measured_z": 0.104}).kind == "consistent"
 
 
-def test_refine_skips_lowering_a_flight_step():
+def test_refine_skips_large_lowering_of_a_flight_step():
     state: dict = {}
     apply_terrain_mutation(state, {
         "object_type": "stairs", "name": "s",
@@ -151,11 +151,24 @@ def test_refine_skips_lowering_a_flight_step():
     })
     before = [v.top for v in volumes_of(state)]
     # 0.17 is still closer to step 1 (0.20) than to step 0 (0.10), so the
-    # sibling guard does not fire; the down-refine guard should.
+    # sibling guard does not fire; a 3 cm drop exceeds FLIGHT_DOWN_REFINE_MAX.
     result = refine_from_touchdown(state, {"xy": [1.45, 0.0], "measured_z": 0.17})
     assert result.kind == "skipped"
     assert "refusing to lower" in result.note
     assert [v.top for v in volumes_of(state)] == pytest.approx(before)
+
+
+def test_refine_allows_small_lowering_of_a_flight_step():
+    """Vision often declares ~0.08 m on a true 0.07 m riser; fix via touchdown."""
+    state: dict = {}
+    apply_terrain_mutation(state, {
+        "object_type": "stairs", "name": "s",
+        "value": {"start": [1.0, 0.0], "steps": 4, "riser": 0.08, "tread": 0.3},
+    })
+    result = refine_from_touchdown(state, {"xy": [1.15, 0.0], "measured_z": 0.069})
+    assert result.kind == "refined"
+    tops = [v.top for v in volumes_of(state)]
+    assert tops == pytest.approx([0.069, 0.149, 0.229, 0.309], abs=1e-3)
 
 
 def test_refine_skips_when_a_sibling_tread_matches_better():

@@ -73,7 +73,6 @@ Belief_Searches:
 - Symmetric biases for actuators usually means *the mass itself* is mismatched - not the z axis. On one body, search mass before any COM axis.
 - After a friction search lowers the believed friction, the controller already plans inside it, but a gait tuned for a dry floor can still ask for more sideways force than the floor gives. Walk on with a lower gait.speed, a higher gait.duty_factor, a longer gait.step_period, or a shorter gait.step_length_max.
 - If you observe a raised platform or stairs, first determine if you can step onto it. If a step up appears higher than 0.16 m, the controller cannot climb it: go around it unless the directive says otherwise.
-- When declaring climbable terrain, arm a near_xy before the approach so you can check the geometry from closer in; footfalls correct the heights.
 - If a swing is blocked by an obstacle (furniture or any object that is not climbable ground), retreat at least 0.6 m away from the contact on that turn, then route around it from the clear pose on a later turn. Do not set a new approach waypoint past or beside the object on the blocked-swing turn.
 - Snapshot distance and closing speed are to the active gait goal. Being inside gait.goal_tolerance of a waypoint does not finish the locked directive if the plan still has steps or the directive has no parsed world xy.
 - An imbalance between legs or a roll error is influenced by the y component of the COM. A large pitch error is influenced by the x component of the COM. The height is measured along the z-axis.

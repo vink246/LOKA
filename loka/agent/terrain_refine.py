@@ -12,8 +12,9 @@ Guardrails keep flaky contacts from warping a flight:
 - only ``touchdown`` events refine (callers must not pass ``early_contact``);
 - a footfall whose measured height matches a sibling tread more closely than
   the volume under the sole is left alone (wrong-step contact);
-- within a flight, tops only move up (a lower sole is treated as the wrong
-  tread, not a shorter riser);
+- within a flight, tops may move up freely, but may only move down by at most
+  ``FLIGHT_DOWN_REFINE_MAX`` (small overestimates from vision; larger drops are
+  treated as the wrong tread, not a shorter riser);
 - after a cascade, each riser must stay inside ``STAIR_RISER_RANGE``.
 
 A footfall the belief cannot explain (load on a sole over believed flat floor,
@@ -32,6 +33,10 @@ from loka.control.terrain import STAIR_RISER_RANGE, TerrainBelief, Volume
 
 #: Touchdown height error that is refined rather than ignored [m].
 REFINE_TOL = 0.01
+#: Within a stair flight, allow lowering a tread by at most this much [m].
+#: Covers typical ~1 cm vision overestimates (e.g. 0.08 declared vs 0.07 true)
+#: while still rejecting large drops that look like wrong-tread contacts.
+FLIGHT_DOWN_REFINE_MAX = 0.025
 #: A footfall this far above the floor where the belief has no volume is
 #: unexplained terrain [m].
 UNEXPLAINED_HEIGHT = 0.02
@@ -124,10 +129,11 @@ def refine_from_touchdown(loka_state: dict, event: dict, floor_z: float = 0.0) -
     if abs(error) <= REFINE_TOL:
         return RefineResult("consistent", "", error)
 
-    # Within a flight, only raise tops. A sole that sits low is almost always
-    # on a lower tread (or the face), not evidence that every higher riser
-    # should shrink.
-    if vol.group is not None and error < -REFINE_TOL:
+    # Within a flight, raise freely; only allow a small downward correction.
+    # A sole that sits much lower is almost always on a lower tread (or the
+    # face), not evidence that every higher riser should shrink. Sibling
+    # matching already catches clear wrong-step contacts.
+    if vol.group is not None and error < -FLIGHT_DOWN_REFINE_MAX:
         return RefineResult(
             "skipped",
             f"terrain refine skipped: refusing to lower {vol.name} "

@@ -215,8 +215,8 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "  Scale: with this camera one image row is about 0.6 cm of riser 0.7 to 1.6 m ahead, so a "
         "0.10 m riser spans about 15 to 17 rows. Read the edges to the pixel; a 3-row misread is a "
         "2 cm error. Measure from a frame with the first riser 0.7 to 1.6 m ahead (closer, its "
-        "bottom edge leaves the image) and re-measure from the staging point. Write v_b, v_t and "
-        "the resulting riser in Analysis.",
+        "bottom edge leaves the image). Write v_b, v_t and the resulting riser in Analysis, then "
+        "declare and walk.",
         "  The robot measures every tread it steps on and corrects the belief.",
         "- A locked directive with no parsed world xy is unfinished until the image shows you "
         "stopped at the place it describes; arriving at an intermediate gait goal is not enough.",
