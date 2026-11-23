@@ -1,0 +1,22 @@
+# Same layout/collisions as navigation.yaml, with MP3D-matched indoor visuals
+# (Poly Haven CC0; models/room/). Used by eval_navigation_photoreal.yaml.
+# visual: photoreal selects models/g1/scene_nav_photoreal.xml and
+# models/props/photoreal/* (mesh chair/shelf, textured table/box).
+description: "Photoreal navigation room: wood floor, plaster walls, real chair/bookshelf meshes; same poses as navigation"
+visual: photoreal
+ceiling_z: 2.6
+# VLN-CE-like ego for local run_loka / paired eval (overrides loka.yaml vision).
+camera:
+  width: 512
+  height: 512
+  fovy_deg: 90.0
+  pitch_down_deg: 10.0
+terrain:
+  - {kind: wall, name: wall_back, x: 5.6, y: 0.5, yaw: 1.5708, length: 5.6, height: 2.5}
+  - {kind: wall, name: wall_left, x: 2.2, y: 3.2, yaw: 0.0, length: 6.9, height: 2.5}
+  - {kind: wall, name: wall_right, x: 2.2, y: -2.2, yaw: 0.0, length: 6.9, height: 2.5}
+props:
+  - {kind: box, x: 1.3, y: -0.45, yaw: 0.0}
+  - {kind: chair, x: 2.5, y: 0.0, yaw: 3.14159}
+  - {kind: table, x: 2.2, y: 1.9, yaw: 0.0}
+  - {kind: shelf, x: 4.6, y: 0.0, yaw: 0.0}

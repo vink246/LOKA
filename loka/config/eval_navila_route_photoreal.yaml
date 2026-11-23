@@ -1,0 +1,65 @@
+# NaVILA-only route check on navigation_photoreal (for PACE GPU smoke / compare
+# to results/navila_route_check). Same instruction and plant as the Nov 16/22
+# runs; scene visuals are MP3D-matched.
+#
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_navila_route_photoreal.yaml \
+#       --num-trials 5 --navila-prefix ~/scratch/envs/loka-navila \
+#       --conda-prefix ~/scratch/envs/loka
+
+output_dir: results/navila_route_check_photoreal
+seed: 0
+num_trials: 5
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: fixed_sim
+    seconds: 4.0
+  request_timeout_s: 120.0
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+  stand_push_probes: boundary
+  min_push_visible_s: 0.3
+
+baselines:
+  - name: navila
+    type: navila
+    options:
+      plant: mpc
+      model_path: ~/scratch/models/navila-llama3-8b-8f
+      forward_speed: 0.15
+      camera: {width: 512, height: 512, fovy_deg: 90.0, pitch_down_deg: 10.0}
+
+tasks:
+  - name: nav_route
+    type: navigate
+    scene: navigation_photoreal
+    instruction: "Walk forward past the box on your right, go around the chair keeping it on your right, and stop in front of the bookshelf."
+    route:
+      - {xy: [1.3, -0.45], keep_on: right}
+      - {xy: [2.5, 0.0], keep_on: right}
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, route_followed, llm_turn_count, model_invocations, camera_frames]

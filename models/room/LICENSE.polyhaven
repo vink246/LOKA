@@ -1,0 +1,16 @@
+Poly Haven assets under models/room/ (CC0 1.0 Universal)
+
+  https://creativecommons.org/publicdomain/zero/1.0/
+
+Fetched textures / models (see scripts/fetch_nav_room_assets.py):
+
+  wooden_floor_01     https://polyhaven.com/a/wooden_floor_01
+  plastered_wall      https://polyhaven.com/a/plastered_wall
+  wood_table_worn     https://polyhaven.com/a/wood_table_worn
+  dark_wood           https://polyhaven.com/a/dark_wood
+  WoodenChair_01      https://polyhaven.com/a/WoodenChair_01
+  wooden_bookshelf_worn  https://polyhaven.com/a/wooden_bookshelf_worn
+
+cardboard_diff_512.png is a synthetic cardboard albedo generated for LOKA
+(no third-party rights). Mesh OBJs are re-exported / scaled from the Poly Haven
+glTF sources for MuJoCo; diffuse maps are the Poly Haven 1k albedos.

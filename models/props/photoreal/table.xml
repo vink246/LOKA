@@ -1,0 +1,29 @@
+<mujoco model="table_photoreal">
+  <!-- Same collisions as models/props/table.xml; wood_table_worn albedo (CC0). -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <texture name="table_wood" type="2d" file="../../room/textures/wood_table_worn_diff_512.png"/>
+    <material name="table_wood" texture="table_wood" texuniform="true" texrepeat="2 2"/>
+  </asset>
+  <worldbody>
+    <body name="table">
+      <geom type="box" pos="0 0 0.9" size="0.5 0.5 0.05" material="table_wood" rgba="1 1 1 1" class="visual"/>
+      <geom type="box" pos="0.4 0.4 0.425" size="0.05 0.05 0.425" material="table_wood" rgba="1 1 1 1" class="visual"/>
+      <geom type="box" pos="0.4 -0.4 0.425" size="0.05 0.05 0.425" material="table_wood" rgba="1 1 1 1" class="visual"/>
+      <geom type="box" pos="-0.4 0.4 0.425" size="0.05 0.05 0.425" material="table_wood" rgba="1 1 1 1" class="visual"/>
+      <geom type="box" pos="-0.4 -0.4 0.425" size="0.05 0.05 0.425" material="table_wood" rgba="1 1 1 1" class="visual"/>
+      <geom name="top" type="box" pos="0 0 0.9" size="0.5 0.5 0.05" mass="12" class="collision"/>
+      <geom name="leg_1" type="box" pos="0.4 0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+      <geom name="leg_2" type="box" pos="0.4 -0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+      <geom name="leg_3" type="box" pos="-0.4 0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+      <geom name="leg_4" type="box" pos="-0.4 -0.4 0.425" size="0.05 0.05 0.425" mass="1" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

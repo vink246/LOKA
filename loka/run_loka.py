@@ -263,6 +263,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Also on when vision.enabled is true in loka.yaml",
     )
     parser.add_argument(
+        "--prompt-floor-metric",
+        dest="prompt_floor_metric",
+        action="store_true",
+        default=None,
+        help="Tell the orchestrator the floor texture period for ranging "
+        "(default: vision.prompt_floor_metric in loka.yaml, on)",
+    )
+    parser.add_argument(
+        "--no-prompt-floor-metric",
+        dest="prompt_floor_metric",
+        action="store_false",
+        help="Do not tell the orchestrator the floor tile / checker size",
+    )
+    parser.add_argument(
         "--ego-view",
         action="store_true",
         help="Open a live window streaming the head camera (ego_cam) next to the "
@@ -804,8 +818,16 @@ def main(argv: list[str] | None = None) -> int:
 
         terrain.TERRAIN_STACK = args.terrain_stack
     settings = loka_config()
-    vision_cfg = settings.get("vision") or {}
+    vision_cfg = dict(settings.get("vision") or {})
     navila_cfg_raw = dict(settings.get("navila") or {})
+    scene_meta = {}
+    if args.scene:
+        from loka.scene_props import load_scene_meta
+
+        scene_meta = load_scene_meta(args.scene)
+        # Scene-level camera (e.g. navigation_photoreal VLN-CE 90/10) overrides loka.yaml.
+        if isinstance(scene_meta.get("camera"), dict) and scene_meta["camera"]:
+            vision_cfg.update(scene_meta["camera"])
     vision = llm_enabled and (args.vision or bool(vision_cfg.get("enabled", False)))
     if args.navila:
         camera = EgoCameraSpec.from_config(navila_cfg_raw.get("camera") or {})
@@ -820,6 +842,11 @@ def main(argv: list[str] | None = None) -> int:
         "camera": camera.recipe() if need_camera else None,
         "terrain": _scene_terrain(args),
     }
+    for key in ("room_visual", "props_variant", "ceiling_z", "model_path"):
+        if scene_meta.get(key) not in (None, ""):
+            plant[key] = scene_meta[key]
+    # Scene visual (e.g. navigation_photoreal) may set model_path; CLI --model is the fallback.
+    model_path = plant.pop("model_path", None) or args.model
     if args.navila:
         from loka.vla.navila import (
             NavilaConfig,
@@ -858,10 +885,10 @@ def main(argv: list[str] | None = None) -> int:
         plant_name = "unitree_rl" if args.unitree_rl else "mpc"
         if args.unitree_rl:
             sim = UnitreeRLSimulation(
-                config, model_path=args.model, policy_dir=args.policy_dir, **plant
+                config, model_path=model_path, policy_dir=args.policy_dir, **plant
             )
         else:
-            sim = Simulation(config, model_path=args.model, **plant)
+            sim = Simulation(config, model_path=model_path, **plant)
         runtime = NavilaRuntime(
             sim,
             nav_cfg,
@@ -873,12 +900,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.unitree_rl:
         sim = UnitreeRLSimulation(
-            config, model_path=args.model, policy_dir=args.policy_dir, **plant
+            config, model_path=model_path, policy_dir=args.policy_dir, **plant
         )
         runtime = _PlantRuntime(sim, build_faults(args))
     else:
         llm_model = _install_local_orchestrator(args)
-        sim = Simulation(config, model_path=args.model, **plant)
+        sim = Simulation(config, model_path=model_path, **plant)
         log_path = None
         if not args.no_log:
             log_path = default_log_path(args.log_dir)
@@ -896,6 +923,9 @@ def main(argv: list[str] | None = None) -> int:
             f"reply_check={args.reply_check} max_memory={memory.get('max_memory', 'loka.yaml')}"
             f" ablation={args.ablation or 'none'} model={llm_model or 'default'}"
         )
+        prompt_floor_metric = args.prompt_floor_metric
+        if prompt_floor_metric is None:
+            prompt_floor_metric = bool(vision_cfg.get("prompt_floor_metric", True))
         runtime = LokaRuntime(
             sim,
             LokaConfig(
@@ -908,6 +938,7 @@ def main(argv: list[str] | None = None) -> int:
                 **memory,
                 enable_vision=vision,
                 vision=camera,
+                prompt_floor_metric=prompt_floor_metric,
                 terrain_belief=args.terrain_belief,
                 enable_session_log=not args.no_log,
                 log_path=log_path,

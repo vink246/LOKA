@@ -1,0 +1,24 @@
+<mujoco model="chair_photoreal">
+  <!-- Same collision footprint as models/props/chair.xml; visual is Poly Haven
+       WoodenChair_01 (CC0) scaled to ~0.42 m seat, 0.85 m tall. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <mesh name="chair_mesh" file="../../room/meshes/chair.obj"/>
+    <texture name="chair_tex" type="2d" file="../../room/textures/chair_diff_1k.png"/>
+    <material name="chair_mat" texture="chair_tex"/>
+  </asset>
+  <worldbody>
+    <body name="chair">
+      <geom name="mesh" type="mesh" mesh="chair_mesh" material="chair_mat" class="visual"/>
+      <geom name="back" type="box" pos="-0.23 0 0.65" size="0.02 0.21 0.2" mass="1.5" class="collision"/>
+      <geom name="seat" type="box" pos="0 0 0.2375" size="0.21 0.21 0.2375" mass="4.5" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

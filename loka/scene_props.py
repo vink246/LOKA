@@ -37,6 +37,11 @@ import mujoco
 import numpy as np
 
 PROPS_DIR = Path(__file__).resolve().parents[1] / "models" / "props"
+ROOM_DIR = Path(__file__).resolve().parents[1] / "models" / "room"
+PHOTOREAL_PROPS_DIR = PROPS_DIR / "photoreal"
+PHOTOREAL_SCENE_XML = Path(__file__).resolve().parents[1] / "models" / "g1" / "scene_nav_photoreal.xml"
+#: Floor texture period for ``navigation_photoreal`` (texrepeat 1 on a 2 m Poly Haven tile).
+PHOTOREAL_FLOOR_PERIOD_M = 1.0
 PROP_KINDS = ("chair", "table", "box", "cube", "shelf")
 TERRAIN_KINDS = ("stairs", "wall")
 #: Walls as the robot's cameras see them, and as the viewer and recordings do.
@@ -55,6 +60,8 @@ PARK_SPACING = 3.0
 SPAWN_CLEARANCE = 0.002
 #: A spawn closer than this to the pelvis is reported as overlapping the robot.
 ROBOT_CLEARANCE = 0.45
+#: Default ceiling height for photoreal rooms [m].
+DEFAULT_CEILING_Z = 2.6
 
 _GEOM_TYPES = {
     "box": mujoco.mjtGeom.mjGEOM_BOX,
@@ -62,6 +69,7 @@ _GEOM_TYPES = {
     "capsule": mujoco.mjtGeom.mjGEOM_CAPSULE,
     "cylinder": mujoco.mjtGeom.mjGEOM_CYLINDER,
     "ellipsoid": mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+    "mesh": mujoco.mjtGeom.mjGEOM_MESH,
 }
 _SLOT_NAME = re.compile(r"^(" + "|".join(PROP_KINDS) + r")_(\d+)$")
 
@@ -74,6 +82,7 @@ class PropDef:
     kind: str
     textures: dict[str, Path]
     materials: dict[str, dict[str, str]]
+    meshes: dict[str, Path]
     geoms: tuple[dict[str, str], ...]
 
 
@@ -89,10 +98,19 @@ def _collect_defaults(node: ET.Element, inherited: dict[str, str], out: dict) ->
         _collect_defaults(child, attrs, out)
 
 
+def prop_xml_path(kind: str, variant: str = "") -> Path:
+    """``models/props/<kind>.xml``, or ``models/props/<variant>/<kind>.xml``."""
+    if variant:
+        path = PROPS_DIR / variant / f"{kind}.xml"
+        if path.is_file():
+            return path
+    return PROPS_DIR / f"{kind}.xml"
+
+
 @lru_cache(maxsize=None)
-def load_prop_def(kind: str) -> PropDef:
-    """Parse ``models/props/<kind>.xml`` into geoms with their classes resolved."""
-    path = PROPS_DIR / f"{kind}.xml"
+def load_prop_def(kind: str, variant: str = "") -> PropDef:
+    """Parse a prop MJCF into geoms with their classes resolved."""
+    path = prop_xml_path(kind, variant)
     if not path.is_file():
         raise FileNotFoundError(f"no prop file for {kind!r}: {path}")
     root = ET.parse(path).getroot()
@@ -102,11 +120,14 @@ def load_prop_def(kind: str) -> PropDef:
         _collect_defaults(top, base, defaults)
     textures: dict[str, Path] = {}
     materials: dict[str, dict[str, str]] = {}
+    meshes: dict[str, Path] = {}
     for asset in root.findall("asset"):
         for tex in asset.findall("texture"):
             textures[tex.get("name")] = (path.parent / tex.get("file")).resolve()
         for mat in asset.findall("material"):
             materials[mat.get("name")] = dict(mat.attrib)
+        for mesh in asset.findall("mesh"):
+            meshes[mesh.get("name")] = (path.parent / mesh.get("file")).resolve()
     bodies = root.find("worldbody").findall("body")
     if len(bodies) != 1:
         raise ValueError(f"{path}: expected one body, found {len(bodies)}")
@@ -116,7 +137,7 @@ def load_prop_def(kind: str) -> PropDef:
         attrs.update(geom.attrib)
         attrs.pop("class", None)
         geoms.append(attrs)
-    return PropDef(kind, textures, materials, tuple(geoms))
+    return PropDef(kind, textures, materials, meshes, tuple(geoms))
 
 
 def _floats(text: str) -> list[float]:
@@ -128,7 +149,21 @@ def _asset_name(kind: str, name: str) -> str:
 
 
 def _add_prop_assets(spec, prop: PropDef) -> None:
+    for name, file in prop.meshes.items():
+        if not file.is_file():
+            raise FileNotFoundError(
+                f"prop {prop.kind!r} mesh {name!r} missing: {file} "
+                f"(run scripts/fetch_nav_room_assets.py)"
+            )
+        mesh = spec.add_mesh()
+        mesh.name = _asset_name(prop.kind, name)
+        mesh.file = str(file)
     for name, file in prop.textures.items():
+        if not file.is_file():
+            raise FileNotFoundError(
+                f"prop {prop.kind!r} texture {name!r} missing: {file} "
+                f"(run scripts/fetch_nav_room_assets.py)"
+            )
         tex = spec.add_texture()
         tex.name = _asset_name(prop.kind, name)
         tex.type = mujoco.mjtTexture.mjTEXTURE_2D
@@ -153,9 +188,13 @@ def _add_prop_geom(body, kind: str, slot: str, attrs: dict[str, str]) -> None:
     geom = body.add_geom()
     if "name" in attrs:
         geom.name = f"{slot}/{attrs['name']}"
-    geom.type = _GEOM_TYPES[attrs.get("type", "sphere")]
-    size = _floats(attrs["size"])
-    geom.size = (size + [0.0, 0.0, 0.0])[:3]
+    geom_type = attrs.get("type", "sphere")
+    geom.type = _GEOM_TYPES[geom_type]
+    if geom_type == "mesh":
+        geom.meshname = _asset_name(kind, attrs["mesh"])
+    else:
+        size = _floats(attrs["size"])
+        geom.size = (size + [0.0, 0.0, 0.0])[:3]
     for key in ("pos", "quat", "rgba", "friction"):
         if key in attrs:
             setattr(geom, key, _floats(attrs[key]))
@@ -196,24 +235,41 @@ def plant_recipe(
     static_kinds=DEFAULT_STATIC_KINDS,
     camera: dict | None = None,
     terrain=None,
+    *,
+    room_visual: str = "",
+    props_variant: str = "",
+    ceiling_z: float | None = None,
 ) -> dict:
     """Everything needed to rebuild the identical plant in another process."""
     slots = {str(k): int(v) for k, v in (prop_slots or {}).items() if int(v) > 0}
     for kind in slots:
         if kind not in PROP_KINDS:
             raise ValueError(f"unknown prop kind {kind!r}; known: {', '.join(PROP_KINDS)}")
+    visual = str(room_visual or "").strip().lower()
+    variant = str(props_variant or "").strip()
+    if visual == "photoreal" and not variant:
+        variant = "photoreal"
+    path = Path(model_path)
+    if visual == "photoreal" and path.name == "scene.xml":
+        path = PHOTOREAL_SCENE_XML
     return {
-        "model_path": str(model_path),
+        "model_path": str(path),
         "prop_slots": slots,
         "static_kinds": [str(k) for k in static_kinds],
         "camera": dict(camera) if camera else None,
         "terrain": normalize_terrain(terrain),
+        "room_visual": visual,
+        "props_variant": variant,
+        "ceiling_z": None if ceiling_z is None else float(ceiling_z),
     }
 
 
 def recipe_is_plain(recipe: dict | None) -> bool:
     return not recipe or (
-        not recipe.get("prop_slots") and not recipe.get("camera") and not recipe.get("terrain")
+        not recipe.get("prop_slots")
+        and not recipe.get("camera")
+        and not recipe.get("terrain")
+        and not recipe.get("room_visual")
     )
 
 
@@ -303,7 +359,7 @@ def add_stairs(spec, flight: dict) -> None:
         geom.priority = 1
 
 
-def add_wall(spec, wall: dict) -> None:
+def add_wall(spec, wall: dict, *, material: str | None = None) -> None:
     """A static vertical slab: ``x, y`` its centre, ``length`` along ``yaw``.
 
     A wall is plant geometry only. It has no terrain volumes, so the fall
@@ -320,14 +376,52 @@ def add_wall(spec, wall: dict) -> None:
     geom.size = [0.5 * length, 0.5 * thickness, 0.5 * height]
     geom.pos = [float(wall["x"]), float(wall["y"]), 0.5 * height]
     geom.quat = list(yaw_quat(float(wall.get("yaw", 0.0))))
-    geom.rgba = list(WALL_RGBA)
+    if material:
+        geom.material = material
+        # Default geom rgba is 0.5; it multiplies the texture and kills plaster detail.
+        geom.rgba = [1.0, 1.0, 1.0, 1.0]
+    else:
+        geom.rgba = list(WALL_RGBA)
+
+
+def add_ceiling(spec, walls: list[dict], z: float, *, material: str = "ceiling_plaster") -> None:
+    """A thin visual/collision slab over the wall AABB so ego views are not sky."""
+    if not walls:
+        return
+    xs, ys = [], []
+    for wall in walls:
+        half = 0.5 * float(wall.get("length", 4.0))
+        x, y = float(wall["x"]), float(wall["y"])
+        yaw = float(wall.get("yaw", 0.0))
+        # Cover endpoints of the wall centre-line plus thickness margin.
+        c, s = math.cos(yaw), math.sin(yaw)
+        xs.extend([x - half * c, x + half * c, x])
+        ys.extend([y - half * s, y + half * s, y])
+    margin = 0.4
+    x0, x1 = min(xs) - margin, max(xs) + margin
+    y0, y1 = min(ys) - margin, max(ys) + margin
+    body = spec.worldbody.add_body()
+    body.name = "ceiling"
+    geom = body.add_geom()
+    geom.name = "ceiling/slab"
+    geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    geom.size = [0.5 * (x1 - x0), 0.5 * (y1 - y0), 0.05]
+    geom.pos = [0.5 * (x0 + x1), 0.5 * (y0 + y1), float(z)]
+    geom.contype = 0
+    geom.conaffinity = 0
+    geom.group = 2
+    try:
+        geom.material = material
+        geom.rgba = [1.0, 1.0, 1.0, 1.0]
+    except Exception:
+        geom.rgba = [0.92, 0.91, 0.88, 1.0]
 
 
 def see_through_walls(model, alpha: float = WALL_VIEW_ALPHA) -> None:
     """Fade wall geoms for a third-person view; the ego cameras build their own opaque copy."""
     for g in range(model.ngeom):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
-        if name.endswith("/wall"):
+        if name.endswith("/wall") or name.startswith("ceiling/"):
             model.geom_rgba[g, 3] = float(alpha)
 
 
@@ -340,17 +434,23 @@ def build_plant_model(recipe: dict):
     from loka.vision import EgoCameraSpec, add_ego_camera, fit_offscreen_buffer
 
     spec = mujoco.MjSpec()
-    spec.from_file(recipe["model_path"])
+    model_path = recipe["model_path"]
+    if not Path(model_path).is_file():
+        raise FileNotFoundError(model_path)
+    spec.from_file(model_path)
     camera = EgoCameraSpec.from_config(recipe["camera"]) if recipe.get("camera") else None
     if camera is not None:
         add_ego_camera(spec, camera)
 
+    variant = str(recipe.get("props_variant") or "")
+    photoreal = str(recipe.get("room_visual") or "").lower() == "photoreal"
+    wall_material = "wall_plaster" if photoreal else None
     static_kinds = set(recipe.get("static_kinds") or ())
     names: list[tuple[str, str, bool, tuple]] = []
     park_qpos: list[float] = []
     index = 0
     for kind, count in recipe.get("prop_slots", {}).items():
-        prop = load_prop_def(kind)
+        prop = load_prop_def(kind, variant)
         _add_prop_assets(spec, prop)
         static = kind in static_kinds
         for i in range(count):
@@ -371,11 +471,18 @@ def build_plant_model(recipe: dict):
             names.append((name, kind, static, park))
             index += 1
     terrain = list(recipe.get("terrain") or [])
+    walls = [flight for flight in terrain if flight.get("kind") == "wall"]
     for flight in terrain:
         if flight.get("kind") == "wall":
-            add_wall(spec, flight)
+            add_wall(spec, flight, material=wall_material)
         else:
             add_stairs(spec, flight)
+    if photoreal and walls:
+        ceiling_z = recipe.get("ceiling_z")
+        if ceiling_z is None:
+            ceiling_z = max(float(w.get("height", 2.5)) for w in walls) + 0.1
+            ceiling_z = max(ceiling_z, DEFAULT_CEILING_Z)
+        add_ceiling(spec, walls, float(ceiling_z))
     for key in spec.key:
         key.qpos = list(key.qpos) + park_qpos
     model = spec.compile()
@@ -635,19 +742,23 @@ def list_scenes() -> list[str]:
     return sorted(p.stem for p in SCENES_DIR.glob("*.yaml"))
 
 
-def load_scene(name: str | Path) -> list[tuple[str, float, float, float]]:
-    """Read a scene file -> [(kind, x, y, yaw), ...].
-
-    The file holds ``props:``, a list of ``{kind, x, y, yaw}`` (yaw optional,
-    radians), and an optional ``description``.
-    """
+def _read_scene_yaml(name: str | Path) -> tuple[Path, dict]:
     import yaml
 
     path = scene_path(name)
     if not path.is_file():
         known = ", ".join(list_scenes()) or "none"
         raise ValueError(f"no scene {str(name)!r} ({path}); saved scenes: {known}")
-    data = yaml.safe_load(path.read_text()) or {}
+    return path, yaml.safe_load(path.read_text()) or {}
+
+
+def load_scene(name: str | Path) -> list[tuple[str, float, float, float]]:
+    """Read a scene file -> [(kind, x, y, yaw), ...].
+
+    The file holds ``props:``, a list of ``{kind, x, y, yaw}`` (yaw optional,
+    radians), and an optional ``description``.
+    """
+    path, data = _read_scene_yaml(name)
     out = []
     for item in data.get("props") or []:
         kind = str(item.get("kind", "")).strip().lower()
@@ -663,14 +774,32 @@ def load_scene_terrain(name: str | Path) -> list[dict]:
     Terrain is built into the plant, so it has to be known before the
     simulation exists, unlike props, which are spawned into slots later.
     """
-    import yaml
-
-    path = scene_path(name)
-    if not path.is_file():
-        known = ", ".join(list_scenes()) or "none"
-        raise ValueError(f"no scene {str(name)!r} ({path}); saved scenes: {known}")
-    data = yaml.safe_load(path.read_text()) or {}
+    _, data = _read_scene_yaml(name)
     return normalize_terrain(data.get("terrain") or [])
+
+
+def load_scene_meta(name: str | Path) -> dict:
+    """Optional scene keys that change the plant look (not the prop poses).
+
+    ``visual: photoreal`` selects the MP3D-matched room XML and photoreal prop
+    meshes/textures. ``model`` overrides the plant MJCF path. ``ceiling_z``
+    sets the ceiling slab height.
+    """
+    _, data = _read_scene_yaml(name)
+    visual = str(data.get("visual") or "").strip().lower()
+    model = data.get("model")
+    meta = {
+        "room_visual": visual,
+        "props_variant": "photoreal" if visual == "photoreal" else str(data.get("props_variant") or ""),
+        "ceiling_z": float(data["ceiling_z"]) if data.get("ceiling_z") is not None else None,
+    }
+    if model:
+        meta["model_path"] = str(Path(model))
+    elif visual == "photoreal":
+        meta["model_path"] = str(PHOTOREAL_SCENE_XML)
+    if isinstance(data.get("camera"), dict) and data["camera"]:
+        meta["camera"] = dict(data["camera"])
+    return meta
 
 
 def save_scene(name: str | Path, placed, description: str = "") -> Path:

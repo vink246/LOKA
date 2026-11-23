@@ -1,0 +1,32 @@
+<mujoco model="shelf_photoreal">
+  <!-- Static bookshelf: HumanoidBench collision boxes + Poly Haven
+       wooden_bookshelf_worn visual (CC0), 0.65 x 0.9 x 1.85 m. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <mesh name="shelf_mesh" file="../../room/meshes/shelf.obj"/>
+    <texture name="shelf_tex" type="2d" file="../../room/textures/shelf_diff_1k.png"/>
+    <material name="shelf_mat" texture="shelf_tex"/>
+  </asset>
+  <worldbody>
+    <body name="shelf">
+      <geom name="mesh" type="mesh" mesh="shelf_mesh" material="shelf_mat" class="visual"/>
+      <geom type="box" pos="0 0 0.025" size="0.3 0.4 0.025" class="collision"/>
+      <geom type="box" pos="0 0 0.325" size="0.3 0.4 0.025" class="collision"/>
+      <geom type="box" pos="0 0 0.625" size="0.3 0.4 0.025" class="collision"/>
+      <geom type="box" pos="0 0 0.925" size="0.3 0.4 0.025" class="collision"/>
+      <geom type="box" pos="0 0 1.225" size="0.3 0.4 0.025" class="collision"/>
+      <geom type="box" pos="0 0 1.525" size="0.3 0.4 0.025" class="collision"/>
+      <geom type="box" pos="0.025 0 1.825" size="0.325 0.45 0.025" class="collision"/>
+      <geom type="box" pos="0.025 0.425 0.9" size="0.325 0.025 0.9" class="collision"/>
+      <geom type="box" pos="0.025 -0.425 0.9" size="0.325 0.025 0.9" class="collision"/>
+      <geom type="box" pos="0.325 0 0.9" size="0.025 0.4 0.9" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

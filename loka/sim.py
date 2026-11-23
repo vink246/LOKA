@@ -85,6 +85,9 @@ class Simulation:
         static_props=None,
         camera: dict | None = None,
         terrain=None,
+        room_visual: str = "",
+        props_variant: str = "",
+        ceiling_z: float | None = None,
     ) -> None:
         self.config = config or LocomotionConfig()
         if model_path is not None:
@@ -92,7 +95,15 @@ class Simulation:
         from loka.control.stacks import make as make_stack
 
         self.controller = make_stack(self.config)
-        self._load_plant(props, static_props, camera, terrain)
+        self._load_plant(
+            props,
+            static_props,
+            camera,
+            terrain,
+            room_visual=room_visual,
+            props_variant=props_variant,
+            ceiling_z=ceiling_z,
+        )
         self.steps_per_control = max(
             1, int(round(self.config.control_dt / self.model.opt.timestep))
         )
@@ -100,7 +111,17 @@ class Simulation:
         self.history: list[dict] = []
         self.reset()
 
-    def _load_plant(self, props, static_props, camera, terrain=None) -> None:
+    def _load_plant(
+        self,
+        props,
+        static_props,
+        camera,
+        terrain=None,
+        *,
+        room_visual: str = "",
+        props_variant: str = "",
+        ceiling_z: float | None = None,
+    ) -> None:
         from loka.control.terrain import TerrainBelief, stairs_volumes
         from loka.scene_props import (
             DEFAULT_STATIC_KINDS,
@@ -116,7 +137,12 @@ class Simulation:
             DEFAULT_STATIC_KINDS if static_props is None else static_props,
             camera,
             terrain,
+            room_visual=room_visual,
+            props_variant=props_variant,
+            ceiling_z=ceiling_z,
         )
+        if self.recipe["model_path"] != str(self.config.model_path):
+            self.config.model_path = self.recipe["model_path"]
         self.model, self.prop_layout = build_plant_model(self.recipe)
         # Only the viewer renders this model; ego frames come from their own build.
         see_through_walls(self.model)
@@ -178,12 +204,29 @@ class Simulation:
             for message in self.props.apply_pending():
                 print(message)
 
+    def _lift_onto_plant_terrain(self) -> None:
+        """If the keyframe stands on a raised plant pad, lift the free joint onto it."""
+        terrain = getattr(self, "plant_terrain", None)
+        if terrain is None or not terrain.active:
+            return
+        ground = float(terrain.height_at(self.data.qpos[:2]))
+        if ground <= 1e-3:
+            return
+        self.data.qpos[2] = float(self.data.qpos[2]) + ground
+        mujoco.mj_forward(self.model, self.data)
+
     def reset(self) -> None:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         if getattr(self, "props", None) is not None:
             self.props.reset()
         mujoco.mj_forward(self.model, self.data)
+        self._lift_onto_plant_terrain()
         self.controller.reset()
+        # Empty belief + raised start pad: contact uses this plane until LOKA
+        # declares volumes. Does not reveal stairs/curbs/gaps.
+        seed = getattr(self.controller, "seed_support_from_soles", None)
+        if callable(seed):
+            seed(self.robot_qpos, self.robot_qvel)
         self.history.clear()
         self.torque = np.zeros(self.model.nu)
 
@@ -292,13 +335,26 @@ class UnitreeRLSimulation(Simulation):
         static_props=None,
         camera: dict | None = None,
         terrain=None,
+        room_visual: str = "",
+        props_variant: str = "",
+        ceiling_z: float | None = None,
     ) -> None:
         from loka.control.unitree_rl import MIN_WALK_SPEED, UnitreeRLController
 
         self.config = config or LocomotionConfig()
         if model_path is not None:
             self.config.model_path = str(model_path)
-        self._load_plant(props, static_props, camera, terrain)
+        self._load_plant(
+            props,
+            static_props,
+            camera,
+            terrain,
+            room_visual=room_visual,
+            props_variant=props_variant,
+            ceiling_z=ceiling_z,
+        )
+        if self.recipe["model_path"] != str(self.config.model_path):
+            self.config.model_path = self.recipe["model_path"]
         self.controller = UnitreeRLController(
             self.model,
             policy_dir,

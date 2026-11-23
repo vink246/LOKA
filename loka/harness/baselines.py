@@ -120,17 +120,22 @@ class Baseline:
             print(sim.props.spawn(kind, x, y, yaw))
 
 
-def _prop_plant(props) -> dict:
+def _prop_plant(props, scene_meta: dict | None = None) -> dict:
     """Plant keyword arguments for a scene's props: the ``loka.yaml`` slot pool."""
-    if not props:
-        return {}
-    from loka.agent.loka_config import loka_config
+    out: dict = {}
+    if props:
+        from loka.agent.loka_config import loka_config
 
-    pool = loka_config().get("props") or {}
-    return {
-        "props": dict(pool.get("slots") or {}),
-        "static_props": tuple(pool.get("static") or ()),
-    }
+        pool = loka_config().get("props") or {}
+        out = {
+            "props": dict(pool.get("slots") or {}),
+            "static_props": tuple(pool.get("static") or ()),
+        }
+    meta = dict(scene_meta or {})
+    for key in ("room_visual", "props_variant", "ceiling_z", "model_path"):
+        if meta.get(key) not in (None, ""):
+            out[key] = meta[key]
+    return out
 
 
 def _apply_goal(controller, xy, speed: float, radius: float) -> None:
@@ -171,10 +176,14 @@ class LowLevelBaseline(Baseline):
     ``oracle``, the plant's own stairs, for the controller-only bound).
     """
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
+    def __init__(
+        self, spec, suite, log_path: Path | None = None, terrain=None, props=None, scene_meta=None
+    ) -> None:
         del log_path
         self._spawns = tuple(props or ())
-        self._sim = Simulation(locomotion_config(suite), terrain=terrain, **_prop_plant(props))
+        self._sim = Simulation(
+            locomotion_config(suite), terrain=terrain, **_prop_plant(props, scene_meta)
+        )
         self._terrain_belief = _terrain_belief_option(spec)
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
@@ -219,7 +228,9 @@ class UnitreeRLBaseline(LowLevelBaseline):
     (slowest walking command [m/s]).
     """
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
+    def __init__(
+        self, spec, suite, log_path: Path | None = None, terrain=None, props=None, scene_meta=None
+    ) -> None:
         del log_path
         options = dict(spec.options or {})
         self._spawns = tuple(props or ())
@@ -228,7 +239,7 @@ class UnitreeRLBaseline(LowLevelBaseline):
             policy_dir=options.get("policy_dir"),
             min_speed=options.get("min_speed"),
             terrain=terrain,
-            **_prop_plant(props),
+            **_prop_plant(props, scene_meta),
         )
         self._viz = FaultVizState(external_body_id=self._sim.pelvis_id)
         self._goal_xy = None
@@ -258,6 +269,12 @@ def loka_runtime_config(spec, suite, log_path: Path | None = None) -> LokaConfig
         extra["terrain_refine"] = bool(options["terrain_refine"])
     if "vision" in options:
         extra["enable_vision"] = bool(options["vision"])
+    if "prompt_floor_metric" in options:
+        extra["prompt_floor_metric"] = bool(options["prompt_floor_metric"])
+    if options.get("camera"):
+        from loka.vision import EgoCameraSpec
+
+        extra["vision"] = EgoCameraSpec.from_config(options["camera"])
     return LokaConfig(
         **extra,
         enable_llm=True,
@@ -289,12 +306,17 @@ class LokaBaseline(Baseline):
 
     supports_directive = True
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
+    def __init__(
+        self, spec, suite, log_path: Path | None = None, terrain=None, props=None, scene_meta=None
+    ) -> None:
         config = loka_runtime_config(spec, suite, log_path)
         camera = config.vision.recipe() if config.enable_vision else None
         self._spawns = tuple(props or ())
         self._sim = Simulation(
-            locomotion_config(suite), terrain=terrain, camera=camera, **_prop_plant(props)
+            locomotion_config(suite),
+            terrain=terrain,
+            camera=camera,
+            **_prop_plant(props, scene_meta),
         )
         self.runtime = LokaRuntime(self._sim, config)
         self.runtime.effort_observer.printout = False
@@ -370,7 +392,9 @@ class NavilaBaseline(Baseline):
 
     supports_directive = True
 
-    def __init__(self, spec, suite, log_path: Path | None = None, terrain=None, props=None) -> None:
+    def __init__(
+        self, spec, suite, log_path: Path | None = None, terrain=None, props=None, scene_meta=None
+    ) -> None:
         from loka.agent.loka_config import loka_config
         from loka.vla.navila import (
             NavilaConfig,
@@ -410,6 +434,11 @@ class NavilaBaseline(Baseline):
             "static_props": tuple((loka_config().get("props") or {}).get("static") or ()),
             "camera": camera,
             "terrain": terrain,
+            **{
+                k: v
+                for k, v in _prop_plant(props, scene_meta).items()
+                if k in ("room_visual", "props_variant", "ceiling_z", "model_path")
+            },
         }
         if plant == "unitree_rl":
             self._sim = UnitreeRLSimulation(
@@ -480,7 +509,9 @@ class NavilaBaseline(Baseline):
         return self.runtime.viz
 
 
-def build_baseline(spec, suite, log_path: Path | None = None, terrain=None, props=None) -> Baseline:
+def build_baseline(
+    spec, suite, log_path: Path | None = None, terrain=None, props=None, scene_meta=None
+) -> Baseline:
     """One baseline on a plant with ``terrain`` (stairs specs) built in, if any,
     and ``props`` (``[(kind, x, y, yaw), ...]``) placed after every reset."""
     cls = get_baseline(spec.type)
@@ -489,4 +520,6 @@ def build_baseline(spec, suite, log_path: Path | None = None, terrain=None, prop
         kwargs["terrain"] = terrain
     if props:
         kwargs["props"] = props
+    if scene_meta:
+        kwargs["scene_meta"] = scene_meta
     return cls(spec, suite, log_path=log_path, **kwargs)

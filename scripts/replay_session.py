@@ -23,12 +23,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -37,7 +41,12 @@ from loka.agent.loka_config import loka_config  # noqa: E402
 from loka.agent.runtime import LokaConfig, LokaRuntime  # noqa: E402
 from loka.control.locomotion import LocomotionConfig  # noqa: E402
 from loka.recording import OverviewCamera, SessionRecorder  # noqa: E402
-from loka.scene_props import load_scene, parse_props_spec  # noqa: E402
+from loka.scene_props import (  # noqa: E402
+    load_scene,
+    load_scene_meta,
+    load_scene_terrain,
+    parse_props_spec,
+)
 from loka.sim import Simulation  # noqa: E402
 from loka.vision import EgoCameraSpec  # noqa: E402
 
@@ -87,25 +96,44 @@ def main() -> int:
     if not applies:
         print(f"no applied scratchpads in {args.log}")
         return 1
-    if setup and args.scene is None and args.props is None:
-        args.props = setup["props"] or None
-        argv = setup["argv"].split()
+    if setup:
+        argv = shlex.split(setup.get("argv") or "")
+        if args.scene is None and "--scene" in argv:
+            args.scene = argv[argv.index("--scene") + 1]
+        if args.props is None and setup.get("props"):
+            # Scene already places these; only use the logged prop string when
+            # there was no --scene (ad-hoc --props runs).
+            if args.scene is None:
+                args.props = setup["props"]
         args.vision = args.vision or "--vision" in argv or "--ego-view" in argv
         print(f"[replay] setup from the log: argv '{setup['argv']}', props '{setup['props']}'")
     until = args.until if args.until is not None else applies[-1][0] + 6.0
 
     settings = loka_config()
+    vision_cfg = dict(settings.get("vision") or {})
     prop_cfg = settings.get("props") or {}
-    camera = EgoCameraSpec.from_config(settings.get("vision") or {}).recipe() if args.vision else None
-    sim = Simulation(
-        LocomotionConfig(),
-        props=dict(prop_cfg.get("slots") or {}),
-        static_props=tuple(prop_cfg.get("static") or ()),
-        camera=camera,
-    )
+    scene_meta = load_scene_meta(args.scene) if args.scene else {}
+    if isinstance(scene_meta.get("camera"), dict) and scene_meta["camera"]:
+        vision_cfg.update(scene_meta["camera"])
+    camera = EgoCameraSpec.from_config(vision_cfg).recipe() if args.vision else None
+    plant = {
+        "props": dict(prop_cfg.get("slots") or {}),
+        "static_props": tuple(prop_cfg.get("static") or ()),
+        "camera": camera,
+        "terrain": load_scene_terrain(args.scene) if args.scene else None,
+    }
+    for key in ("room_visual", "props_variant", "ceiling_z", "model_path"):
+        if scene_meta.get(key) not in (None, ""):
+            plant[key] = scene_meta[key]
+    model_path = plant.pop("model_path", None)
+    sim = Simulation(LocomotionConfig(), model_path=model_path, **plant)
     runtime = LokaRuntime(sim, LokaConfig(enable_llm=False, enable_session_log=False, print_compressor=False))
     runtime.effort_observer.printout = False
-    spawns = (load_scene(args.scene) if args.scene else []) + (parse_props_spec(args.props) if args.props else [])
+    # Prefer the scene file's props; logged startup props duplicate them when
+    # the original run used --scene.
+    spawns = list(load_scene(args.scene) if args.scene else [])
+    if args.props:
+        spawns.extend(parse_props_spec(args.props))
     for kind, x, y, yaw in spawns:
         print(sim.props.spawn(kind, x, y, yaw))
 

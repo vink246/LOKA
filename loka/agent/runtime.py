@@ -71,6 +71,9 @@ class LokaConfig:
     #: with the camera (``Simulation(camera=...)``).
     enable_vision: bool = bool(_VISION.get("enabled", False))
     vision: EgoCameraSpec = field(default_factory=lambda: EgoCameraSpec.from_config(_VISION))
+    #: Tell the orchestrator the floor texture period (checker / wood tile) for
+    #: metric ranging. Off leaves floor scale to the image alone.
+    prompt_floor_metric: bool = bool(_VISION.get("prompt_floor_metric", True))
     cooldown_s: float = float(_SESSION["cooldown_s"])
     heartbeat_s: float = float(_SESSION["heartbeat_s"])
     telemetry_window_s: float = float(_SESSION["telemetry_window_s"])
@@ -682,11 +685,10 @@ class LokaRuntime:
             )
         spec = self.config.vision
         block = format_compact_vision_block if self.compact else format_vision_block
-        self.vision_block = block(
-            spec,
-            nominal_camera_pose(self.sim.model),
-            floor_cell_size(self.sim.model),
+        floor_cell = (
+            floor_cell_size(self.sim.model) if self.config.prompt_floor_metric else None
         )
+        self.vision_block = block(spec, nominal_camera_pose(self.sim.model), floor_cell)
         ablations = self.config.ablations
         if ablations.hide_residual:
             self.vision_block = self.vision_block.replace(

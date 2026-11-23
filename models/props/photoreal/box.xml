@@ -1,0 +1,21 @@
+<mujoco model="box_photoreal">
+  <!-- Same 0.4 x 0.2 x 0.3 m collisions; synthetic cardboard albedo. -->
+  <default>
+    <default class="visual">
+      <geom group="2" contype="0" conaffinity="0" density="0"/>
+    </default>
+    <default class="collision">
+      <geom group="3"/>
+    </default>
+  </default>
+  <asset>
+    <texture name="package" type="2d" file="../../room/textures/cardboard_diff_512.png"/>
+    <material name="package" texture="package" texuniform="true" texrepeat="2 2"/>
+  </asset>
+  <worldbody>
+    <body name="box">
+      <geom type="box" pos="0 0 0.15" size="0.2 0.1 0.15" material="package" rgba="1 1 1 1" class="visual"/>
+      <geom name="shell" type="box" pos="0 0 0.15" size="0.2 0.1 0.15" mass="3" class="collision"/>
+    </body>
+  </worldbody>
+</mujoco>

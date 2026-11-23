@@ -49,11 +49,22 @@ def render_episode_dir(directory, *, recording, model_path: str, until_s: float 
     out_path = directory / ("episode.mp4" if until_s is None else f"episode_0-{float(until_s):g}s.mp4")
     terrain = None
     props = None
+    scene_meta = {}
     meta_path = directory / "metadata.json"
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         terrain = meta.get("terrain") or None
         props = meta.get("props") or None
+        scene_name = meta.get("scene")
+        if scene_name:
+            try:
+                from loka.scene_props import load_scene_meta
+
+                scene_meta = load_scene_meta(str(scene_name))
+                if scene_meta.get("model_path"):
+                    model_path = scene_meta["model_path"]
+            except ValueError:
+                scene_meta = {}
     _spawn_render(
         model_path=model_path,
         times=times,
@@ -63,6 +74,9 @@ def render_episode_dir(directory, *, recording, model_path: str, until_s: float 
         recording=recording,
         terrain=terrain,
         props=props,
+        room_visual=scene_meta.get("room_visual") or "",
+        props_variant=scene_meta.get("props_variant") or "",
+        ceiling_z=scene_meta.get("ceiling_z"),
     )
     return out_path
 
@@ -75,7 +89,20 @@ def _prop_pool() -> tuple[dict, tuple]:
     return dict(pool.get("slots") or {}), tuple(pool.get("static") or ())
 
 
-def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, terrain=None, props=None) -> None:
+def _spawn_render(
+    *,
+    model_path,
+    times,
+    qpos,
+    overlays,
+    out_path,
+    recording,
+    terrain=None,
+    props=None,
+    room_visual: str = "",
+    props_variant: str = "",
+    ceiling_z=None,
+) -> None:
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
         frames_path = tmp.name
     np.savez_compressed(
@@ -97,6 +124,9 @@ def _spawn_render(*, model_path, times, qpos, overlays, out_path, recording, ter
         "min_push_visible_s": float(recording.min_push_visible_s),
         "terrain": terrain,
         "props": props,
+        "room_visual": room_visual,
+        "props_variant": props_variant,
+        "ceiling_z": ceiling_z,
     }
     # Spawn re-imports the main module, and that import pulls MuJoCo in,
     # before ``_render_worker`` runs. The GL backend is chosen on first
@@ -134,7 +164,15 @@ def _render_worker(job: dict) -> None:
         from loka.scene_props import build_plant_model, plant_recipe, see_through_walls, yaw_quat
 
         slots, static_kinds = _prop_pool() if job.get("props") else ({}, ())
-        recipe = plant_recipe(job["model_path"], slots, static_kinds, terrain=job.get("terrain"))
+        recipe = plant_recipe(
+            job["model_path"],
+            slots,
+            static_kinds,
+            terrain=job.get("terrain"),
+            room_visual=str(job.get("room_visual") or ""),
+            props_variant=str(job.get("props_variant") or ""),
+            ceiling_z=job.get("ceiling_z"),
+        )
         model, layout = build_plant_model(recipe)
         see_through_walls(model)
         # Free props are in the stored qpos; static ones live in body_pos.

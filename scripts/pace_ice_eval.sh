@@ -16,6 +16,14 @@
 #   # Rerun only what did not finish (CPU units and GPU bundles alike):
 #   bash scripts/pace_ice_eval.sh --resubmit-missing results/g1_eval/pace_YYYYMMDD_HHMMSS \
 #       --conda-prefix ~/scratch/envs/loka
+#   # MP3D-matched MuJoCo nav (fetch assets once: python scripts/fetch_nav_room_assets.py):
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_navigation_photoreal.yaml \
+#       --num-trials 5 --conda-prefix ~/scratch/envs/loka \
+#       --navila-prefix ~/scratch/envs/loka-navila
+#   # NaVILA-only route check on the photoreal room:
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_navila_route_photoreal.yaml \
+#       --num-trials 5 --navila-prefix ~/scratch/envs/loka-navila \
+#       --conda-prefix ~/scratch/envs/loka
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

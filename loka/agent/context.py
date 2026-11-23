@@ -32,6 +32,36 @@ _COMPACT_GAIT_KEYS = (
     "gait.swing_height",
 )
 
+#: Photoreal wood floor period is >= 0.5 m (checker is 0.2 m); see scene_nav_photoreal.xml.
+_WOOD_FLOOR_PERIOD_M = 0.35
+
+
+def _floor_metric_sentence(floor_cell: float | None, *, compact: bool) -> str:
+    """Describe the floor pattern the ego camera sees for ranging.
+
+    Pass ``floor_cell=None`` to omit the clue (``prompt_floor_metric`` off).
+    """
+    if not floor_cell:
+        return ""
+    if float(floor_cell) >= _WOOD_FLOOR_PERIOD_M:
+        if compact:
+            return (
+                f" The floor is hardwood with a repeating texture every "
+                f"{floor_cell:.2f} m; use plank runs to gauge distance."
+            )
+        return (
+            f"The floor is hardwood (photoreal wood albedo). One texture tile repeats every "
+            f"{floor_cell:.2f} m along the floor; count plank runs and tile periods to measure "
+            "distances and object sizes on the floor."
+        )
+    if compact:
+        return f" The floor is a checkerboard of {floor_cell:.2f} m squares."
+    return (
+        f"The floor is a blue checkerboard of {floor_cell:.2f} m squares, alternating "
+        f"light and dark, with thin white lines every {2 * floor_cell:.2f} m. Count "
+        "squares to measure distances and sizes on the floor."
+    )
+
 
 def format_stand_configuration(controller: LocomotionController, *, compact: bool = False) -> str:
     """Live MPC costs and DCM gait knobs, current values only.
@@ -72,10 +102,14 @@ def format_stand_configuration(controller: LocomotionController, *, compact: boo
     return "\n".join(lines)
 
 
-def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
+def format_compact_vision_block(
+    spec, nominal_pose, floor_cell: float | None = None
+) -> str:
     """The camera facts a planner needs, without the derivations.
 
     Camera facts only: what is in the scene is for the model to find in the image.
+    Pass ``floor_cell`` to include the floor texture period (see
+    ``LokaConfig.prompt_floor_metric``); omit it to leave ranging to the image alone.
     """
     import math
 
@@ -88,7 +122,7 @@ def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) ->
         denom = math.sin(p) + yn * math.cos(p)
         if denom > 1e-6 and v < spec.height:
             ranges.append(f"row {v}: {h * (math.cos(p) - yn * math.sin(p)) / denom:.1f} m")
-    floor = f" The floor is a checkerboard of {floor_cell:.2f} m squares." if floor_cell else ""
+    floor = _floor_metric_sentence(floor_cell, compact=True)
     return "\n".join(
         [
             "## CAMERA",
@@ -111,8 +145,11 @@ def format_compact_vision_block(spec, nominal_pose, floor_cell: float | None) ->
     )
 
 
-def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
-    """System-prompt block describing the head camera and how to use it."""
+def format_vision_block(spec, nominal_pose, floor_cell: float | None = None) -> str:
+    """System-prompt block describing the head camera and how to use it.
+
+    Pass ``floor_cell`` to include the floor texture period; omit for no floor clue.
+    """
     import math
 
     h = float(nominal_pose.xyz[2])
@@ -127,21 +164,8 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         forward = h * (math.cos(p) - yn * math.sin(p)) / denom
         half_width = h * ((spec.width - spec.cx) / spec.fx) / denom
         ranges.append(f"  row {v:3d}: floor {forward:5.2f} m ahead, image spans +/-{half_width:4.2f} m sideways")
-    floor = (
-        f"The floor is a blue checkerboard of {floor_cell:.2f} m squares, alternating "
-        f"light and dark, with thin white lines every {2 * floor_cell:.2f} m. Count "
-        "squares to measure distances and sizes on the floor."
-        if floor_cell
-        else "The floor has no metric pattern."
-    )
-    lines = [
-        "## EGOCENTRIC CAMERA",
-        "Each user message carries one RGB image from ego_cam, a camera on the front of "
-        "the G1 head, rendered at the instant the message was sent. It shows what the "
-        "robot would see. Use it to find obstacles, free space, and objects on the way "
-        "to the goal. Telemetry remains the source of truth for the robot's own state.",
-        "",
-        "### Camera and image",
+    floor = _floor_metric_sentence(floor_cell, compact=False)
+    cam_lines = [
         f"- RGB only (no depth), {spec.width} x {spec.height} px, noiseless render, no lens distortion.",
         f"- Pinhole intrinsics: fx = fy = {spec.fx:.1f} px, cx = {spec.cx:.1f}, cy = {spec.cy:.1f}. "
         f"Vertical FOV {spec.fovy_deg:.1f} deg, horizontal FOV {spec.fovx_deg:.1f} deg.",
@@ -156,11 +180,22 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "- Pixel (u, v): u grows to the right, v grows downward, (0, 0) is the top-left corner. "
         "The image's left half is the robot's left (+y in its heading frame).",
         f"- With the nominal pitch the horizon is row {horizon:.0f}. Everything below it is "
-        "floor or objects standing on it; the sky gradient fills the top rows.",
+        "floor or objects standing on it; walls, a ceiling, or a soft indoor void fill the top rows.",
         "- The robot's own arms or hands can appear at the bottom edge; they are not obstacles.",
-        "- Lighting is a directional overhead light plus a headlight, so objects cast short "
-        "shadows straight down.",
-        f"- {floor}",
+        "- Lighting is a warm directional overhead light plus a headlight, so objects cast short "
+        "shadows.",
+    ]
+    if floor:
+        cam_lines.append(f"- {floor}")
+    lines = [
+        "## EGOCENTRIC CAMERA",
+        "Each user message carries one RGB image from ego_cam, a camera on the front of "
+        "the G1 head, rendered at the instant the message was sent. It shows what the "
+        "robot would see. Use it to find obstacles, free space, and objects on the way "
+        "to the goal. Telemetry remains the source of truth for the robot's own state.",
+        "",
+        "### Camera and image",
+        *cam_lines,
         "",
         "### From a pixel to the floor",
         "Use the camera height h, pitch p, and yaw from CAMERA FRAME. For the pixel where an "
@@ -196,9 +231,11 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "- The frame was taken when the message was sent; the robot keeps moving during your "
         "reply, so allow for the distance covered at the current speed.",
         "- Stairs, curbs and platforms are terrain, not obstacles: declare them with a stairs "
-        "or volume Model_Mutation before the walk reaches them, and put the goal on top. The "
-        "foot of the first riser is where the bottom step meets the floor: use the floor "
-        "formulas above on its lowest visible row. Count the treads.",
+        "or volume Model_Mutation before the walk reaches them, and put the goal on top. Notice "
+        "whether the ground ahead looks like one continuous surface or whether it breaks — a "
+        "gap, a bump, a drop, or separate pads at the same height. The foot of the first riser "
+        "is where the bottom step meets the floor: use the floor formulas above on its lowest "
+        "visible row. Count the treads.",
         "- Measure the riser height; do not guess it. A riser is a vertical face, so its bottom "
         "edge (where it meets the floor or the tread below) and its top edge (the nosing, where "
         "it meets the tread above) are the same distance ahead. In one column through the "
@@ -216,7 +253,8 @@ def format_vision_block(spec, nominal_pose, floor_cell: float | None) -> str:
         "0.10 m riser spans about 15 to 17 rows. Read the edges to the pixel; a 3-row misread is a "
         "2 cm error. Measure from a frame with the first riser 0.7 to 1.6 m ahead (closer, its "
         "bottom edge leaves the image). Write v_b, v_t and the resulting riser in Analysis, then "
-        "declare and walk.",
+        "declare and walk; do not stage a closer look or replace the declaration from a later "
+        "image alone.",
         "  The robot measures every tread it steps on and corrects the belief.",
         "- A locked directive with no parsed world xy is unfinished until the image shows you "
         "stopped at the place it describes; arriving at an intermediate gait goal is not enough.",

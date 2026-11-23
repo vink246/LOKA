@@ -93,6 +93,9 @@ vision:
   detail: high
   save_frames: true
   stream_hz: 15.0
+  # Tell the orchestrator the floor texture period (checker / wood tile size).
+  # Set false (or --no-prompt-floor-metric) to leave floor scale to the image alone.
+  prompt_floor_metric: true
 
 # run_loka --record: a fixed overview camera at +x/-y, looking along +y
 # (azimuth 90) and down elevation_deg, so the side-top view covers roughly
