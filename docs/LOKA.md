@@ -2,9 +2,9 @@
 
 **Working methodology document.** This is the long-form source for the Methodology section of the paper in `paper/`. It is deliberately more detailed than the paper will be. The paper version should keep the structure and equations and drop most of the numeric detail, which is kept here so that every claim in the paper can be traced to the implementation.
 
-**Scope of this revision:** motivation, methodology (architecture, low-level controller, anomaly detector, telemetry compressor, orchestrator, scratchpad, belief search) and experimental setup. Results and discussion are not yet covered.
+**Scope of this revision:** motivation, methodology (architecture, low-level controller, anomaly detector, telemetry compressor, orchestrator, scratchpad, belief search), experimental setup, and ablation results with qualitative analysis of orchestrator reasoning logs.
 
-**Source of truth:** the implementation as of October 2026, in its default configuration (Unitree G1, 29 actuated degrees of freedom, MuJoCo plant, convex-MPC + whole-body-QP stack with DCM footholds). Where earlier project notes or the current paper draft disagree with the implementation, this document follows the implementation; the disagreements are listed in Section 12.
+**Source of truth:** the implementation as of October 2026, in its default configuration (Unitree G1, 29 actuated degrees of freedom, MuJoCo plant, convex-MPC + whole-body-QP stack with DCM footholds). Where earlier project notes or the current paper draft disagree with the implementation, this document follows the implementation; the disagreements are listed in Section 13.
 
 ---
 
@@ -791,7 +791,7 @@ The orchestrator is never polled at the control rate. It is invoked by exactly f
 
 1. *Charter.* The orchestrator's role and its five duties (set task targets toward the directive; correct the belief by queueing searches; decide when to stand and walk; arm listeners; maintain its own plan), the semantics of goal-directed walking and turning in place, the meaning of each telemetry section and of each anomaly signal, how residual patterns map to search parameters (Section 5.2), the episode and memory rules, the reply schema with an annotated example, and a short list of problem-solving heuristics (for example, start a walk at 0.15 m/s; route around obstacles with waypoints that keep each heading change below 45°; search the mass of a body before its CoM coordinates).
 2. *Robot model reference.* Generated from the robot description: the body tree with parent links and offsets; every joint with its type, its index in the position and velocity vectors and its range; every actuator with its joint, gear and command range; the list of mutable attributes (actuator gear, surface friction, body mass and CoM); and the kinematic part of the robot description file itself (MJCF). Together these make up most of the system message, which was about 62,000 characters long in the logged VLM runs.
-3. *Camera description (VLM mode only).* The head camera's mount, intrinsics (512 × 512 pixels, 70° vertical field of view, pitched 30° down), the pixel-to-floor projection formulas from pinhole geometry, reference floor distances per image row, the size of the floor checkerboard, a catalogue of the objects that may appear (from HumanoidBench [66]), and navigation guidance for using the image.
+3. *Camera description (VLM mode only).* The head camera's mount, intrinsics (512 × 512 pixels, 70° vertical field of view, pitched 30° down), the pixel-to-floor projection formulas from pinhole geometry, reference floor distances per image row, optionally the floor texture period for metric ranging (`vision.prompt_floor_metric`, on by default), and navigation guidance for using the image. Prop identities are not named in the prompt; the model must read them from the image.
 
 **User message.** The header for the invocation type, then the context and telemetry of Sections 6.2 and 6.3. In VLM mode it also carries one RGB image rendered from the head camera at the instant of dispatch, together with the camera's world pose. Only the current turn carries an image; earlier turns are kept as text.
 
@@ -1002,7 +1002,7 @@ For Experiment 2 the metric is the largest survived push force. Continuous metri
 
 **Benchmark navigation tasks.** The current experiments use one goal on a flat, empty floor. The next step is to evaluate on HumanoidBench [66], a MuJoCo benchmark of whole-body humanoid tasks, so that results are comparable with other methods. The first target is a goal-reaching navigation task in which the direct line to the goal is blocked, such as the benchmark's maze task. It exercises the parts of LOKA that the current experiments do not: the camera image of Section 7.3, waypoint planning in the self-assigned plan, and proximity listeners. As the scope widens, tasks with uneven ground, such as stairs and hurdles, would follow. These require footholds off the floor plane, which the current gait planner does not produce (Section 8.2), so they also depend on an extension of the low-level controller. HumanoidBench is built around the Unitree H1 by default, whereas the controller here is tuned for the G1. The evaluation will therefore either use a G1 version of the benchmark scenes, or port the task geometry and success criteria into the G1 scene.
 
-**Vision-language-action baselines.** To compare LOKA with methods that obtain generality from large-scale training, the planned evaluation adds a humanoid vision-language-action (VLA) model that can be run in the same MuJoCo environment. Candidates include GR00T N1 [23], an open humanoid foundation model with a slow vision-language module and a fast learned action module, and LeVERB [69], which conditions a learned whole-body humanoid controller on vision and language. RT-2 [20] is a natural reference, but its weights are not public, so it can only be discussed rather than run. Most other VLAs, such as OpenVLA [21] and π0 [22], target arm manipulation and do not control humanoid balance. A navigation VLA, NaVILA [70], is already integrated (`loka/vla/navila.py`). It emits mid-level language actions (move forward, turn, stop), which are translated into the same gait targets the orchestrator writes. Its original low-level controller is a reinforcement-learning locomotion policy trained in Isaac Lab with a terrain height scan, and released checkpoints exist only for the Unitree Go2 and H1. Our integration therefore does not use that policy: NaVILA drives either our own low-level controller of Section 4 or the Unitree velocity policy [42], neither of which perceives terrain. Results for this baseline measure NaVILA's high-level navigation on our locomotion stack, not the full NaVILA system, and the paper must say so. Each VLA will be given the same instruction and observations as LOKA, plus whatever robot-specific fine-tuning it requires, and the amount of data and training this involves will be reported as part of the comparison. The reinforcement-learning policy and the low-level controller of Section 11.1 will be retained.
+**Vision-language-action baselines.** To compare LOKA with methods that obtain generality from large-scale training, the planned evaluation adds a humanoid vision-language-action (VLA) model that can be run in the same MuJoCo environment. Candidates include GR00T N1 [23], an open humanoid foundation model with a slow vision-language module and a fast learned action module, and LeVERB [69], which conditions a learned whole-body humanoid controller on vision and language. RT-2 [20] is a natural reference, but its weights are not public, so it can only be discussed rather than run. Most other VLAs, such as OpenVLA [21] and π0 [22], target arm manipulation and do not control humanoid balance. A navigation VLA, NaVILA [70], is already integrated (`loka/vla/navila.py`). It emits mid-level language actions (move forward, turn, stop), which are translated into the same gait targets the orchestrator writes. Its original low-level controller is a reinforcement-learning locomotion policy trained in Isaac Lab with a terrain height scan, and released checkpoints exist only for the Unitree Go2 and H1. Our integration therefore does not use that policy: NaVILA drives either our own low-level controller of Section 4 or the Unitree velocity policy [42], neither of which perceives terrain. Results for this baseline measure NaVILA's high-level navigation on our locomotion stack, not the full NaVILA system, and the paper must say so. Official Habitat VLN-CE / Matterport3D evaluation is deferred without an MP3D license; instead the paired suite `eval_navigation_photoreal.yaml` uses a MuJoCo room with CC0 Poly Haven materials and furniture meshes chosen to approximate MP3D residential RGB (`navigation_photoreal` scene), while keeping the G1 plant and shared MPC. Fetch assets with `scripts/fetch_nav_room_assets.py`. Each VLA will be given the same instruction and observations as LOKA, plus whatever robot-specific fine-tuning it requires, and the amount of data and training this involves will be reported as part of the comparison. The reinforcement-learning policy and the low-level controller of Section 11.1 will be retained.
 
 **Planned metrics.**
 
@@ -1012,11 +1012,137 @@ For Experiment 2 the metric is the largest survived push force. Continuous metri
 - *Number of orchestrator invocations*, broken down by trigger (anomaly, listener, directive, heartbeat). This measures how much language-model reasoning a task needs.
 - *Orchestrator cost*: per-call latency, and tokens and API cost per episode.
 - *Training cost*: the robot-specific data and compute each method requires before deployment. This is zero for LOKA and the low-level controller, and is the quantity on which LOKA's claim rests.
-- *Path efficiency* on navigation tasks, measured to the boundary of the goal region (see Section 12).
+- *Path efficiency* on navigation tasks, measured to the boundary of the goal region (see Section 13).
 
 ---
 
-## 12. Notes for Drafting the Paper
+## 12. Results: Ablations of the Detector and Compressor
+
+This section reports the ablation suite from the G1 master evaluation (`results/g1_master/pace_20261112_032855`; extracted under `results/g1_ablations/g1_master_ablations_pace_20261112`). The task definitions match Section 11.1. Relative to the narrative protocol there, this run used **10 trials** per condition (seeds 0–9), orchestrator latency mode **`fixed_sim` at 4.0 s** per call, and temperature requested at 0.0. The quantitative tables below are therefore not interchangeable with any earlier five-trial / wall-latency ablation dump; the qualitative story is taken from the orchestrator reasoning logs (`loka_turns.jsonl`) of this run.
+
+### 12.1 Ablated baselines
+
+Three ablations remove one or both of the components that turn raw dynamics into a diagnosable report for the language model (Sections 5–6):
+
+1. **`loka_raw_telemetry`.** The residual anomaly detector is kept. The compressor is replaced by a token-budgeted raw CSV of the last telemetry window (same token budget as the compressor would have used on that turn).
+2. **`loka_cost_detector`.** Failure episodes open on windowed MPC tracking cost instead of effort bias / motor deficit / stance slip. Residual channels are hidden from the orchestrator (`hide_residual_telemetry`). The compressor (minus those channels) remains.
+3. **`loka_raw_and_cost`.** Both changes at once: cost tripwire, residual channels hidden, raw CSV instead of compressor prose.
+
+Full **`loka`** is the intact system. The point of the suite is not that every ablation must fail everywhere, but that **when diagnosis requires the right physical story**, removing the residual detector or the compressor changes what the model *says* and therefore what the belief search repairs.
+
+### 12.2 Quantitative summary
+
+**Table 7. Experiment 1 (`goto_goal`) success counts out of 10.**
+
+| Perturbation | `loka` | raw telemetry | cost detector | raw + cost |
+|---|---:|---:|---:|---:|
+| Nominal | 10 | 10 | 10 | 10 |
+| Torso mass (+10 kg) | 10 | 10 | 10 | 10 |
+| Shoulder mass (+7 kg) | 10 | 9 | 0 | 0 |
+| Weak right knee (×0.75) | 8 | 0 | 0 | 0 |
+| Low friction (μ=0.4) | 3 | 1 | 0 | 3 |
+| Lateral shove | 10 | 10 | 10 | 10 |
+
+**Table 8. Experiment 2 (`stand_push` with shoulder mass): max survived push force (N), mean over 10 trials.**
+
+| Baseline | Mean | Min–max |
+|---|---:|---|
+| `loka` | 389.2 | 379–395 |
+| cost detector | 380.7 | 350–396 |
+| raw + cost | 354.1 | 335–378 |
+| raw telemetry | 263.0 | 148–387 |
+
+Full LOKA is stable on stand-push. Raw telemetry collapses on several seeds. Cost detector stays close to full LOKA. The combo sits **between** the two singles—not below both. Section 12.4 explains why that is expected once the logs are read as coupled interfaces rather than independent module deletions.
+
+### 12.3 Qualitative explanation from the reasoning logs
+
+The numbers make sense once you read what the orchestrator *hypothesises* on the first failure turn. Across conditions, full LOKA’s compressor turns three residual channels into a short causal story (“motor deficit on right_knee”, “bilateral knee effort → mass”, “stance slip → friction”). The ablations either never open that conversation, or open it with a table that no longer points at the right cause.
+
+#### Weak right knee: compressor + residual channels name the actuator
+
+This is the cleanest ablation. On successful full-LOKA trials the first failure turn is almost always the same diagnosis:
+
+> *“The right_knee motor deficit is −2.06 Nm, exceeding the 0.8 Nm threshold, while the effort bias and stance slip are below their thresholds. Queue a gear search for right_knee.”*
+
+First search: `gear/right_knee` on **8/10** trials; **8/10** successes. The model is not inventing a clever plan—it is reading a labelled motor-deficit line that only exists because the residual detector computed it and the compressor surfaced it.
+
+Raw telemetry still trips on residuals, but the CSV does not isolate the actuator. Typical first hypotheses become torso mass or COM:
+
+> *“The effort deviations are distributed across multiple actuators without a clear isolated actuator… Search torso_link mass first.”*
+
+First search: mass/COM on essentially every intervening trial; **0** gear searches; **0/10** successes (mostly timeout while chasing the wrong parameter).
+
+Cost detector and raw+cost hide motor deficit entirely. When they intervene at all, they read height/roll tracking cost and again search mass/COM—never gear—and finish **0/10**. Several cost-detector episodes never open before the fall: the gear fault does not always push windowed MPC cost over the calibrated walk threshold in time.
+
+**Intuition:** a weakened knee is a *local actuator* story. Without motor-deficit in the report, the language model defaults to the global stories it knows (mass, COM) and repairs the wrong thing.
+
+#### Shoulder mass while walking: cost detector never gets a turn
+
+Full LOKA and raw telemetry both stop on effort bias and queue `mass/torso_link` then `com/torso_link/y`, citing the dominant waist-roll residual (e.g. bias ≈ 21 Nm, waist_roll ≈ +9.6 Nm). That is enough for **10/10** and **9/10** successes.
+
+Cost detector and raw+cost: **0/10**, and in this run **every** cost-detector shoulder-mass trial has only the initial directive turn—no failure episode before the fall. The asymmetric payload destabilises the walk faster than the cost tripwire opens a diagnose-and-stand cycle. Full LOKA’s residual tripwire is simply more sensitive to this fault class.
+
+**Intuition:** here the compressor is not the bottleneck; **getting interrupted in time** is. Ablating the residual detector removes the interrupt.
+
+#### Torso mass: “success” without repair is not the same as LOKA
+
+All four baselines succeed **10/10** on +10 kg torso mass, but the logs split into two behaviours:
+
+- Full LOKA and raw telemetry **always** open a failure episode and search `torso_link` mass (bilateral positive knee residuals in the compressor; broadly bilateral effort columns in the raw table). Time to goal is ~30–34 s because the robot stands, identifies, then resumes.
+- Cost detector and raw+cost succeed with **≈1 orchestrator turn** (the directive only) on most trials—**no belief search**. Tracking cost never crosses the walk threshold, so they never stop to repair. They reach the goal faster (~19 s) by *limping* with the wrong model at 0.15 m/s.
+
+**Intuition:** torso payload at this speed is **survivable without adaptation**. Cost-detector “wins” on time-to-goal because it **misses** the fault, not because a scalar cost is a better sensor. That must not be read as evidence that the residual detector or compressor are redundant; the weak-knee and shoulder-mass logs show where missing them is fatal.
+
+#### Low friction: a noisy task where trigger × observation interact
+
+Even full LOKA is only **3/10**. On its successes the compressor makes the causal link explicit:
+
+> *“The motor deficit is zero, but stance slip is 0.186 m/s, above the 0.15 m/s threshold… search friction on floor.”*
+
+Raw telemetry usually misreads the same transient as mass (**5/10** first searches are `mass/torso_link`; only one friction search) and finishes **1/10**. Cost detector alone never searches friction (**0/10**). Raw+cost matches full LOKA at **3/10**: on its three successes it also queued `friction/floor`, arguing from yaw / lateral-velocity / MPC-cost structure in the raw stream rather than from a stance-slip line.
+
+**Intuition:** μ=0.4 is near the edge for everyone. Combo beating raw here is **not** “two removals help.” Cost changes *when* the stand happens; raw (with residuals stripped) still leaves enough state/cost columns for an occasional correct friction guess. With n=10 and a 30% full-system success rate, treat 3 vs 1 as noise-compatible, not as a main claim.
+
+#### Stand-push: raw’s disasters are a residual×raw interaction
+
+On stand-push after the shoulder payload, full LOKA’s first probe is stereotyped: effort bias ≫ threshold, waist_roll dominant, search torso mass then COM y—then a listener confirms bias is back under threshold before the next push probe. Mean force **389 N**, tight across seeds.
+
+Raw telemetry’s mean **263 N** is driven by catastrophic seeds (≈148–197 N on trials 0, 1, 4, 7, 8). The hypotheses still mention mass/COM, but the raw table keeps large per-tick waist_roll effort spikes in view while the residual tripwire keeps re-opening episodes; recovery under successive push probes is fragile.
+
+On **those same seeds**, raw+cost recovers to **≈335–354 N**. The cost tripwire plus hidden residual channels remove the residual-heavy CSV that raw-alone was reacting to. Cost-alone, which still has compressor structure, stays near full LOKA (**≈381 N**).
+
+**Intuition:** raw telemetry is not “missing one helpful module.” It is **pairing the residual interrupt with a residual-dense table**. That pairing is what collapses stand-push. Putting the cost detector on top of raw breaks the pairing, so combo lands in the middle: better than raw-alone, worse than cost-alone (which kept the compressor).
+
+### 12.4 Why “raw + cost” is not automatically the worst
+
+A natural expectation is that removing two components should hurt at least as much as removing either one. That would hold if the ablations were independent deletions from an otherwise identical system. They are not:
+
+| Baseline | What opens a failure episode | What the orchestrator reads |
+|---|---|---|
+| `loka` | residual bias / motor / slip | compressor report (residuals labelled) |
+| raw telemetry | residual bias / motor / slip | raw CSV (**residuals visible**) |
+| cost detector | MPC tracking cost | compressor (**residuals hidden**) |
+| raw + cost | MPC tracking cost | raw CSV (**residuals hidden**) |
+
+Combo is a **third operating point** (cost tripwire × stripped raw table), not the intersection of the two failure modes. Empirically:
+
+- On stand-push, combo **mitigates** raw’s worst seeds by changing the tripwire and stripping residual columns, while still losing compressor structure relative to cost-alone → middle of the pack.
+- On weak knee and walking shoulder mass, combo tracks the **worse** parent (cost): no motor-deficit story, or no timely interrupt → 0/10.
+- On low friction, combo can match full LOKA’s low success count while raw alone does not; that is interaction on a noisy edge case, not evidence that compression is unnecessary.
+
+### 12.5 Takeaway for the compressor and residual detector
+
+Read together, the logs support a simple claim:
+
+1. **Survivable model error** (torso mass at slow speed; shove with no model change) can look fine under aggressive ablations because the plant never needs a correct belief.
+2. **Local or asymmetric faults** (weak knee; shoulder payload; stand-push recovery) need either a timely residual interrupt, a labelled residual report, or both. When those are removed, the orchestrator’s prose shifts from actuator- or residual-specific hypotheses to generic mass/COM stories—or never runs before the fall.
+3. The telemetry compressor’s value is clearest where raw tables still contain the numbers but the model **fails to isolate the cause** (weak knee; most low-friction raw trials). The residual detector’s value is clearest where cost never opens an episode in time (shoulder mass under cost detector).
+
+For paper drafting: lead with weak-knee and shoulder-mass (and stand-push raw collapse); treat torso-mass cost-detector speedups as missed detection; treat low-friction combo≥raw as a small-n interaction, not a headline.
+
+---
+
+## 13. Notes for Drafting the Paper
 
 These points are for the authors and should not appear in the paper.
 
