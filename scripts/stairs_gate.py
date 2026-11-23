@@ -146,8 +146,10 @@ def main() -> None:
                         help="Walk to this world xy instead of the first flight's landing.")
     parser.add_argument("--diagnose", action="store_true",
                         help="Attach stairs_trace.FallAttribution and report the fall label.")
-    parser.add_argument("--terrain-stack", choices=("heuristic", "classical"), default="classical",
-                        help="Terrain-mode controller variant (loka.control.terrain.TERRAIN_STACK).")
+    parser.add_argument("--terrain-stack", choices=("heuristic", "classical", "auto", "wbto"),
+                        default="classical",
+                        help="Terrain-mode controller variant (loka.control.terrain.TERRAIN_STACK). "
+                             "auto/wbto need pinocchio+crocoddyl.")
     args = parser.parse_args()
     from loka.control import terrain
 

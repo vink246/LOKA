@@ -362,6 +362,10 @@ class LocomotionController:
         self._stabilizer: DCMStabilizer | None = None
         #: Terrain the controller believes in. Empty is the flat-floor controller.
         self.terrain = TerrainBelief()
+        #: Optional Crocoddyl whole-body session for gaps / multi-step stairs.
+        from loka.control.wbto.session import WbtoSession
+
+        self._wbto = WbtoSession(self)
         import mujoco
 
         self._leg_body_ids = {
@@ -513,6 +517,8 @@ class LocomotionController:
         self._height_ref = None
         self._knee_heights = np.zeros(1)
         self._knee_table = np.zeros((1, 2))
+        if getattr(self, "_wbto", None) is not None:
+            self._wbto.reset()
 
     def seed_support_from_soles(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
         """Set the flat support height to where the soles currently rest.
@@ -944,6 +950,10 @@ class LocomotionController:
 
     def compute_torque(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
         started = time.perf_counter()
+        # Gaps / multi-step stairs: optional whole-body FDDP takeover.
+        if self._wbto.maybe_step(qpos, qvel, started) and self._wbto.torque is not None:
+            return self._wbto.torque
+
         cfg = self.config
         robot = self.robot
         qvel_arr = np.asarray(qvel, dtype=float)

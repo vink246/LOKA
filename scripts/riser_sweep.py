@@ -81,8 +81,10 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=min(20, os.cpu_count() or 4))
     parser.add_argument("--tag", default="latest")
     parser.add_argument("--compare", type=Path, default=None)
-    parser.add_argument("--terrain-stack", choices=("heuristic", "classical"), default="classical",
-                        help="Terrain-mode controller variant (loka.control.terrain.TERRAIN_STACK).")
+    parser.add_argument("--terrain-stack", choices=("heuristic", "classical", "auto", "wbto"),
+                        default="classical",
+                        help="Terrain-mode controller variant (loka.control.terrain.TERRAIN_STACK). "
+                             "auto/wbto need pinocchio+crocoddyl.")
     parser.add_argument("--goal", type=float, nargs=2, default=None,
                         help="Walk to this world xy instead of each flight's landing.")
     args = parser.parse_args()

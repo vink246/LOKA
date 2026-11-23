@@ -5,7 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional: --no-llm / control-only envs (e.g. .venv-croc)
+    def load_dotenv(*_a, **_k) -> bool:  # type: ignore[misc]
+        return False
+
 from openai import OpenAI
 
 from loka.agent.reply_guard import check_reply, feedback_message
