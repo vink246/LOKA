@@ -126,3 +126,21 @@ tasks:
     perturbations:
       - {name: nominal, kind: none}
     metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
+  # Start on a raised pad, step over a 0.30 m gap onto a second pad.
+  - name: platform_gap
+    type: stairs
+    scene: platform_gap
+    goal:
+      xy: [2.5, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+      landing_z: 0.10
+    directive: "Walk along the raised walkway ahead, step over any gaps, and stop at the world coordinate (2.5, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]

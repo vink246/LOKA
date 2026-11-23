@@ -37,16 +37,65 @@ MIN_TREAD = 0.25
 #: BaselineWalkingController): one foot per tread with distance-scaled
 #: swings, 3D DCM with a heel-to-toe VRP, DCM feedback to a CMP and a contact
 #: wrench distribution in place of the MPC, upright torso with angular
-#: momentum damping, lateral step adjustment. Read at run time, so it can be
-#: switched per process (``--terrain-stack`` on run_loka and the bench
-#: scripts). Classical is the
-#: default: 12/20 against 0/20 on the four-step flight at 0.04-0.10 m risers,
-#: and it walks across a curb platform without drifting (docs/LOKA.md 4.9).
+#: momentum damping, lateral step adjustment. ``wbto``: Crocoddyl whole-body
+#: FDDP over a contact plan (needs pinocchio+crocoddyl). ``auto``: WBTO for
+#: any challenging raised belief (curb, stairs, gap) when the deps are
+#: installed; flat stays classical. Read at run time (``--terrain-stack`` on
+#: run_loka and the bench scripts). Classical is the default flat regress
+#: stack; use ``auto`` or ``wbto`` for terrain (docs/LOKA.md 4.9).
 TERRAIN_STACK = "classical"
+TERRAIN_STACK_CHOICES = ("classical", "heuristic", "auto", "wbto")
+
+#: Tops at or above this count as challenging raised ground for WBTO [m].
+WBTO_RAISED_TOP = 0.015
 
 
 def classical_stack() -> bool:
-    return TERRAIN_STACK == "classical"
+    """True when the reduced-order terrain path should use the classical DCM stack.
+
+    ``auto`` / ``wbto`` fall back to classical whenever the whole-body session
+    is not engaged (flat belief or missing Crocoddyl).
+    """
+    return TERRAIN_STACK != "heuristic"
+
+
+def terrain_wants_wbto(belief: "TerrainBelief") -> bool:
+    """Challenging terrain for ``auto``: any non-trivial raised belief.
+
+    Flat (no volumes / only dust-height tops) stays classical. A curb, a
+    flight of stairs, or separated pads (gap) — including declarations that
+    almost touch so a gap scan would miss — all select WBTO.
+    """
+    if not belief.active:
+        return False
+    return any(float(vol.top) >= WBTO_RAISED_TOP for vol in belief.volumes)
+
+
+def _belief_has_gap(belief: "TerrainBelief") -> bool:
+    """True when a scan through the volumes sees raised → floor → raised."""
+    if len(belief.volumes) < 2:
+        return False
+    y = float(np.mean([float(vol.center[1]) for vol in belief.volumes]))
+    xs: list[float] = []
+    for vol in belief.volumes:
+        half = 0.5 * float(vol.size[0])
+        xs.extend([float(vol.center[0]) - half, float(vol.center[0]) + half])
+    x0, x1 = min(xs) - 0.05, max(xs) + 0.05
+    n = max(int(round((x1 - x0) / 0.02)), 3)
+    pts = np.column_stack([np.linspace(x0, x1, n), np.full(n, y)])
+    raised = belief.heights_at(pts, 0.0) >= 0.02
+    i = 0
+    while i < n and not raised[i]:
+        i += 1
+    while i < n and raised[i]:
+        i += 1
+    gap_start = i
+    while i < n and not raised[i]:
+        i += 1
+    if i >= n or gap_start >= i:
+        return False
+    width = (i - gap_start) * (x1 - x0) / (n - 1)
+    return 0.04 <= width <= 0.65
 
 
 #: Longest stride a terrain snap may produce, from the other foot [m].
@@ -66,6 +115,17 @@ TOP_RANGE = (0.0, 1.0)
 SIZE_RANGE = (0.05, 5.0)
 CENTER_RANGE = (-20.0, 20.0)
 STAIR_STEPS_RANGE = (1, 8)
+#: Sole z vs believed height under a planted foot [m]. Larger means the
+#: belief left the stance on the floor while the plant put it on a pad.
+STANCE_HEIGHT_TOL = 0.02
+#: Extra xy when growing a volume under the soles [m].
+STANCE_XY_MARGIN = 0.12
+#: If the nearest same-height pad is farther than this from a sole, insert a
+#: stance pad instead of extending — avoids filling a real gap [m].
+STANCE_EXTEND_REACH = 0.55
+#: Max |top − sole_z| treated as the same surface (vision height error) [m].
+#: Kept below a typical stair riser so adjacent treads are not flattened.
+STANCE_TOP_SNAP_MAX = 0.05
 STAIR_RISER_RANGE = (0.02, 0.20)
 STAIR_TREAD_RANGE = (0.15, 1.0)
 STAIR_WIDTH_RANGE = (0.3, 3.0)
@@ -240,6 +300,132 @@ def footprint_points(center, yaw: float, margin: float = 0.0) -> np.ndarray:
     return np.array(pts)
 
 
+def _volume_outside_distance(vol: Volume, point) -> float:
+    """Distance from ``point`` to the volume AABB in the volume frame (0 inside)."""
+    loc = vol.local(np.asarray(point, dtype=float)[:2])[0]
+    half = 0.5 * vol.size
+    dx = max(0.0, abs(float(loc[0])) - float(half[0]))
+    dy = max(0.0, abs(float(loc[1])) - float(half[1]))
+    return float(math.hypot(dx, dy))
+
+
+def _extend_volume_to_cover(vol: Volume, points: np.ndarray, margin: float) -> None:
+    """Grow ``vol`` in its local frame so every sole sample lies inside."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    samples = []
+    for p in pts:
+        for dx in (-margin - SOLE_HALF_LENGTH, 0.0, margin + SOLE_HALF_LENGTH):
+            for dy in (-margin - SOLE_HALF_WIDTH, 0.0, margin + SOLE_HALF_WIDTH):
+                samples.append(p + np.array([dx, dy]))
+    loc = vol.local(np.asarray(samples, dtype=float))
+    half = 0.5 * np.asarray(vol.size, dtype=float)
+    new_lo = np.minimum(-half, loc.min(axis=0))
+    new_hi = np.maximum(half, loc.max(axis=0))
+    new_half = 0.5 * (new_hi - new_lo)
+    new_center_local = 0.5 * (new_lo + new_hi)
+    c, s = math.cos(vol.yaw), math.sin(vol.yaw)
+    offset = np.array(
+        [
+            c * new_center_local[0] - s * new_center_local[1],
+            s * new_center_local[0] + c * new_center_local[1],
+        ]
+    )
+    vol.center = np.asarray(vol.center, dtype=float) + offset
+    vol.size = np.clip(2.0 * new_half, SIZE_RANGE[0], SIZE_RANGE[1])
+
+
+def _stance_volumes_near_feet(
+    belief: "TerrainBelief",
+    pts: np.ndarray,
+    sole_z: float,
+    *,
+    snap_max: float,
+    extend_reach: float,
+) -> list[Volume]:
+    """Volumes under the soles, or nearby pads at about the sole height."""
+    covering = [vol for vol in belief.volumes if any(vol.contains(p)[0] for p in pts)]
+    if covering:
+        return covering
+    nearby = []
+    for vol in belief.volumes:
+        if abs(float(vol.top) - sole_z) > snap_max:
+            continue
+        if max(_volume_outside_distance(vol, p) for p in pts) <= extend_reach:
+            nearby.append(vol)
+    return nearby
+
+
+def ensure_stance_support(
+    belief: "TerrainBelief",
+    feet_xyz: np.ndarray,
+    *,
+    height_tol: float = STANCE_HEIGHT_TOL,
+    xy_margin: float = STANCE_XY_MARGIN,
+    extend_reach: float = STANCE_EXTEND_REACH,
+    snap_max: float = STANCE_TOP_SNAP_MAX,
+) -> bool:
+    """Make believed ground under the soles match where they currently rest.
+
+    Vision often (1) starts the near pad ahead of the robot or (2) overestimates
+    pad height. Whole-body planning then fights the plant and collapses.
+    Snaps coplanar tops to the measured sole height, then extends the nearest
+    pad under the feet (or inserts a local stance pad) without filling a real
+    gap. Does not bump ``belief.version`` — sync would otherwise reload the
+    short LLM pads every tick. Returns True when the belief changed.
+    """
+    feet = np.asarray(feet_xyz, dtype=float).reshape(2, 3)
+    pts = feet[:, :2]
+    sole_z = float(np.median(feet[:, 2]))
+    changed = False
+
+    # Height: vision tops of 0.12–0.13 m on a 0.10 m plant must snap before plan.
+    seed = _stance_volumes_near_feet(
+        belief, pts, sole_z, snap_max=snap_max, extend_reach=extend_reach
+    )
+    snap_keys = {
+        round(float(vol.top), 3)
+        for vol in seed
+        if abs(float(vol.top) - sole_z) > height_tol
+    }
+    if snap_keys:
+        for vol in belief.volumes:
+            if round(float(vol.top), 3) in snap_keys:
+                vol.top = sole_z
+                changed = True
+
+    under = belief.heights_at(pts, 0.0)
+    if bool(np.all(np.abs(under - sole_z) <= height_tol)):
+        return changed
+
+    candidates = [
+        vol for vol in belief.volumes if abs(float(vol.top) - sole_z) <= height_tol
+    ]
+    mid = pts.mean(axis=0)
+    if candidates:
+        vol = min(candidates, key=lambda v: float(np.linalg.norm(v.center - mid)))
+        reach = max(_volume_outside_distance(vol, p) for p in pts)
+        if reach <= extend_reach:
+            _extend_volume_to_cover(vol, pts, xy_margin)
+            return True
+
+    half = np.array(
+        [
+            max(0.25, float(np.ptp(pts[:, 0]) * 0.5) + xy_margin + SOLE_HALF_LENGTH),
+            max(0.20, float(np.ptp(pts[:, 1]) * 0.5) + xy_margin + SOLE_HALF_WIDTH),
+        ]
+    )
+    pad = Volume(
+        name="stance_support",
+        center=mid.copy(),
+        size=2.0 * half,
+        top=sole_z,
+        yaw=0.0,
+        source="seed",
+    )
+    belief.volumes = list(belief.volumes) + [pad]
+    return True
+
+
 @dataclass
 class TerrainBelief:
     """The controller's terrain: volumes over a flat floor."""
@@ -311,7 +497,9 @@ class TerrainBelief:
         then for the one after it. The foothold goes to the middle of that
         tread; on a deep surface (a landing) it goes as close to the edge as
         a sole plus margin allows, the way a tread-by-tread stair plan puts
-        one foot on each step. Returns ``(distance, height)`` or None.
+        one foot on each step. A drop that rises again within ``reach`` (a
+        gap in a raised walkway) is stepped over onto that far surface, not
+        into the hole. Returns ``(distance, height)`` or None.
         """
         anchor = np.asarray(anchor, dtype=float).reshape(2)
         fwd = np.asarray(forward, dtype=float).reshape(2)
@@ -326,12 +514,24 @@ class TerrainBelief:
             return None
         start = int(rise[0])
         top = float(h[min(start + 1, len(h) - 1)])
+        # Same-height gap: the first change is a drop, then the walkway resumes.
+        gap_cross = False
+        if top < base - STAIR_STEP_DZ:
+            recover = np.nonzero(h[start:] >= base - SAME_SURFACE_TOL)[0]
+            if recover.size == 0:
+                return None
+            start = start + int(recover[0])
+            top = float(h[min(start + 1, len(h) - 1)])
+            gap_cross = True
         if abs(top - base) > STEP_UP_MAX or abs(top - float(anchor_z)) > STEP_UP_MAX + STAIR_STEP_DZ:
             return None
         after = np.nonzero(np.abs(h[start:] - top) > SAME_SURFACE_TOL)[0]
         set_in = SOLE_HALF_LENGTH + self.edge_margin(anchor + ds[start] * fwd)
         if after.size == 0:
-            along = float(ds[start]) + max(set_in, TREAD_SETBACK)
+            # After a gap, plant just past the far edge; a deep-landing setback
+            # would push the stride past STAIR_PITCH_MAX on a short step-over.
+            inset = set_in if gap_cross else max(set_in, TREAD_SETBACK)
+            along = float(ds[start]) + inset
         else:
             depth = float(ds[start + int(after[0])] - ds[start])
             if depth < 2.0 * set_in:

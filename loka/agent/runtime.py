@@ -389,6 +389,9 @@ class LokaRuntime:
         self._last_terrain_fault_t = now
         record["note"] = note
         self._terrain_fault = record
+        from loka.agent.terrain_state import allow_terrain_rewrite
+
+        allow_terrain_rewrite(self.loka_state)
         print(f"[LOKA] terrain fault at t={now:.2f}s: {note}")
         if self.log is not None:
             self.log.note(f"terrain fault: {note}", sim_time=now)

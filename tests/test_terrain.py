@@ -8,6 +8,7 @@ import pytest
 from loka.agent.compress import format_terrain_section
 from loka.agent.terrain_refine import refine_from_touchdown
 from loka.agent.terrain_state import (
+    allow_terrain_rewrite,
     apply_terrain_mutation,
     ensure_terrain_state,
     format_terrain_belief,
@@ -76,6 +77,22 @@ def test_snap_refuses_a_riser_above_the_step_limit():
     assert belief.support_height(pos, 0.0) == 0.0
 
 
+def test_next_tread_steps_over_a_same_height_gap():
+    """A hole in a raised walkway is crossed onto the far pad, not into the floor."""
+    near = {"name": "near", "x": -0.5, "y": 0.0, "yaw": 0.0, "steps": 1, "riser": 0.10, "landing": 1.5, "width": 1.5}
+    far = {"name": "far", "x": 1.10, "y": 0.0, "yaw": 0.0, "steps": 1, "riser": 0.10, "landing": 2.0, "width": 1.5}
+    belief = TerrainBelief()
+    belief.set_volumes(stairs_volumes(near) + stairs_volumes(far))
+    fwd = np.array([1.0, 0.0])
+    along, top = belief.next_tread_center(np.array([0.85, 0.0]), fwd, 0.10, floor=0.0)
+    assert top == pytest.approx(0.10)
+    assert along == pytest.approx(1.10 - 0.85 + SOLE_HALF_LENGTH + EDGE_MARGIN, abs=0.02)
+    assert along <= 0.40 + 1e-9
+    foothold = np.array([0.85, 0.0]) + along * fwd
+    assert belief.support_height(foothold, 0.0) == pytest.approx(0.10)
+    assert foothold[0] >= 1.10
+
+
 def test_stair_swing_lifts_above_the_higher_tread_before_moving():
     start = np.array([0.88, 0.1, 0.0])
     end = np.array([1.15, 0.1, 0.1])
@@ -103,6 +120,16 @@ def test_stairs_mutation_expands_clamps_and_removes():
     assert len(vols) == 8  # step count clamped
     assert vols[0].top == pytest.approx(0.2)  # riser clamped to 0.20
     version = state["terrain_version"]
+    with pytest.raises(ValueError, match="without a terrain fault"):
+        apply_terrain_mutation(state, {"object_type": "stairs", "name": "flight", "attribute": "remove"})
+    with pytest.raises(ValueError, match="without a terrain fault"):
+        apply_terrain_mutation(state, {
+            "object_type": "stairs", "name": "flight",
+            "value": {"start": [1.5, 0.0], "steps": 2, "riser": 0.1, "tread": 0.3},
+        })
+    with pytest.raises(ValueError, match="belongs to stairs"):
+        apply_terrain_mutation(state, {"object_type": "volume", "name": "flight_0", "attribute": "remove"})
+    allow_terrain_rewrite(state)
     apply_terrain_mutation(state, {"object_type": "stairs", "name": "flight", "attribute": "remove"})
     assert volumes_of(state) == [] and state["terrain_version"] > version
 
@@ -130,24 +157,28 @@ def test_volume_cap():
         apply_terrain_mutation(state, {"object_type": "volume", "name": "extra", "value": {"center": [0, 3], "top": 0.1}})
 
 
-def test_refine_moves_the_flight_above_a_mismeasured_step():
+def test_refine_rebuilds_a_uniform_flight_from_one_tread():
+    """A scalar riser is rewritten from the measured tread, not absolute-cascaded."""
     state: dict = {}
     apply_terrain_mutation(state, {
         "object_type": "stairs", "name": "s",
         "value": {"start": [1.0, 0.0], "steps": 3, "riser": 0.10, "tread": 0.3},
     })
+    # Step 1 at 0.24 m => uniform riser 0.12 m (cascade would have left 0.10/0.24/0.34).
     result = refine_from_touchdown(state, {"xy": [1.45, 0.0], "measured_z": 0.24})
     assert result.kind == "refined"
+    assert "uniform riser" in result.note
     tops = [v.top for v in volumes_of(state)]
-    assert tops == pytest.approx([0.10, 0.24, 0.34])
-    assert refine_from_touchdown(state, {"xy": [1.15, 0.0], "measured_z": 0.104}).kind == "consistent"
+    assert tops == pytest.approx([0.12, 0.24, 0.36])
+    assert state["stairs"]["s"]["riser"] == pytest.approx(0.12)
+    assert refine_from_touchdown(state, {"xy": [1.15, 0.0], "measured_z": 0.124}).kind == "consistent"
 
 
-def test_refine_skips_large_lowering_of_a_flight_step():
+def test_refine_skips_large_lowering_of_an_irregular_flight_step():
     state: dict = {}
     apply_terrain_mutation(state, {
         "object_type": "stairs", "name": "s",
-        "value": {"start": [1.0, 0.0], "steps": 3, "riser": 0.10, "tread": 0.3},
+        "value": {"start": [1.0, 0.0], "riser": [0.10, 0.10, 0.10], "tread": 0.3},
     })
     before = [v.top for v in volumes_of(state)]
     # 0.17 is still closer to step 1 (0.20) than to step 0 (0.10), so the
@@ -158,17 +189,18 @@ def test_refine_skips_large_lowering_of_a_flight_step():
     assert [v.top for v in volumes_of(state)] == pytest.approx(before)
 
 
-def test_refine_allows_small_lowering_of_a_flight_step():
-    """Vision often declares ~0.08 m on a true 0.07 m riser; fix via touchdown."""
+def test_refine_rebuilds_uniform_flight_from_overestimated_riser():
+    """Vision declared 0.13 m on a true ~0.07 m flight; first tread fixes it."""
     state: dict = {}
     apply_terrain_mutation(state, {
         "object_type": "stairs", "name": "s",
-        "value": {"start": [1.0, 0.0], "steps": 4, "riser": 0.08, "tread": 0.3},
+        "value": {"start": [1.0, 0.0], "steps": 4, "riser": 0.13, "tread": 0.3},
     })
     result = refine_from_touchdown(state, {"xy": [1.15, 0.0], "measured_z": 0.069})
     assert result.kind == "refined"
     tops = [v.top for v in volumes_of(state)]
-    assert tops == pytest.approx([0.069, 0.149, 0.229, 0.309], abs=1e-3)
+    assert tops == pytest.approx([0.069, 0.138, 0.207, 0.276], abs=1e-3)
+    assert state["stairs"]["s"]["riser"] == pytest.approx(0.069)
 
 
 def test_refine_skips_when_a_sibling_tread_matches_better():

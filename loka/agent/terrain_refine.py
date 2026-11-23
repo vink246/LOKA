@@ -3,19 +3,26 @@
 The orchestrator declares terrain structure (a flight of stairs here, about
 this many steps of about this height). Each footfall then measures one tread:
 the sole's resting height comes from leg kinematics, and the touchdown itself
-from the joint-torque load estimate. When a footfall lands on a believed
-volume at a different height, that volume's top is set to the measurement,
-and, for a declared flight, every step above it moves by the same amount,
-because a flight's treads are cumulative.
+from the joint-torque load estimate.
+
+When a footfall lands on a believed volume at a different height:
+
+- a **uniform** stair flight (scalar ``riser`` in the declaration) has its
+  riser rebuilt from the measurement: ``riser = (measured - floor) /
+  (index + 1)``, and every tread top is rewritten as ``(i + 1) * riser``.
+  Cascading an absolute delta would leave the wrong spacing when vision
+  overestimated the riser itself (e.g. 0.13 m declared, 0.07 m true);
+- an **irregular** flight (per-step riser list) or a lone volume still uses
+  the absolute cascade: that tread's top becomes the measurement, and every
+  higher step of the same group moves by the same amount.
 
 Guardrails keep flaky contacts from warping a flight:
 - only ``touchdown`` events refine (callers must not pass ``early_contact``);
 - a footfall whose measured height matches a sibling tread more closely than
   the volume under the sole is left alone (wrong-step contact);
-- within a flight, tops may move up freely, but may only move down by at most
-  ``FLIGHT_DOWN_REFINE_MAX`` (small overestimates from vision; larger drops are
-  treated as the wrong tread, not a shorter riser);
-- after a cascade, each riser must stay inside ``STAIR_RISER_RANGE``.
+- irregular flights may move tops up freely, but may only move down by at
+  most ``FLIGHT_DOWN_REFINE_MAX``;
+- after a change, each riser must stay inside ``STAIR_RISER_RANGE``.
 
 A footfall the belief cannot explain (load on a sole over believed flat floor,
 or a swing blocked on the way) is not refined here. It is reported, and the
@@ -33,9 +40,8 @@ from loka.control.terrain import STAIR_RISER_RANGE, TerrainBelief, Volume
 
 #: Touchdown height error that is refined rather than ignored [m].
 REFINE_TOL = 0.01
-#: Within a stair flight, allow lowering a tread by at most this much [m].
-#: Covers typical ~1 cm vision overestimates (e.g. 0.08 declared vs 0.07 true)
-#: while still rejecting large drops that look like wrong-tread contacts.
+#: Within an irregular stair flight, allow lowering a tread by at most this
+#: much [m]. Uniform flights rebuild the riser instead (see module docstring).
 FLIGHT_DOWN_REFINE_MAX = 0.025
 #: A footfall this far above the floor where the belief has no volume is
 #: unexplained terrain [m].
@@ -91,6 +97,17 @@ def _better_sibling(vol: Volume, measured: float, belief: TerrainBelief) -> Volu
     return None if best.name == vol.name else best
 
 
+def _uniform_stairs_spec(loka_state: dict, group: str) -> dict | None:
+    """Return the stairs declaration when it uses one scalar riser."""
+    spec = (loka_state.get("stairs") or {}).get(group)
+    if not isinstance(spec, dict):
+        return None
+    riser = spec.get("riser")
+    if isinstance(riser, (list, tuple)):
+        return None
+    return spec
+
+
 def refine_from_touchdown(loka_state: dict, event: dict, floor_z: float = 0.0) -> RefineResult:
     """Fold one ``touchdown`` event into the belief."""
     if event.get("kind") not in (None, "touchdown"):
@@ -129,10 +146,14 @@ def refine_from_touchdown(loka_state: dict, event: dict, floor_z: float = 0.0) -
     if abs(error) <= REFINE_TOL:
         return RefineResult("consistent", "", error)
 
-    # Within a flight, raise freely; only allow a small downward correction.
-    # A sole that sits much lower is almost always on a lower tread (or the
-    # face), not evidence that every higher riser should shrink. Sibling
-    # matching already catches clear wrong-step contacts.
+    volumes = loka_state["volumes"]
+    uniform = _uniform_stairs_spec(loka_state, vol.group) if vol.group is not None else None
+    if uniform is not None:
+        return _refine_uniform_flight(
+            loka_state, vol=vol, measured=measured, floor_z=float(floor_z), error=error
+        )
+
+    # Irregular flight or lone volume: absolute cascade.
     if vol.group is not None and error < -FLIGHT_DOWN_REFINE_MAX:
         return RefineResult(
             "skipped",
@@ -141,7 +162,6 @@ def refine_from_touchdown(loka_state: dict, event: dict, floor_z: float = 0.0) -
             error,
         )
 
-    volumes = loka_state["volumes"]
     proposed: dict[str, float] = {vol.name: round(measured, 4)}
     if vol.group is not None:
         for name, other in volumes.items():
@@ -161,6 +181,7 @@ def refine_from_touchdown(loka_state: dict, event: dict, floor_z: float = 0.0) -
 
     moved = [vol.name]
     entry = volumes[vol.name]
+    old_top = float(vol.top)
     entry["top"] = proposed[vol.name]
     entry["source"] = "refined"
     if vol.group is not None:
@@ -177,7 +198,56 @@ def refine_from_touchdown(loka_state: dict, event: dict, floor_z: float = 0.0) -
     )
     return RefineResult(
         "refined",
-        f"terrain refine: {vol.name} top {vol.top:.3f} -> {measured:.3f} m "
+        f"terrain refine: {vol.name} top {old_top:.3f} -> {measured:.3f} m "
         f"(touchdown {error:+.3f} m){tail}",
+        error,
+    )
+
+
+def _refine_uniform_flight(
+    loka_state: dict,
+    *,
+    vol: Volume,
+    measured: float,
+    floor_z: float,
+    error: float,
+) -> RefineResult:
+    """Rebuild a scalar-riser flight from one measured tread height."""
+    index = int(vol.index)
+    denom = index + 1
+    new_riser = (measured - floor_z) / float(denom)
+    lo, hi = STAIR_RISER_RANGE
+    if new_riser < lo or new_riser > hi:
+        return RefineResult(
+            "skipped",
+            f"terrain refine skipped: uniform riser {new_riser:.3f} m from {vol.name} "
+            f"is outside {STAIR_RISER_RANGE}",
+            error,
+        )
+    members = _group_volumes(loka_state["volumes"], vol.group)
+    tops = [round((i + 1) * new_riser, 4) for i in range(len(members))]
+    if not _riser_spacings_ok(tops):
+        return RefineResult(
+            "skipped",
+            f"terrain refine skipped: uniform riser {new_riser:.3f} m from {vol.name} "
+            f"would leave risers outside {STAIR_RISER_RANGE}",
+            error,
+        )
+    if all(abs(float(entry["top"]) - top) <= REFINE_TOL for (_, entry), top in zip(members, tops)):
+        return RefineResult("consistent", "", error)
+
+    old_top = float(vol.top)
+    for (name, entry), top in zip(members, tops):
+        entry["top"] = top
+        entry["source"] = "refined"
+    spec = loka_state["stairs"][vol.group]
+    old_riser = float(spec.get("riser", new_riser))
+    spec["riser"] = round(new_riser, 4)
+    _bump(loka_state)
+    return RefineResult(
+        "refined",
+        f"terrain refine: {vol.group} uniform riser {old_riser:.3f} -> {new_riser:.3f} m "
+        f"from {vol.name} touchdown ({old_top:.3f} -> {measured:.3f} m); "
+        f"{len(members)} step(s) rebuilt",
         error,
     )

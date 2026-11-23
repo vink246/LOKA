@@ -1,0 +1,9 @@
+# Robot starts on a 0.10 m raised pad, then must step over a 0.10 m gap onto
+# a second pad at the same height. Near pad: x in [-0.5, 1.0]. Far pad:
+# x in [1.10, 3.10]. Goal sits on the far pad at (2.5, 0). The gap is sized
+# so a classical one-foot step-over stays inside STAIR_PITCH_MAX (0.40 m).
+description: "Raised walkway with a 0.10 m gap to step over"
+props: []
+terrain:
+  - {kind: stairs, name: near_pad, x: -0.5, y: 0.0, yaw: 0.0, steps: 1, riser: 0.10, tread: 0.30, width: 1.5, landing: 1.5}
+  - {kind: stairs, name: far_pad, x: 1.10, y: 0.0, yaw: 0.0, steps: 1, riser: 0.10, tread: 0.30, width: 1.5, landing: 2.0}

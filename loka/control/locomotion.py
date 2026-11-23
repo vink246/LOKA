@@ -514,6 +514,23 @@ class LocomotionController:
         self._knee_heights = np.zeros(1)
         self._knee_table = np.zeros((1, 2))
 
+    def seed_support_from_soles(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
+        """Set the flat support height to where the soles currently rest.
+
+        After the plant places the robot on a raised pad, an empty terrain
+        belief would otherwise treat the soles as airborne (they sit above
+        ``config.ground_height``) and the stand QP collapses. Seeding only
+        the support plane — not terrain volumes — keeps stairs, curbs and
+        gaps for the orchestrator to declare.
+        """
+        self.robot.update(qpos, qvel)
+        heights = np.asarray(
+            self.robot.data.site_xpos[self.robot.contact_site_ids][:, 2], dtype=float
+        )
+        z = float(np.median(heights))
+        self._ground_height = z
+        self._leg_z[:] = z
+
     # -- references -------------------------------------------------------
 
     def _contact_mask(self) -> np.ndarray:

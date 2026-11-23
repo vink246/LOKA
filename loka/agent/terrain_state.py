@@ -23,6 +23,7 @@ def ensure_terrain_state(loka_state: dict) -> None:
     loka_state.setdefault("volumes", {})
     loka_state.setdefault("stairs", {})
     loka_state.setdefault("terrain_version", 0)
+    loka_state.setdefault("terrain_rewrite_ok", False)
 
 
 def _bump(loka_state: dict) -> None:
@@ -39,11 +40,34 @@ def _drop_group(loka_state: dict, group: str) -> None:
         del volumes[name]
 
 
+def allow_terrain_rewrite(loka_state: dict) -> None:
+    """Permit the next stairs/volume replace after a terrain fault."""
+    ensure_terrain_state(loka_state)
+    loka_state["terrain_rewrite_ok"] = True
+
+
+def _consume_terrain_rewrite(loka_state: dict) -> None:
+    loka_state["terrain_rewrite_ok"] = False
+
+
+def _rewrite_blocked(loka_state: dict, what: str) -> None:
+    if loka_state.get("terrain_rewrite_ok"):
+        return
+    raise ValueError(
+        f"refusing to {what} without a terrain fault; footfalls correct heights, "
+        "and a later image alone must not replace declared terrain"
+    )
+
+
 def apply_terrain_mutation(loka_state: dict, mut: dict, sim_time: float | None = None) -> str:
     """Apply one ``volume`` or ``stairs`` Model_Mutations entry.
 
     Returns a one-line description of the edit. Raises ``ValueError`` or
     ``TypeError`` on an edit that cannot be applied; nothing is changed then.
+
+    Once stairs or a volume belief exists, removing or replacing it is blocked
+    until :func:`allow_terrain_rewrite` runs (a terrain fault). Footfall
+    refine still updates heights without that flag.
     """
     ensure_terrain_state(loka_state)
     obj_type = str(mut.get("object_type", "")).strip().lower()
@@ -58,7 +82,15 @@ def apply_terrain_mutation(loka_state: dict, mut: dict, sim_time: float | None =
         if attr == "remove":
             if name not in volumes:
                 raise ValueError(f"no believed volume named {name!r}")
+            entry = volumes[name]
+            if entry.get("group"):
+                raise ValueError(
+                    f"volume '{name}' belongs to stairs '{entry['group']}'; "
+                    "remove the stairs declaration, not individual steps"
+                )
+            _rewrite_blocked(loka_state, f"remove volume '{name}'")
             del volumes[name]
+            _consume_terrain_rewrite(loka_state)
             _bump(loka_state)
             return f"volume '{name}' removed"
         if attr == "top" and not isinstance(value, dict):
@@ -68,10 +100,15 @@ def apply_terrain_mutation(loka_state: dict, mut: dict, sim_time: float | None =
         previous = Volume.from_dict(volumes[name]) if name in volumes else None
         if previous is None and len(volumes) >= MAX_VOLUMES:
             raise ValueError(f"terrain belief is full ({MAX_VOLUMES} volumes)")
+        # Shape/top edits to an existing lone volume are allowed; replacing a
+        # stair step must go through the stairs declaration (and a fault).
+        if previous is not None and previous.group is not None:
+            raise ValueError(
+                f"volume '{name}' belongs to stairs '{previous.group}'; "
+                "edit or replace the stairs declaration after a terrain fault"
+            )
         box = clamp_box(value, previous)
         vol = Volume(name=name, source="llm", **box)
-        if previous is not None and previous.group is not None:
-            vol.group, vol.index = previous.group, previous.index
         entry = vol.to_dict()
         entry["applied_at"] = sim_time
         volumes[name] = entry
@@ -85,10 +122,15 @@ def apply_terrain_mutation(loka_state: dict, mut: dict, sim_time: float | None =
         if attr == "remove":
             if name not in loka_state["stairs"]:
                 raise ValueError(f"no believed stairs named {name!r}")
+            _rewrite_blocked(loka_state, f"remove stairs '{name}'")
             _drop_group(loka_state, name)
             del loka_state["stairs"][name]
+            _consume_terrain_rewrite(loka_state)
             _bump(loka_state)
             return f"stairs '{name}' removed"
+        replacing = name in loka_state["stairs"]
+        if replacing:
+            _rewrite_blocked(loka_state, f"replace stairs '{name}'")
         spec = clamp_stairs_spec(value)
         spec["name"] = name
         vols = stairs_volumes(spec, source="llm")
@@ -101,6 +143,8 @@ def apply_terrain_mutation(loka_state: dict, mut: dict, sim_time: float | None =
             entry["applied_at"] = sim_time
             volumes[vol.name] = entry
         loka_state["stairs"][name] = {**spec, "applied_at": sim_time}
+        if replacing:
+            _consume_terrain_rewrite(loka_state)
         _bump(loka_state)
         riser = spec["riser"]
         riser_txt = (
