@@ -950,15 +950,16 @@ class LocomotionController:
 
     def compute_torque(self, qpos: np.ndarray, qvel: np.ndarray) -> np.ndarray:
         started = time.perf_counter()
+        cfg = self.config
+        robot = self.robot
+        qvel_arr = np.asarray(qvel, dtype=float)
+        # Kinematics + loads before WBTO so engage gates and proprio events see
+        # this tick's sole positions (sense_proprioception already ran).
+        robot.update(qpos, qvel)
         # Gaps / multi-step stairs: optional whole-body FDDP takeover.
         if self._wbto.maybe_step(qpos, qvel, started) and self._wbto.torque is not None:
             return self._wbto.torque
 
-        cfg = self.config
-        robot = self.robot
-        qvel_arr = np.asarray(qvel, dtype=float)
-
-        robot.update(qpos, qvel)
         dynamics = robot.dynamics(qvel_arr)
 
         base_quat = np.asarray(qpos[3:7], dtype=float)

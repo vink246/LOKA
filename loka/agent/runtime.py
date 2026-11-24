@@ -322,6 +322,24 @@ class LokaRuntime:
         sync_controller_terrain(self.controller, self.loka_state)
         return count
 
+    def _apply_terrain_volume_patch(self) -> None:
+        """Persist WBTO stance / gap repairs into ``loka_state`` volumes."""
+        patch = getattr(self.controller, "_terrain_volume_patch", None)
+        if not patch:
+            return
+        self.controller._terrain_volume_patch = None
+        ensure_terrain_state(self.loka_state)
+        volumes = {}
+        for entry in patch.get("volumes") or []:
+            name = str(entry.get("name", f"vol_{len(volumes)}"))
+            volumes[name] = dict(entry)
+        self.loka_state["volumes"] = volumes
+        if patch.get("bump"):
+            self.loka_state["terrain_version"] = (
+                int(self.loka_state.get("terrain_version", 0)) + 1
+            )
+        sync_controller_terrain(self.controller, self.loka_state)
+
     def _process_terrain_events(self, now: float) -> None:
         """Drain the controller's terrain events: refine the belief or raise a fault.
 
@@ -349,6 +367,11 @@ class LokaRuntime:
                     self.note_search_result(result.note)
                     if self.log is not None:
                         self.log.note(result.note, sim_time=now)
+                    # Proprioceptive confirmation lets ``auto`` hand off to WBTO
+                    # after classical takes the first step onto raised ground.
+                    self.controller._wbto_proprio_version = int(
+                        self.loka_state.get("terrain_version", 0)
+                    )
                     if (
                         self.config.terrain_fault_on_refined
                         and abs(result.error_m) > self.config.terrain_refine_fault_m
@@ -1159,6 +1182,7 @@ class LokaRuntime:
         sync_controller_terrain(self.controller, self.loka_state)
 
         self._control_step()
+        self._apply_terrain_volume_patch()
         self.belief_search.tick()
 
         frame = self._frame()

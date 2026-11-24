@@ -1,33 +1,33 @@
-# Master evaluation suite: every experiment, 10 trials, one PACE-ICE submission.
+# Final master evaluation suite for the paper (IROS target).
 #
 #   python -m loka.submit_pace_ice --config loka/config/eval_master.yaml --dry-run
 #   bash scripts/pace_ice_eval.sh --config loka/config/eval_master.yaml \
 #       --conda-prefix ~/scratch/envs/loka
 #
-# Each baseline runs only the tasks that list it (tasks.<name>.baselines), and
-# a baseline that appears in several experiments runs once per task: `loka`
-# is the reference for the main comparison, the ablations and the model
-# comparison alike, and `loka_vision` serves both the terrain and navigation
-# tasks.
+# Delta vs the 2026-11-12 run (results/g1_master/11_12_summary.csv):
+#   - controller.terrain_stack: auto  (gap → WBTO; flat/curb/stairs → classical)
+#   - nav scenes: navigation_photoreal with VLN-CE-like ego cameras
+#   - optional platform_gap terrain task
+# Flat / ablation / model-ladder numbers from 11-12 can be reused; prefer the
+# cheap vision-only companion config when you only need the terrain+nav rerun:
+#   loka/config/eval_master_vision.yaml
+#
+# WBTO needs pinocchio+crocoddyl on the eval workers (repo .venv-croc or a
+# conda env that imports both). If they are missing, terrain_stack=auto falls
+# back to classical with a one-time warning.
 #
 #   stand_push, goto_goal (6 perturbations)
 #       main        low_level, loka, unitree_rl
 #       ablations   loka_raw_telemetry, loka_cost_detector, loka_raw_and_cost
 #       models      3 API models (CPU jobs)
-#   curb, stairs_regular                 loka_vision only
-#   nav_object_goal, nav_route           loka_vision (NaVILA left out of this run)
+#   curb, stairs_regular, platform_gap   loka_vision (auto: WBTO on gap only)
+#   nav_object_goal, nav_route           loka_vision (photoreal)
 #
-# 670 units, all CPU jobs: 630 stand_push/goto_goal, 20 terrain, 20 navigation.
-#
-# Plots: one set per plot_groups entry under plots/<group>/ (max push force,
-# the go-to-goal panels per perturbation, successes and highest step for the
-# terrain tasks, and the navigation panels).
+# ~680 CPU units if run end-to-end: 630 stand_push/goto_goal, 30 terrain, 20 nav.
 #
 # Every LOKA baseline pays fixed_sim 4 s of simulated latency per call at
-# temperature 0 (the API models refuse temperature 0 and run at their default;
+# temperature 0 (API models that refuse temperature 0 run at their default;
 # each turn records the decoding used). Wall-clock latency is still recorded.
-# No videos: render.npz is still written, so any episode can be encoded later
-# with `python -m loka.run_eval render <run_dir> --episode <unit_dir>`.
 
 output_dir: results/g1_master
 seed: 0
@@ -39,6 +39,7 @@ workers: 1
 controller:
   config: loka/config/g1.yaml
   stack: legacy_dcm
+  terrain_stack: auto
 
 orchestrator:
   model: gpt-6-luna
@@ -63,24 +64,19 @@ recording:
 ablation_config: loka/config/loka_ablations.yaml
 
 baselines:
-  # Main comparison. unitree_rl walks at its 0.25 m/s floor (the slowest it
-  # walks reliably on this plant); its time panels are hatched.
   - low_level
   - loka
   - {name: unitree_rl, type: unitree_rl, options: {min_speed: 0.25}}
-  # Component ablations of loka (same orchestrator).
   - {name: loka_raw_telemetry, type: loka_ablated, options: {variant: raw_telemetry}}
   - {name: loka_cost_detector, type: loka_ablated, options: {variant: cost_detector}}
   - {name: loka_raw_and_cost, type: loka_ablated, options: {variant: raw_and_cost}}
-  # Orchestrator model comparison; loka (gpt-6-luna) is the reference.
   - {name: loka_gpt61_sol, type: loka, options: {orchestrator: {model: gpt-6.1-sol}}}
   - {name: loka_claude_haiku, type: loka, options: {orchestrator: {model: claude-haiku-5-5}}}
   - {name: loka_claude_sonnet, type: loka, options: {orchestrator: {model: claude-sonnet-5-5}}}
-  # LOKA with the head camera, for the terrain and navigation tasks.
+  # Terrain: default 70/30 ego. Navigation: VLN-CE-like 90/10 override below.
   - {name: loka_vision, type: loka, options: {vision: true}}
-  # NaVILA (GPU jobs) is left out of this run; add it back from eval_navigation.yaml:
-  #   - {name: navila, type: navila, options: {plant: mpc, model_path: ~/scratch/models/navila-llama3-8b-8f, forward_speed: 0.15}}
-  # and list it in the navigation tasks' baselines and the vision plot group.
+  # NaVILA (GPU) optional; uncomment and add to nav baselines + vision plot group:
+  # - {name: navila, type: navila, options: {plant: mpc, model_path: ~/scratch/models/navila-llama3-8b-8f, forward_speed: 0.15, camera: {width: 512, height: 512, fovy_deg: 90.0, pitch_down_deg: 10.0}}}
 
 plot_groups:
   main: [low_level, loka, unitree_rl]
@@ -152,7 +148,6 @@ tasks:
       - llm_output_tokens
       - telemetry_tokens_mean
 
-  # One 0.10 m curb with a 1.5 m platform; the goal is its middle.
   - name: curb
     type: stairs
     baselines: [loka_vision]
@@ -170,7 +165,6 @@ tasks:
       - {name: nominal, kind: none}
     metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
 
-  # Four 0.07 m steps from x = 1.0; the goal is the landing's middle, (2.4, 0) at z = 0.28.
   - name: stairs_regular
     type: stairs
     baselines: [loka_vision]
@@ -188,12 +182,28 @@ tasks:
       - {name: nominal, kind: none}
     metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
 
-  # Navigation: an instruction and the head-camera view, no coordinates.
-  # goal.xy is a stand-off point 0.7 m in front of the bookshelf, used only to score.
+  - name: platform_gap
+    type: stairs
+    baselines: [loka_vision]
+    scene: platform_gap
+    goal:
+      xy: [2.5, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+      landing_z: 0.10
+    directive: "Walk along the raised walkway ahead, step over any gaps, and stop at the world coordinate (2.5, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
   - name: nav_object_goal
     type: navigate
     baselines: [loka_vision]
-    scene: navigation
+    scene: navigation_photoreal
     instruction: "Walk to the bookshelf and stop in front of it."
     goal:
       xy: [3.6, 0.0]
@@ -209,7 +219,7 @@ tasks:
   - name: nav_route
     type: navigate
     baselines: [loka_vision]
-    scene: navigation
+    scene: navigation_photoreal
     instruction: "Walk forward past the box on your right, go around the chair keeping it on your right, and stop in front of the bookshelf."
     route:
       - {xy: [1.3, -0.45], keep_on: right}

@@ -28,8 +28,14 @@ from loka.sim import Simulation, UnitreeRLSimulation
 
 def locomotion_config(suite) -> LocomotionConfig:
     """A fresh controller config. Do not share one across simulations."""
+    from loka.control import terrain as terrain_mod
+
     config = LocomotionConfig.from_yaml(suite.controller.config)
     config.stack = suite.controller.stack
+    # Module flag read by the classical / WBTO terrain path each tick.
+    terrain_mod.TERRAIN_STACK = str(
+        getattr(suite.controller, "terrain_stack", "classical") or "classical"
+    )
     return config
 
 
@@ -310,6 +316,20 @@ class LokaBaseline(Baseline):
         self, spec, suite, log_path: Path | None = None, terrain=None, props=None, scene_meta=None
     ) -> None:
         config = loka_runtime_config(spec, suite, log_path)
+        # Scene camera (e.g. navigation_photoreal 90/10) overrides loka.yaml,
+        # matching run_loka. Baseline options.camera still wins when set.
+        meta = dict(scene_meta or {})
+        if (
+            config.enable_vision
+            and not (spec.options or {}).get("camera")
+            and isinstance(meta.get("camera"), dict)
+            and meta["camera"]
+        ):
+            from dataclasses import replace
+
+            from loka.vision import EgoCameraSpec
+
+            config = replace(config, vision=EgoCameraSpec.from_config(meta["camera"]))
         camera = config.vision.recipe() if config.enable_vision else None
         self._spawns = tuple(props or ())
         self._sim = Simulation(

@@ -5,7 +5,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from loka.control.terrain import TerrainBelief, Volume, ensure_stance_support
+from loka.control.terrain import (
+    TerrainBelief,
+    Volume,
+    auto_wbto_stance_ready,
+    carve_through_contact,
+    ensure_stance_support,
+    shrink_declared_gap_edges,
+)
 
 
 def _short_near_gap_belief() -> TerrainBelief:
@@ -114,3 +121,103 @@ def test_ensure_stance_support_does_not_flatten_next_stair_tread():
     feet = np.array([[0.15, 0.10, 0.07], [0.15, -0.10, 0.07]])
     assert not ensure_stance_support(belief, feet)
     assert belief.height_at([0.45, 0.0]) == pytest.approx(0.14)
+
+
+def test_shrink_declared_gap_edges_opens_narrow_seam():
+    """Near-touching pads (2 cm seam) are pulled apart to a step-over trench."""
+    belief = TerrainBelief()
+    belief.set_volumes(
+        [
+            Volume(
+                name="near",
+                center=np.array([0.5, 0.0]),
+                size=np.array([1.0, 1.6]),
+                top=0.10,
+                source="llm",
+            ),
+            Volume(
+                name="far",
+                center=np.array([1.52, 0.0]),
+                size=np.array([1.0, 1.6]),
+                top=0.10,
+                source="llm",
+            ),
+        ]
+    )
+    # Seam at x≈1.00–1.02.
+    assert belief.height_at([1.01, 0.0]) == 0.0
+    assert shrink_declared_gap_edges(belief)
+    assert belief.height_at([1.01, 0.0]) == 0.0
+    # Idempotent once the seam clears DECLARED_GAP_MIN.
+    assert not shrink_declared_gap_edges(belief)
+
+
+def test_shrink_skips_already_open_gap():
+    belief = TerrainBelief()
+    belief.set_volumes(
+        [
+            Volume(
+                name="near",
+                center=np.array([0.45, 0.0]),
+                size=np.array([0.9, 1.6]),
+                top=0.10,
+                source="llm",
+            ),
+            Volume(
+                name="far",
+                center=np.array([2.2, 0.0]),
+                size=np.array([2.0, 1.6]),
+                top=0.10,
+                source="llm",
+            ),
+        ]
+    )
+    assert not shrink_declared_gap_edges(belief)
+
+
+def test_carve_through_contact_opens_overhang():
+    belief = TerrainBelief()
+    belief.set_volumes(
+        [
+            Volume(
+                name="near",
+                center=np.array([0.55, 0.0]),
+                size=np.array([1.04, 1.6]),
+                top=0.10,
+                source="llm",
+            )
+        ]
+    )
+    assert carve_through_contact(belief, [1.05, 0.0], measured_z=0.02)
+    assert belief.height_at([1.05, 0.0]) == 0.0
+
+
+def test_auto_wbto_stance_ready_defers_on_floor_and_seed_only():
+    belief = _short_near_gap_belief()
+    floor_feet = np.array([[0.0, 0.10, 0.0], [0.0, -0.10, 0.0]])
+    assert not auto_wbto_stance_ready(belief, floor_feet)
+
+    seed = TerrainBelief()
+    seed.set_volumes(
+        [
+            Volume(
+                name="stance_support",
+                center=np.array([0.0, 0.0]),
+                size=np.array([0.5, 0.5]),
+                top=0.10,
+                source="seed",
+            ),
+            Volume(
+                name="far",
+                center=np.array([2.5, 0.0]),
+                size=np.array([1.0, 1.5]),
+                top=0.10,
+                source="llm",
+            ),
+        ]
+    )
+    raised = np.array([[0.0, 0.10, 0.10], [0.0, -0.10, 0.10]])
+    assert not auto_wbto_stance_ready(seed, raised)
+
+    on_pad = np.array([[0.6, 0.10, 0.10], [0.6, -0.10, 0.10]])
+    assert auto_wbto_stance_ready(belief, on_pad)

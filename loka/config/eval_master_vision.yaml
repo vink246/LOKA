@@ -1,0 +1,142 @@
+# Final vision pass for the paper: terrain (auto = classical curb/stairs,
+# WBTO on gap) + photoreal navigation.
+# Reuse 2026-11-12 flat/ablation/model numbers; only refresh these 50 units.
+#
+# Local smoke (3 seeds) first:
+#   MUJOCO_GL=egl .venv-croc/bin/python -m loka.run_eval \
+#       --config loka/config/eval_master_vision_smoke.yaml \
+#       --run-dir results/g1_master_vision/smoke_local
+#
+# Then on a PACE-ICE login node (workers need pinocchio+crocoddyl in the conda
+# env, else terrain_stack=auto falls back to classical):
+#   bash scripts/pace_ice_eval.sh --config loka/config/eval_master_vision.yaml \
+#       --conda-prefix ~/scratch/envs/loka
+#
+# Optional: sync smoke_local/ into the new pace run_dir so trials 0–2 are skipped.
+# Fetch photoreal assets once: python scripts/fetch_nav_room_assets.py
+#
+# 50 units (5 tasks × 10 trials), all loka_vision / gpt-6-luna.
+
+output_dir: results/g1_master_vision
+seed: 0
+num_trials: 10
+init_noise: 0.005
+log_hz: 100
+workers: 1
+
+controller:
+  config: loka/config/g1.yaml
+  stack: legacy_dcm
+  terrain_stack: auto
+
+orchestrator:
+  model: gpt-6-luna
+  latency:
+    mode: fixed_sim
+    seconds: 4.0
+  request_timeout_s: 120.0
+  temperature: 0.0
+
+recording:
+  enabled: false
+  fps: 30
+  width: 1280
+  height: 720
+  camera:
+    azimuth: 135
+    elevation: -25
+    distance: 3.5
+
+baselines:
+  - {name: loka_vision, type: loka, options: {vision: true}}
+
+plot_groups:
+  vision: [loka_vision]
+
+tasks:
+  - name: curb
+    type: stairs
+    baselines: [loka_vision]
+    scene: curb
+    goal:
+      xy: [1.75, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Step up onto the platform ahead and stop at the world coordinate (1.75, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 60.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
+  - name: stairs_regular
+    type: stairs
+    baselines: [loka_vision]
+    scene: stairs_regular
+    goal:
+      xy: [2.4, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+    directive: "Climb the stairs ahead and stop on the landing at the world coordinate (2.4, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
+  - name: platform_gap
+    type: stairs
+    baselines: [loka_vision]
+    scene: platform_gap
+    goal:
+      xy: [2.5, 0.0]
+      speed: 0.15
+      radius: 0.2
+      hold_s: 1.0
+      landing_z: 0.10
+    directive: "Walk along the raised walkway ahead, step over any gaps, and stop at the world coordinate (2.5, 0), at 0.15 m/s, within 0.2 m."
+    command_time_s: 0.5
+    timeout_s: 90.0
+    goal_via: directive
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, highest_step_m, llm_turn_count, model_invocations, camera_frames]
+
+  - name: nav_object_goal
+    type: navigate
+    baselines: [loka_vision]
+    scene: navigation_photoreal
+    instruction: "Walk to the bookshelf and stop in front of it."
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, llm_turn_count, model_invocations, camera_frames]
+
+  - name: nav_route
+    type: navigate
+    baselines: [loka_vision]
+    scene: navigation_photoreal
+    instruction: "Walk forward past the box on your right, go around the chair keeping it on your right, and stop in front of the bookshelf."
+    route:
+      - {xy: [1.3, -0.45], keep_on: right}
+      - {xy: [2.5, 0.0], keep_on: right}
+    goal:
+      xy: [3.6, 0.0]
+      radius: 0.75
+      hold_s: 1.0
+      speed: 0.15
+    command_time_s: 0.5
+    timeout_s: 120.0
+    perturbations:
+      - {name: nominal, kind: none}
+    metrics: [num_successes, num_falls, time_to_goal_s, wall_time_to_goal_s, path_efficiency, prop_collisions, route_followed, llm_turn_count, model_invocations, camera_frames]

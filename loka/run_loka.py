@@ -325,10 +325,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("classical", "heuristic", "auto", "wbto"),
         default=None,
         help="Terrain-mode controller variant (loka.control.terrain.TERRAIN_STACK); "
-        "classical|heuristic = DCM stacks; wbto = Crocoddyl whole-body always on "
-        "terrain; auto = WBTO for any raised belief (curb, stairs, gap). "
-        "Defaults to the module setting (classical). Needs pinocchio+crocoddyl for "
-        "auto/wbto. See docs/LOKA.md Section 4.9.",
+        "classical|heuristic = DCM stacks; wbto = Crocoddyl whole-body on any "
+        "active belief; auto = classical for curb/stairs, WBTO for gap-like "
+        "beliefs. Defaults to the module setting (classical). Needs "
+        "pinocchio+crocoddyl for auto/wbto. See docs/LOKA.md Section 4.9.",
     )
     parser.add_argument(
         "--no-props",

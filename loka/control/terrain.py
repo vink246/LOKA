@@ -38,11 +38,12 @@ MIN_TREAD = 0.25
 #: swings, 3D DCM with a heel-to-toe VRP, DCM feedback to a CMP and a contact
 #: wrench distribution in place of the MPC, upright torso with angular
 #: momentum damping, lateral step adjustment. ``wbto``: Crocoddyl whole-body
-#: FDDP over a contact plan (needs pinocchio+crocoddyl). ``auto``: WBTO for
-#: any challenging raised belief (curb, stairs, gap) when the deps are
-#: installed; flat stays classical. Read at run time (``--terrain-stack`` on
-#: run_loka and the bench scripts). Classical is the default flat regress
-#: stack; use ``auto`` or ``wbto`` for terrain (docs/LOKA.md 4.9).
+#: FDDP over a contact plan (needs pinocchio+crocoddyl). ``auto``: classical
+#: for flat, curb and stairs; WBTO only for gap-like beliefs (two or more
+#: coplanar raised pads / a raised→floor→raised trench) when the deps are
+#: installed. Read at run time (``--terrain-stack`` on run_loka and the bench
+#: scripts). Classical is the default flat regress stack; use ``auto`` for the
+#: paper vision suite (docs/LOKA.md 4.9).
 TERRAIN_STACK = "classical"
 TERRAIN_STACK_CHOICES = ("classical", "heuristic", "auto", "wbto")
 
@@ -60,15 +61,31 @@ def classical_stack() -> bool:
 
 
 def terrain_wants_wbto(belief: "TerrainBelief") -> bool:
-    """Challenging terrain for ``auto``: any non-trivial raised belief.
+    """Whether ``auto`` should hand this belief to WBTO.
 
-    Flat (no volumes / only dust-height tops) stays classical. A curb, a
-    flight of stairs, or separated pads (gap) — including declarations that
-    almost touch so a gap scan would miss — all select WBTO.
+    Paper policy: classical owns curb step-ups and multi-riser stairs (VLM
+    height noise + proprioceptive refine). WBTO owns gap crossings — two or
+    more coplanar raised pads, or a scan that sees raised → floor → raised.
+    Seed-only stance pads do not count. The forced ``wbto`` stack still takes
+    every active belief (see :func:`loka.control.wbto.session.should_use_wbto`).
     """
     if not belief.active:
         return False
-    return any(float(vol.top) >= WBTO_RAISED_TOP for vol in belief.volumes)
+    raised = [
+        vol
+        for vol in belief.volumes
+        if float(vol.top) >= WBTO_RAISED_TOP and str(vol.source) != "seed"
+    ]
+    if len(raised) < 2:
+        return False
+    if _belief_has_gap(belief):
+        return True
+    # Almost-touching or sealed coplanar pads (vision often under-states the seam).
+    for i, a in enumerate(raised):
+        for b in raised[i + 1 :]:
+            if abs(float(a.top) - float(b.top)) <= STANCE_HEIGHT_TOL:
+                return True
+    return False
 
 
 def _belief_has_gap(belief: "TerrainBelief") -> bool:
@@ -126,6 +143,14 @@ STANCE_EXTEND_REACH = 0.55
 #: Max |top − sole_z| treated as the same surface (vision height error) [m].
 #: Kept below a typical stair riser so adjacent treads are not flattened.
 STANCE_TOP_SNAP_MAX = 0.05
+#: When two coplanar LLM pads leave a seam narrower than this, shrink the
+#: facing faces so a real gap is not sealed by vision overshoot [m].
+DECLARED_GAP_MIN = 0.08
+#: Only pads whose facing seam is shorter than this are treated as a
+#: declared gap crossing (wider separations are unrelated surfaces) [m].
+DECLARED_GAP_PAIR_MAX = 0.30
+#: Pull each facing face back by this much when carving a sealed seam [m].
+DECLARED_GAP_EDGE_SHRINK = 0.06
 STAIR_RISER_RANGE = (0.02, 0.20)
 STAIR_TREAD_RANGE = (0.15, 1.0)
 STAIR_WIDTH_RANGE = (0.3, 3.0)
@@ -355,6 +380,226 @@ def _stance_volumes_near_feet(
     return nearby
 
 
+def _volume_extent_along(vol: Volume, axis: np.ndarray) -> tuple[float, float]:
+    """Min/max projection of the volume AABB onto a unit world-xy ``axis``."""
+    a = np.asarray(axis, dtype=float).reshape(2)
+    n = float(np.linalg.norm(a))
+    if n < 1e-9:
+        c = float(np.dot(vol.center, a))
+        return c, c
+    a = a / n
+    c, s = math.cos(vol.yaw), math.sin(vol.yaw)
+    # Local ±half corners in world.
+    hx, hy = 0.5 * float(vol.size[0]), 0.5 * float(vol.size[1])
+    corners = []
+    for lx in (-hx, hx):
+        for ly in (-hy, hy):
+            corners.append(vol.center + np.array([c * lx - s * ly, s * lx + c * ly]))
+    proj = [float(np.dot(p, a)) for p in corners]
+    return min(proj), max(proj)
+
+
+def _extend_closes_gap(belief: "TerrainBelief", vol: Volume, points: np.ndarray, margin: float) -> bool:
+    """True when growing ``vol`` under ``points`` would seal a seam to a coplanar pad."""
+    probe = Volume(
+        name=vol.name,
+        center=np.asarray(vol.center, dtype=float).copy(),
+        size=np.asarray(vol.size, dtype=float).copy(),
+        top=float(vol.top),
+        yaw=float(vol.yaw),
+        source=vol.source,
+        group=vol.group,
+        index=vol.index,
+    )
+    _extend_volume_to_cover(probe, points, margin)
+    others = [
+        other
+        for other in belief.volumes
+        if other is not vol and abs(float(other.top) - float(vol.top)) <= STANCE_HEIGHT_TOL
+    ]
+    if not others:
+        return False
+    for other in others:
+        delta = np.asarray(other.center, dtype=float) - np.asarray(vol.center, dtype=float)
+        if float(np.linalg.norm(delta)) < 1e-6:
+            continue
+        axis = delta / float(np.linalg.norm(delta))
+        a0, a1 = _volume_extent_along(vol, axis)
+        b0, b1 = _volume_extent_along(other, axis)
+        gap_before = max(0.0, max(b0 - a1, a0 - b1))
+        p0, p1 = _volume_extent_along(probe, axis)
+        gap_after = max(0.0, max(b0 - p1, p0 - b1))
+        if gap_before >= DECLARED_GAP_MIN * 0.5 and gap_after < DECLARED_GAP_MIN * 0.5:
+            return True
+        if gap_before > 1e-6 and gap_after <= 1e-9:
+            return True
+    return False
+
+
+def _shrink_volume_face(vol: Volume, axis: np.ndarray, pull: float) -> bool:
+    """Pull back the face of ``vol`` that points along unit ``axis`` by ``pull``."""
+    if pull <= 1e-6:
+        return False
+    c, s = math.cos(vol.yaw), math.sin(vol.yaw)
+    local_x = np.array([c, s])
+    along = float(np.dot(axis, local_x))
+    if abs(along) < 0.7:
+        return False
+    pull_i = min(pull, max(0.0, 0.5 * (float(vol.size[0]) - SIZE_RANGE[0])))
+    if pull_i <= 1e-6:
+        return False
+    # Move center away from the trimmed face; shrink depth by pull_i (one side).
+    vol.size = np.array(
+        [max(SIZE_RANGE[0], float(vol.size[0]) - pull_i), float(vol.size[1])]
+    )
+    # Face along +local_x when along>0: center shifts −local_x * pull_i/2.
+    vol.center = np.asarray(vol.center, dtype=float) - math.copysign(1.0, along) * (pull_i * 0.5) * local_x
+    return True
+
+
+def shrink_declared_gap_edges(
+    belief: "TerrainBelief",
+    *,
+    min_gap: float = DECLARED_GAP_MIN,
+    pair_max: float = DECLARED_GAP_PAIR_MAX,
+    shrink: float = DECLARED_GAP_EDGE_SHRINK,
+) -> bool:
+    """Pull facing faces of near-touching coplanar pads apart.
+
+    Vision often overshoots the near-pad far edge into a real gap. Shrinking
+    only the faces that look at each other re-opens a step-over trench without
+    disturbing unrelated surfaces. Returns True when any volume changed.
+    """
+    vols = [
+        vol
+        for vol in belief.volumes
+        if float(vol.top) >= WBTO_RAISED_TOP and vol.source != "seed"
+    ]
+    if len(vols) < 2:
+        return False
+    changed = False
+    for i in range(len(vols)):
+        for j in range(i + 1, len(vols)):
+            a, b = vols[i], vols[j]
+            if abs(float(a.top) - float(b.top)) > STANCE_HEIGHT_TOL:
+                continue
+            delta = np.asarray(b.center, dtype=float) - np.asarray(a.center, dtype=float)
+            dist = float(np.linalg.norm(delta))
+            if dist < 1e-6:
+                continue
+            axis = delta / dist
+            a0, a1 = _volume_extent_along(a, axis)
+            b0, b1 = _volume_extent_along(b, axis)
+            left, right = a, b
+            left0, left1, right0, right1 = a0, a1, b0, b1
+            fwd = axis
+            if left1 > right1:
+                left, right = b, a
+                left0, left1, right0, right1 = b0, b1, a0, a1
+                fwd = -axis
+            gap = float(right0 - left1)
+            # Only carve when the seam is sealed or narrower than ``min_gap``.
+            # Idempotent: once the trench is wide enough, further engages no-op
+            # (repeated pulls were pushing the far pad out of reach).
+            if gap > pair_max or gap >= min_gap:
+                continue
+            if gap < -0.05:
+                continue
+            pull = max(float(shrink), 0.5 * (min_gap - gap) + 0.01)
+            # left face toward +fwd; right face toward -fwd.
+            if _shrink_volume_face(left, fwd, pull):
+                changed = True
+            if _shrink_volume_face(right, -fwd, pull):
+                changed = True
+    return changed
+
+
+def carve_through_contact(
+    belief: "TerrainBelief",
+    xy,
+    measured_z: float,
+    *,
+    height_tol: float = STANCE_HEIGHT_TOL,
+    margin: float = SOLE_HALF_LENGTH,
+) -> bool:
+    """Shrink the volume under ``xy`` when the sole fell through believed solid.
+
+    Used when WBTO planned a contact on vision-solid ground that is actually
+    air (gap overhang). Pulls the nearest local-x face past the sole so the
+    next plan sees a trench. Returns True when a volume changed.
+    """
+    pt = np.asarray(xy, dtype=float).reshape(2)
+    vol = belief.volume_at(pt)
+    if vol is None:
+        return False
+    if float(vol.top) - float(measured_z) <= height_tol:
+        return False
+    loc = vol.local(pt)[0]
+    half = 0.5 * np.asarray(vol.size, dtype=float)
+    # Cut the nearer end-face along local x (travel for yaw-aligned pads).
+    if abs(float(loc[0]) - half[0]) <= abs(float(loc[0]) + half[0]):
+        new_lo, new_hi = -float(half[0]), float(loc[0]) - margin
+    else:
+        new_lo, new_hi = float(loc[0]) + margin, float(half[0])
+    if new_hi - new_lo < SIZE_RANGE[0]:
+        belief.volumes = [v for v in belief.volumes if v is not vol]
+        return True
+    new_half = 0.5 * (new_hi - new_lo)
+    new_center_local = 0.5 * (new_lo + new_hi)
+    c, s = math.cos(vol.yaw), math.sin(vol.yaw)
+    vol.center = np.asarray(vol.center, dtype=float) + np.array(
+        [c * new_center_local, s * new_center_local]
+    )
+    vol.size = np.array([max(SIZE_RANGE[0], 2.0 * new_half), float(vol.size[1])])
+    return True
+
+
+def soles_match_belief(
+    belief: "TerrainBelief",
+    feet_xyz: np.ndarray,
+    *,
+    height_tol: float = STANCE_HEIGHT_TOL,
+) -> bool:
+    """True when believed height under each sole matches the measured sole z."""
+    feet = np.asarray(feet_xyz, dtype=float).reshape(2, 3)
+    under = belief.heights_at(feet[:, :2], 0.0)
+    return bool(np.all(np.abs(under - feet[:, 2]) <= height_tol))
+
+
+def auto_wbto_stance_ready(
+    belief: "TerrainBelief",
+    feet_xyz: np.ndarray,
+    *,
+    height_tol: float = STANCE_HEIGHT_TOL,
+) -> bool:
+    """Whether ``auto`` may hand control to WBTO from this stance.
+
+    Defers when the robot is still on the floor (classical takes the first
+    step-up and proprioceptive refine), or when the only support under the
+    soles is a seed ``stance_support`` pad while LLM terrain sits ahead —
+    that usually means vision missed the near pad (gap glitch).
+    """
+    feet = np.asarray(feet_xyz, dtype=float).reshape(2, 3)
+    sole_z = float(np.median(feet[:, 2]))
+    if sole_z < WBTO_RAISED_TOP:
+        return False
+    if not soles_match_belief(belief, feet, height_tol=height_tol):
+        return False
+    for foot in feet:
+        vol = belief.volume_at(foot[:2])
+        if vol is None:
+            return False
+        if vol.source == "seed" and vol.name == "stance_support":
+            others = [
+                v
+                for v in belief.volumes
+                if v is not vol and float(v.top) >= WBTO_RAISED_TOP and v.source != "seed"
+            ]
+            if others:
+                return False
+    return True
+
+
 def ensure_stance_support(
     belief: "TerrainBelief",
     feet_xyz: np.ndarray,
@@ -404,7 +649,7 @@ def ensure_stance_support(
     if candidates:
         vol = min(candidates, key=lambda v: float(np.linalg.norm(v.center - mid)))
         reach = max(_volume_outside_distance(vol, p) for p in pts)
-        if reach <= extend_reach:
+        if reach <= extend_reach and not _extend_closes_gap(belief, vol, pts, xy_margin):
             _extend_volume_to_cover(vol, pts, xy_margin)
             return True
 

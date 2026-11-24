@@ -29,6 +29,8 @@ OFFSCREEN_MAX = (1920, 1080)
 class ControllerSpec:
     config: str = "loka/config/g1.yaml"
     stack: str = "legacy_dcm"
+    #: Terrain-mode plant: classical | heuristic | auto | wbto (see loka.control.terrain).
+    terrain_stack: str = "classical"
 
 
 @dataclass
@@ -177,6 +179,7 @@ class SuiteConfig:
             "controller": {
                 "config": self.controller.config,
                 "stack": self.controller.stack,
+                "terrain_stack": self.controller.terrain_stack,
             },
             "orchestrator": self.orchestrator.to_dict(),
             "recording": {
@@ -504,10 +507,17 @@ def _parse_orchestrator(raw: Any) -> OrchestratorSpec:
 def parse_suite(raw: dict[str, Any]) -> SuiteConfig:
     ensure_registered()
     data = _mapping(raw, "suite")
+    from loka.control.terrain import TERRAIN_STACK_CHOICES
+
     controller = dict(data.get("controller") or {})
     stack = str(controller.get("stack", "legacy_dcm"))
     if stack not in STACK_NAMES:
         raise ValueError(f"Unknown controller stack {stack!r}. Known: {STACK_NAMES}")
+    terrain_stack = str(controller.get("terrain_stack", "classical"))
+    if terrain_stack not in TERRAIN_STACK_CHOICES:
+        raise ValueError(
+            f"Unknown terrain_stack {terrain_stack!r}. Known: {', '.join(TERRAIN_STACK_CHOICES)}"
+        )
     config_path = str(controller.get("config", "loka/config/g1.yaml"))
     orchestrator = _parse_orchestrator(data.get("orchestrator"))
     ablation_config = data.get("ablation_config")
@@ -562,7 +572,9 @@ def parse_suite(raw: dict[str, Any]) -> SuiteConfig:
         init_noise=init_noise,
         log_hz=log_hz,
         workers=workers,
-        controller=ControllerSpec(config=config_path, stack=stack),
+        controller=ControllerSpec(
+            config=config_path, stack=stack, terrain_stack=terrain_stack
+        ),
         orchestrator=orchestrator,
         recording=_parse_recording(data.get("recording")),
         baselines=baselines,
